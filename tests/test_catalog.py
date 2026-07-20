@@ -2,7 +2,7 @@ from pathlib import Path
 
 from openpyxl import Workbook
 
-from bot import Catalog, Entry, format_result, normalize, suggestion_label
+from bot import Catalog, Entry, format_result, normalize, suggestion_label, validate_excel
 
 
 def make_book(path: Path) -> None:
@@ -63,3 +63,19 @@ def test_many_results_are_paginated():
     assert "Район 10" not in first_page
     assert "Район 24" in last_page
     assert suggestion_label(entries[0], 25) == "Александровка — 25 вариантов"
+
+
+def test_excel_upload_requires_all_headers(tmp_path):
+    path = tmp_path / "invalid.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Территория", "Менеджер"])
+    sheet.append(["Питер", "Андрей"])
+    workbook.save(path)
+
+    try:
+        validate_excel(path)
+    except ValueError as error:
+        assert "местоположение" in str(error)
+    else:
+        raise AssertionError("Missing location header must be rejected")

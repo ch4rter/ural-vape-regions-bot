@@ -73,6 +73,17 @@ class MaterialsDB:
                 """
             )
 
+    def backup_to(self, destination: Path) -> None:
+        """Create a consistent SQLite backup, including pending WAL changes."""
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        source = self._connect()
+        target = sqlite3.connect(destination)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+            source.close()
+
     def add_product(self, name: str) -> Product:
         with self._connect() as connection:
             position = connection.execute("SELECT COALESCE(MAX(position), -1) + 1 FROM products").fetchone()[0]

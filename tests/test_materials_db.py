@@ -39,3 +39,16 @@ def test_hidden_products_and_unique_names(tmp_path):
         pass
     else:
         raise AssertionError("Product names must be unique ignoring case")
+
+
+def test_consistent_backup(tmp_path):
+    db = MaterialsDB(tmp_path / "materials.sqlite3")
+    product = db.add_product("OGGO VLIQ")
+    section = db.add_section(product.id, "Мокапы")
+    db.add_material(section.id, "photo", file_id="photo-id")
+
+    backup_path = tmp_path / "backup" / "materials.sqlite3"
+    db.backup_to(backup_path)
+    restored = MaterialsDB(backup_path)
+    assert restored.list_products()[0].name == "OGGO VLIQ"
+    assert restored.list_materials(section.id)[0].file_id == "photo-id"

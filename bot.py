@@ -3,8 +3,12 @@ import html
 import logging
 import os
 import re
+import shutil
 import sqlite3
+import tempfile
+import zipfile
 from dataclasses import dataclass
+from datetime import datetime
 from difflib import SequenceMatcher
 from itertools import chain
 from pathlib import Path
@@ -15,7 +19,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dotenv import load_dotenv
 from openpyxl import load_workbook
 
@@ -28,6 +32,8 @@ router = Router()
 catalog: "Catalog"
 materials_db: MaterialsDB
 admin_ids: set[int] = set()
+active_excel_path: Path
+managed_excel_path: Path
 
 
 class AppState(StatesGroup):
@@ -40,6 +46,8 @@ class AdminState(StatesGroup):
     section_name = State()
     section_rename = State()
     material_upload = State()
+    excel_upload = State()
+    excel_confirmation = State()
 
 
 def normalize(value: str) -> str:
@@ -134,6 +142,27 @@ class Catalog:
         return [index for _, index in ranked[:limit]]
 
 
+def validate_excel(path: Path) -> tuple[Catalog, tuple[str, ...]]:
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    sheet = workbook.active
+    first_row = next(sheet.iter_rows(min_row=1, max_row=1, values_only=True), None)
+    sheet_name = sheet.title
+    workbook.close()
+    if not first_row:
+        raise ValueError("Excel-файл пуст.")
+    headers = tuple(str(value or "").strip() for value in first_row)
+    normalized = [normalize(value) for value in headers]
+    required = {
+        "местоположение": any("местополож" in value for value in normalized),
+        "территория": any("территор" in value for value in normalized),
+        "менеджер": any("менеджер" in value for value in normalized),
+    }
+    missing = [name for name, present in required.items() if not present]
+    if missing:
+        raise ValueError(f"Не найдены обязательные колонки: {', '.join(missing)}.")
+    return Catalog(path), (sheet_name, *headers)
+
+
 def is_admin(user_id: int | None) -> bool:
     return user_id is not None and user_id in admin_ids
 
@@ -170,12 +199,14 @@ async def show_main(target: Message, user_id: int | None, *, edit: bool = False)
 @router.message(CommandStart())
 @router.message(Command("menu"))
 async def command_menu(message: Message, state: FSMContext) -> None:
+    await cleanup_pending_excel(state)
     await state.clear()
     await show_main(message, message.from_user.id if message.from_user else None)
 
 
 @router.message(Command("cancel"))
 async def cancel(message: Message, state: FSMContext) -> None:
+    await cleanup_pending_excel(state)
     await state.clear()
     await message.answer("✅ Текущее действие отменено.")
     await show_main(message, message.from_user.id if message.from_user else None)
@@ -183,6 +214,7 @@ async def cancel(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "main:menu")
 async def callback_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    await cleanup_pending_excel(state)
     await state.clear()
     await show_main(callback.message, callback.from_user.id, edit=True)
     await callback.answer()
@@ -333,6 +365,8 @@ def products_keyboard(admin: bool = False) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text=text, callback_data=f"{prefix}:{product.id}")])
     if admin:
         rows.append([InlineKeyboardButton(text="➕ Добавить товар", callback_data="adm:add_product")])
+        rows.append([InlineKeyboardButton(text="📊 Обновить Excel", callback_data="adm:excel")])
+        rows.append([InlineKeyboardButton(text="💾 Скачать резервную копию", callback_data="adm:backup")])
     rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -412,6 +446,189 @@ async def require_admin(callback: CallbackQuery) -> bool:
         return True
     await callback.answer("Этот раздел доступен только администратору.", show_alert=True)
     return False
+
+
+async def cleanup_pending_excel(state: FSMContext) -> None:
+    pending = (await state.get_data()).get("pending_excel")
+    if pending:
+        Path(pending).unlink(missing_ok=True)
+
+
+def build_backup_archive(archive_path: Path) -> None:
+    with tempfile.TemporaryDirectory() as temp_name:
+        temp_dir = Path(temp_name)
+        database_copy = temp_dir / "materials.sqlite3"
+        excel_copy = temp_dir / "managers.xlsx"
+        materials_db.backup_to(database_copy)
+        shutil.copy2(active_excel_path, excel_copy)
+        metadata = temp_dir / "README.txt"
+        metadata.write_text(
+            "Резервная копия Ural Vape Regions Bot\n"
+            f"Создана: {datetime.now().astimezone().isoformat(timespec='seconds')}\n"
+            f"Записей территорий: {len(catalog.entries)}\n"
+            "materials.sqlite3 — товары, разделы и материалы\n"
+            "managers.xlsx — действующая таблица территорий\n",
+            encoding="utf-8",
+        )
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.write(database_copy, database_copy.name)
+            archive.write(excel_copy, excel_copy.name)
+            archive.write(metadata, metadata.name)
+
+
+@router.callback_query(F.data == "adm:backup")
+async def download_backup(callback: CallbackQuery) -> None:
+    if not await require_admin(callback):
+        return
+    await callback.answer("Готовлю резервную копию…")
+    await callback.message.answer(
+        "⏳ <b>Создаю резервную копию</b>\n\n"
+        "Это может занять несколько секунд. Не закрывайте чат."
+    )
+    try:
+        with tempfile.TemporaryDirectory() as temp_name:
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            archive_path = Path(temp_name) / f"ural-vape-bot-backup_{timestamp}.zip"
+            await asyncio.to_thread(build_backup_archive, archive_path)
+            await callback.message.answer_document(
+                FSInputFile(archive_path),
+                caption=(
+                    "✅ <b>Резервная копия готова</b>\n\n"
+                    "В архиве находятся база товаров и действующая таблица территорий. "
+                    "Храните файл в надёжном месте."
+                ),
+            )
+    except Exception:
+        logging.exception("Не удалось создать резервную копию")
+        await callback.message.answer(
+            "⚠️ Не удалось создать резервную копию. Попробуйте ещё раз или проверьте журнал сервера."
+        )
+
+
+@router.callback_query(F.data == "adm:excel")
+async def start_excel_upload(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin(callback):
+        return
+    await cleanup_pending_excel(state)
+    await state.set_state(AdminState.excel_upload)
+    await callback.message.edit_text(
+        "📊 <b>Обновление таблицы территорий</b>\n\n"
+        "Отправьте Excel-файл в формате <code>.xlsx</code>. В первой строке должны быть колонки:\n\n"
+        "• <b>Местоположение</b>\n"
+        "• <b>Территория</b>\n"
+        "• <b>Менеджер</b>\n\n"
+        "Сначала бот проверит файл и покажет сводку. Действующая таблица не изменится без подтверждения.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="main:admin")]]
+        ),
+    )
+    await callback.answer()
+
+
+@router.message(AdminState.excel_upload)
+async def receive_excel(message: Message, state: FSMContext, bot: Bot) -> None:
+    if not is_admin(message.from_user.id) or message.chat.type != "private":
+        return
+    if not message.document or not (message.document.file_name or "").lower().endswith(".xlsx"):
+        await message.answer(
+            "⚠️ Нужен документ в формате <code>.xlsx</code>. Отправьте правильный файл или нажмите /cancel."
+        )
+        return
+    pending_dir = managed_excel_path.parent / "pending"
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    pending_path = pending_dir / f"excel_{message.document.file_unique_id}.xlsx"
+    await message.answer("⏳ Файл получен. Проверяю структуру и данные…")
+    try:
+        await bot.download(message.document.file_id, destination=pending_path)
+        checked_catalog, details = await asyncio.to_thread(validate_excel, pending_path)
+    except Exception as error:
+        pending_path.unlink(missing_ok=True)
+        logging.warning("Отклонён Excel от администратора: %s", error)
+        await message.answer(
+            "❌ <b>Файл не прошёл проверку</b>\n\n"
+            f"Причина: {html.escape(str(error))}\n\n"
+            "Действующая таблица не изменена."
+        )
+        return
+    await state.set_state(AdminState.excel_confirmation)
+    await state.update_data(
+        pending_excel=str(pending_path),
+        excel_rows=len(checked_catalog.entries),
+        excel_sheet=details[0],
+        excel_name=message.document.file_name,
+    )
+    await message.answer(
+        "✅ <b>Файл успешно проверен</b>\n\n"
+        f"Файл: <code>{html.escape(message.document.file_name)}</code>\n"
+        f"Лист: <b>{html.escape(details[0])}</b>\n"
+        f"Корректных записей: <b>{len(checked_catalog.entries):,}</b>\n\n"
+        "Применить эту таблицу? Текущая версия будет сохранена в резервную копию.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Применить", callback_data="adm:apply_excel")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:cancel_excel")],
+            ]
+        ),
+    )
+
+
+def apply_pending_excel(pending_path: Path) -> tuple[Catalog, Path]:
+    checked_catalog, _ = validate_excel(pending_path)
+    backup_dir = managed_excel_path.parent / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    backup_path = backup_dir / f"managers_{timestamp}.xlsx"
+    shutil.copy2(active_excel_path, backup_path)
+    managed_excel_path.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(pending_path, managed_excel_path)
+    checked_catalog.path = managed_excel_path
+    return checked_catalog, backup_path
+
+
+@router.callback_query(F.data == "adm:apply_excel")
+async def apply_excel(callback: CallbackQuery, state: FSMContext) -> None:
+    global catalog, active_excel_path
+    if not await require_admin(callback):
+        return
+    data = await state.get_data()
+    pending_path = Path(data.get("pending_excel", ""))
+    if not pending_path.is_file():
+        await state.clear()
+        await callback.answer("Файл проверки не найден. Загрузите его ещё раз.", show_alert=True)
+        return
+    await callback.answer("Применяю таблицу…")
+    try:
+        new_catalog, backup_path = await asyncio.to_thread(apply_pending_excel, pending_path)
+        catalog = new_catalog
+        active_excel_path = managed_excel_path
+    except Exception:
+        logging.exception("Не удалось применить новый Excel")
+        await callback.message.edit_text(
+            "❌ Не удалось применить таблицу. Действующая версия сохранена без изменений.",
+            reply_markup=products_keyboard(admin=True),
+        )
+        return
+    await state.clear()
+    await callback.message.edit_text(
+        "✅ <b>Таблица обновлена</b>\n\n"
+        f"Загружено записей: <b>{len(catalog.entries):,}</b>\n"
+        "Новые данные уже используются в поиске — перезапуск бота не требуется.\n\n"
+        f"Предыдущая версия сохранена: <code>{html.escape(backup_path.name)}</code>",
+        reply_markup=products_keyboard(admin=True),
+    )
+
+
+@router.callback_query(F.data == "adm:cancel_excel")
+async def cancel_excel(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin(callback):
+        return
+    await cleanup_pending_excel(state)
+    await state.clear()
+    await callback.message.edit_text(
+        "Обновление таблицы отменено. Действующие данные не изменились.",
+        reply_markup=products_keyboard(admin=True),
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data == "main:admin")
@@ -740,17 +957,20 @@ async def outside_mode(message: Message) -> None:
 
 
 async def main() -> None:
-    global catalog, materials_db, admin_ids
+    global catalog, materials_db, admin_ids, active_excel_path, managed_excel_path
     load_dotenv(BASE_DIR / ".env")
     token = os.getenv("BOT_TOKEN", "").strip()
     if not token:
         raise RuntimeError("Добавьте BOT_TOKEN в файл .env.")
     excel_path = Path(os.getenv("EXCEL_PATH", "managers.xlsx"))
+    managed_excel_path = Path(os.getenv("MANAGED_EXCEL_PATH", "data/managers.xlsx"))
     db_path = Path(os.getenv("MATERIALS_DB", "data/materials.sqlite3"))
     if not excel_path.is_absolute(): excel_path = BASE_DIR / excel_path
+    if not managed_excel_path.is_absolute(): managed_excel_path = BASE_DIR / managed_excel_path
     if not db_path.is_absolute(): db_path = BASE_DIR / db_path
     admin_ids = {int(value.strip()) for value in os.getenv("ADMIN_IDS", "5533726476").split(",") if value.strip()}
-    catalog = Catalog(excel_path)
+    active_excel_path = managed_excel_path if managed_excel_path.exists() else excel_path
+    catalog = Catalog(active_excel_path)
     materials_db = MaterialsDB(db_path)
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dispatcher = Dispatcher()
