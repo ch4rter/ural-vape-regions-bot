@@ -140,7 +140,7 @@ def is_admin(user_id: int | None) -> bool:
 
 def main_menu(user_id: int | None) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(text="🔎 Найти менеджера", callback_data="main:region")],
+        [InlineKeyboardButton(text="🔎 Поиск менеджера", callback_data="main:region")],
         [InlineKeyboardButton(text="🗃 База данных", callback_data="main:database")],
     ]
     if is_admin(user_id):
@@ -155,7 +155,12 @@ def back_main() -> InlineKeyboardMarkup:
 
 
 async def show_main(target: Message, user_id: int | None, *, edit: bool = False) -> None:
-    text = "Выберите нужный раздел:"
+    text = (
+        "👋 <b>Добро пожаловать!</b>\n\n"
+        "Здесь можно найти ответственного менеджера по территории или получить "
+        "рабочие материалы по продукции.\n\n"
+        "Выберите нужный раздел:"
+    )
     if edit:
         await target.edit_text(text, reply_markup=main_menu(user_id))
     else:
@@ -172,7 +177,7 @@ async def command_menu(message: Message, state: FSMContext) -> None:
 @router.message(Command("cancel"))
 async def cancel(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("Действие отменено.")
+    await message.answer("✅ Текущее действие отменено.")
     await show_main(message, message.from_user.id if message.from_user else None)
 
 
@@ -187,7 +192,9 @@ async def callback_menu(callback: CallbackQuery, state: FSMContext) -> None:
 async def open_region_search(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AppState.region_search)
     await callback.message.edit_text(
-        "Введите город, деревню, область или другую территорию.\n\nНапример: <code>Питер</code>",
+        "🔎 <b>Поиск менеджера</b>\n\n"
+        "Отправьте название города, посёлка, деревни, области или другой территории.\n\n"
+        "Например: <code>Питер</code>",
         reply_markup=back_main(),
     )
     await callback.answer()
@@ -201,7 +208,7 @@ def format_result(entries: list[Entry], page: int = 0) -> str:
     unique = unique_results(entries)
     if len(unique) == 1:
         name, location, manager = unique[0]
-        lines = [f"📍 <b>{html.escape(name)}</b>"]
+        lines = ["✅ <b>Менеджер найден</b>", "", f"📍 Территория: <b>{html.escape(name)}</b>"]
         if location:
             lines.append(f"🗺 Местоположение: <b>{html.escape(location)}</b>")
         lines.append(f"👤 Менеджер: <b>{html.escape(manager)}</b>")
@@ -209,13 +216,13 @@ def format_result(entries: list[Entry], page: int = 0) -> str:
     page_count = (len(unique) + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE
     page = max(0, min(page, page_count - 1))
     start = page * RESULTS_PER_PAGE
-    lines = [f"Найдено вариантов: <b>{len(unique)}</b>"]
+    lines = ["🔎 <b>Найдено несколько вариантов</b>", f"Всего совпадений: <b>{len(unique)}</b>"]
     if page_count > 1:
         lines.append(f"Страница <b>{page + 1}</b> из <b>{page_count}</b>")
     for number, (name, location, manager) in enumerate(
         unique[start : start + RESULTS_PER_PAGE], start=start + 1
     ):
-        block = [f"\n<b>{number}.</b> 📍 <b>{html.escape(name)}</b>"]
+        block = [f"\n<b>{number}.</b> 📍 Территория: <b>{html.escape(name)}</b>"]
         if location:
             block.append(f"🗺 Местоположение: <b>{html.escape(location)}</b>")
         block.append(f"👤 Менеджер: <b>{html.escape(manager)}</b>")
@@ -249,7 +256,10 @@ def pagination_keyboard(entry_index: int, entries: list[Entry], page: int) -> In
 async def search_region(message: Message) -> None:
     query = message.text.strip()
     if len(query) > 200:
-        await message.answer("Запрос слишком длинный.", reply_markup=back_main())
+        await message.answer(
+            "⚠️ Запрос получился слишком длинным. Отправьте только название территории.",
+            reply_markup=back_main(),
+        )
         return
     found = catalog.exact(query)
     if found:
@@ -258,7 +268,11 @@ async def search_region(message: Message) -> None:
         return
     indexes = catalog.suggestions(query)
     if not indexes:
-        await message.answer("Ничего не найдено. Проверьте написание.", reply_markup=back_main())
+        await message.answer(
+            "🤷 <b>Ничего не найдено</b>\n\n"
+            "Проверьте написание или попробуйте указать другое название территории.",
+            reply_markup=back_main(),
+        )
         return
     rows = []
     for index in indexes:
@@ -267,14 +281,17 @@ async def search_region(message: Message) -> None:
         rows.append([InlineKeyboardButton(text=suggestion_label(entry, count), callback_data=f"place:{index}")])
     rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")])
     await message.answer(
-        "Точного совпадения нет. Возможно, вы имели в виду:",
+        "Точного совпадения не найдено. Возможно, вы имели в виду один из вариантов:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
 
 
 @router.message(AppState.region_search)
 async def region_non_text(message: Message) -> None:
-    await message.answer("Введите название обычным текстом.", reply_markup=back_main())
+    await message.answer(
+        "Пожалуйста, отправьте название территории обычным текстовым сообщением.",
+        reply_markup=back_main(),
+    )
 
 
 @router.callback_query(F.data.startswith("place:"))
@@ -324,7 +341,11 @@ def products_keyboard(admin: bool = False) -> InlineKeyboardMarkup:
 async def open_database(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     products = materials_db.list_products(visible_only=True)
-    text = "Выберите товар:" if products else "База данных пока не заполнена."
+    text = (
+        "🗃 <b>База данных</b>\n\nВыберите продукцию, чтобы посмотреть доступные материалы:"
+        if products
+        else "🗃 <b>База данных</b>\n\nМатериалы пока не опубликованы. Загляните сюда позднее."
+    )
     await callback.message.edit_text(text, reply_markup=products_keyboard())
     await callback.answer()
 
@@ -338,7 +359,11 @@ async def open_product(callback: CallbackQuery) -> None:
     sections = materials_db.list_sections(product.id)
     rows = [[InlineKeyboardButton(text=s.name, callback_data=f"db:s:{s.id}")] for s in sections]
     rows.append([InlineKeyboardButton(text="⬅️ К товарам", callback_data="main:database")])
-    text = f"<b>{html.escape(product.name)}</b>\n\nВыберите материал:" if sections else f"<b>{html.escape(product.name)}</b>\n\nМатериалов пока нет."
+    text = (
+        f"📦 <b>{html.escape(product.name)}</b>\n\nВыберите нужный раздел:"
+        if sections
+        else f"📦 <b>{html.escape(product.name)}</b>\n\nВ этом разделе пока нет опубликованных материалов."
+    )
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await callback.answer()
 
@@ -364,22 +389,28 @@ async def deliver_section(callback: CallbackQuery, bot: Bot) -> None:
         return
     items = materials_db.list_materials(section.id)
     if not items:
-        await callback.answer("В этом разделе пока нет материалов.", show_alert=True)
+        await callback.answer("В этом разделе пока нет опубликованных материалов.", show_alert=True)
         return
-    await callback.answer("Отправляю материалы…")
-    await bot.send_message(callback.message.chat.id, f"<b>{html.escape(product.name)} · {html.escape(section.name)}</b>")
+    await callback.answer("Материалы отправляются…")
+    await bot.send_message(
+        callback.message.chat.id,
+        f"📎 <b>{html.escape(product.name)}</b>\nРаздел: <b>{html.escape(section.name)}</b>",
+    )
     for item in items:
         try:
             await send_material(bot, callback.message.chat.id, item)
         except Exception:
             logging.exception("Не удалось отправить материал %s", item.id)
-            await bot.send_message(callback.message.chat.id, "Не удалось отправить один из материалов.")
+            await bot.send_message(
+                callback.message.chat.id,
+                "⚠️ Один из материалов временно недоступен. Сообщите об этом администратору.",
+            )
 
 
 async def require_admin(callback: CallbackQuery) -> bool:
     if is_admin(callback.from_user.id) and callback.message.chat.type == "private":
         return True
-    await callback.answer("Недостаточно прав.", show_alert=True)
+    await callback.answer("Этот раздел доступен только администратору.", show_alert=True)
     return False
 
 
@@ -388,7 +419,12 @@ async def admin_menu(callback: CallbackQuery, state: FSMContext) -> None:
     if not await require_admin(callback):
         return
     await state.clear()
-    await callback.message.edit_text("⚙️ <b>Управление базой</b>", reply_markup=products_keyboard(admin=True))
+    await callback.message.edit_text(
+        "⚙️ <b>Управление базой</b>\n\n"
+        "Создавайте товары, добавляйте разделы и наполняйте их материалами. "
+        "Скрытые товары видны здесь, но недоступны пользователям.",
+        reply_markup=products_keyboard(admin=True),
+    )
     await callback.answer()
 
 
@@ -397,7 +433,10 @@ async def admin_add_product(callback: CallbackQuery, state: FSMContext) -> None:
     if not await require_admin(callback):
         return
     await state.set_state(AdminState.product_name)
-    await callback.message.edit_text("Введите название нового товара:", reply_markup=back_main())
+    await callback.message.edit_text(
+        "➕ <b>Новый товар</b>\n\nВведите название так, как его должны видеть пользователи:",
+        reply_markup=back_main(),
+    )
     await callback.answer()
 
 
@@ -408,10 +447,13 @@ async def save_product(message: Message, state: FSMContext) -> None:
     try:
         product = materials_db.add_product(message.text)
     except sqlite3.IntegrityError:
-        await message.answer("Товар с таким названием уже существует.")
+        await message.answer("⚠️ Товар с таким названием уже существует. Введите другое название.")
         return
     await state.clear()
-    await message.answer(f"Товар <b>{html.escape(product.name)}</b> создан.", reply_markup=admin_product_keyboard(product.id))
+    await message.answer(
+        f"✅ Товар <b>{html.escape(product.name)}</b> создан.\n\nТеперь добавьте в него первый раздел.",
+        reply_markup=admin_product_keyboard(product.id),
+    )
 
 
 def admin_product_keyboard(product_id: int) -> InlineKeyboardMarkup:
@@ -437,7 +479,9 @@ async def admin_product(callback: CallbackQuery) -> None:
         await callback.answer("Товар не найден.", show_alert=True); return
     status = "доступен пользователям" if product.is_visible else "скрыт"
     await callback.message.edit_text(
-        f"📦 <b>{html.escape(product.name)}</b>\nСтатус: {status}", reply_markup=admin_product_keyboard(product_id)
+        f"📦 <b>{html.escape(product.name)}</b>\n\nСтатус: <b>{status}</b>\n"
+        f"Разделов: <b>{len(materials_db.list_sections(product_id))}</b>",
+        reply_markup=admin_product_keyboard(product_id),
     )
     await callback.answer()
 
@@ -448,7 +492,11 @@ async def admin_add_section(callback: CallbackQuery, state: FSMContext) -> None:
     product_id = int(callback.data.rsplit(":", 1)[1])
     await state.set_state(AdminState.section_name)
     await state.update_data(product_id=product_id)
-    await callback.message.edit_text("Введите название нового раздела:", reply_markup=back_main())
+    await callback.message.edit_text(
+        "➕ <b>Новый раздел</b>\n\n"
+        "Введите название, например: <code>Декларации</code>, <code>Мокапы</code> или <code>КП</code>.",
+        reply_markup=back_main(),
+    )
     await callback.answer()
 
 
@@ -459,9 +507,12 @@ async def save_section(message: Message, state: FSMContext) -> None:
     try:
         section = materials_db.add_section(product_id, message.text)
     except sqlite3.IntegrityError:
-        await message.answer("Раздел с таким названием уже существует."); return
+        await message.answer("⚠️ Раздел с таким названием уже существует."); return
     await state.clear()
-    await message.answer(f"Раздел <b>{html.escape(section.name)}</b> создан.", reply_markup=admin_section_keyboard(section.id))
+    await message.answer(
+        f"✅ Раздел <b>{html.escape(section.name)}</b> создан.\n\nТеперь можно добавить материалы.",
+        reply_markup=admin_section_keyboard(section.id),
+    )
 
 
 def material_title(material: Material, number: int) -> str:
@@ -496,7 +547,9 @@ async def admin_section(callback: CallbackQuery) -> None:
         await callback.answer("Раздел не найден.", show_alert=True); return
     count = len(materials_db.list_materials(section_id))
     await callback.message.edit_text(
-        f"📁 <b>{html.escape(section.name)}</b>\nМатериалов: {count}", reply_markup=admin_section_keyboard(section_id)
+        f"📁 <b>{html.escape(section.name)}</b>\n\nМатериалов внутри: <b>{count}</b>\n"
+        "Нажмите на материал с символом 🗑, чтобы удалить его.",
+        reply_markup=admin_section_keyboard(section_id),
     )
     await callback.answer()
 
@@ -515,7 +568,10 @@ async def start_upload(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AdminState.material_upload)
     await state.update_data(section_id=section_id)
     await callback.message.edit_text(
-        "Отправляйте текст, изображения или документы по одному сообщению. Они сохранятся в том же порядке.\n\nКогда закончите, нажмите «Завершить».",
+        "📎 <b>Добавление материалов</b>\n\n"
+        "Отправляйте текст, изображения или документы по одному сообщению. "
+        "Пользователь получит их в том же порядке.\n\n"
+        "Когда всё будет добавлено, нажмите <b>«Завершить»</b>.",
         reply_markup=upload_keyboard(),
     )
     await callback.answer()
@@ -538,8 +594,11 @@ async def save_material(message: Message, state: FSMContext) -> None:
         )
         label = "Файл"
     else:
-        await message.answer("Поддерживаются текст, изображения и документы.", reply_markup=upload_keyboard()); return
-    await message.answer(f"✅ {label} добавлен.", reply_markup=upload_keyboard())
+        await message.answer(
+            "⚠️ Этот формат пока не поддерживается. Отправьте текст, изображение или документ.",
+            reply_markup=upload_keyboard(),
+        ); return
+    await message.answer(f"✅ {label} добавлен. Можно отправить следующий материал.", reply_markup=upload_keyboard())
 
 
 @router.callback_query(F.data == "adm:finish_upload")
@@ -550,7 +609,10 @@ async def finish_upload(callback: CallbackQuery, state: FSMContext) -> None:
     if not section_id or not materials_db.get_section(section_id):
         await callback.message.edit_text("Раздел не найден.", reply_markup=products_keyboard(admin=True))
     else:
-        await callback.message.edit_text("Материалы сохранены.", reply_markup=admin_section_keyboard(section_id))
+        await callback.message.edit_text(
+            "✅ <b>Материалы сохранены</b>\n\nРаздел готов к использованию.",
+            reply_markup=admin_section_keyboard(section_id),
+        )
     await callback.answer()
 
 
@@ -571,7 +633,7 @@ async def ask_product_rename(callback: CallbackQuery, state: FSMContext) -> None
     if not await require_admin(callback): return
     product_id = int(callback.data.rsplit(":", 1)[1])
     await state.set_state(AdminState.product_rename); await state.update_data(product_id=product_id)
-    await callback.message.edit_text("Введите новое название товара:", reply_markup=back_main()); await callback.answer()
+    await callback.message.edit_text("✏️ <b>Переименование товара</b>\n\nВведите новое название:", reply_markup=back_main()); await callback.answer()
 
 
 @router.message(AdminState.product_rename, F.text)
@@ -581,7 +643,7 @@ async def save_product_rename(message: Message, state: FSMContext) -> None:
     try: materials_db.rename_product(product_id, message.text)
     except sqlite3.IntegrityError:
         await message.answer("Такое название уже используется."); return
-    await state.clear(); await message.answer("Товар переименован.", reply_markup=admin_product_keyboard(product_id))
+    await state.clear(); await message.answer("✅ Название товара обновлено.", reply_markup=admin_product_keyboard(product_id))
 
 
 @router.callback_query(F.data.startswith("adm:rename_section:"))
@@ -589,7 +651,7 @@ async def ask_section_rename(callback: CallbackQuery, state: FSMContext) -> None
     if not await require_admin(callback): return
     section_id = int(callback.data.rsplit(":", 1)[1])
     await state.set_state(AdminState.section_rename); await state.update_data(section_id=section_id)
-    await callback.message.edit_text("Введите новое название раздела:", reply_markup=back_main()); await callback.answer()
+    await callback.message.edit_text("✏️ <b>Переименование раздела</b>\n\nВведите новое название:", reply_markup=back_main()); await callback.answer()
 
 
 @router.message(AdminState.section_rename, F.text)
@@ -599,7 +661,7 @@ async def save_section_rename(message: Message, state: FSMContext) -> None:
     try: materials_db.rename_section(section_id, message.text)
     except sqlite3.IntegrityError:
         await message.answer("Такое название уже используется."); return
-    await state.clear(); await message.answer("Раздел переименован.", reply_markup=admin_section_keyboard(section_id))
+    await state.clear(); await message.answer("✅ Название раздела обновлено.", reply_markup=admin_section_keyboard(section_id))
 
 
 @router.callback_query(F.data.startswith("adm:toggle_product:"))
@@ -620,21 +682,27 @@ def confirm_keyboard(yes_data: str, back_data: str) -> InlineKeyboardMarkup:
 async def confirm_product(callback: CallbackQuery) -> None:
     if not await require_admin(callback): return
     product_id = int(callback.data.rsplit(":", 1)[1])
-    await callback.message.edit_text("Удалить товар вместе со всеми разделами и материалами?", reply_markup=confirm_keyboard(f"adm:delete_product:{product_id}", f"adm:p:{product_id}")); await callback.answer()
+    await callback.message.edit_text(
+        "⚠️ <b>Удалить товар?</b>\n\nБудут удалены все его разделы и материалы. Это действие нельзя отменить.",
+        reply_markup=confirm_keyboard(f"adm:delete_product:{product_id}", f"adm:p:{product_id}"),
+    ); await callback.answer()
 
 
 @router.callback_query(F.data.startswith("adm:delete_product:"))
 async def delete_product(callback: CallbackQuery) -> None:
     if not await require_admin(callback): return
     materials_db.delete_product(int(callback.data.rsplit(":", 1)[1]))
-    await callback.message.edit_text("Товар удалён.", reply_markup=products_keyboard(admin=True)); await callback.answer()
+    await callback.message.edit_text("✅ Товар и все связанные материалы удалены.", reply_markup=products_keyboard(admin=True)); await callback.answer()
 
 
 @router.callback_query(F.data.startswith("adm:confirm_section:"))
 async def confirm_section(callback: CallbackQuery) -> None:
     if not await require_admin(callback): return
     section_id = int(callback.data.rsplit(":", 1)[1]); section = materials_db.get_section(section_id)
-    await callback.message.edit_text("Удалить раздел и все его материалы?", reply_markup=confirm_keyboard(f"adm:delete_section:{section_id}", f"adm:s:{section_id}")); await callback.answer()
+    await callback.message.edit_text(
+        "⚠️ <b>Удалить раздел?</b>\n\nВсе материалы внутри него также будут удалены. Это действие нельзя отменить.",
+        reply_markup=confirm_keyboard(f"adm:delete_section:{section_id}", f"adm:s:{section_id}"),
+    ); await callback.answer()
 
 
 @router.callback_query(F.data.startswith("adm:delete_section:"))
@@ -642,14 +710,17 @@ async def delete_section(callback: CallbackQuery) -> None:
     if not await require_admin(callback): return
     section_id = int(callback.data.rsplit(":", 1)[1]); section = materials_db.get_section(section_id)
     product_id = section.product_id if section else 0; materials_db.delete_section(section_id)
-    await callback.message.edit_text("Раздел удалён.", reply_markup=admin_product_keyboard(product_id)); await callback.answer()
+    await callback.message.edit_text("✅ Раздел удалён.", reply_markup=admin_product_keyboard(product_id)); await callback.answer()
 
 
 @router.callback_query(F.data.startswith("adm:confirm_material:"))
 async def confirm_material(callback: CallbackQuery) -> None:
     if not await require_admin(callback): return
     material_id = int(callback.data.rsplit(":", 1)[1]); material = materials_db.get_material(material_id)
-    await callback.message.edit_text("Удалить этот материал?", reply_markup=confirm_keyboard(f"adm:delete_material:{material_id}", f"adm:s:{material.section_id}")); await callback.answer()
+    await callback.message.edit_text(
+        "⚠️ <b>Удалить материал?</b>\n\nЭто действие нельзя отменить.",
+        reply_markup=confirm_keyboard(f"adm:delete_material:{material_id}", f"adm:s:{material.section_id}"),
+    ); await callback.answer()
 
 
 @router.callback_query(F.data.startswith("adm:delete_material:"))
@@ -657,12 +728,15 @@ async def delete_material(callback: CallbackQuery) -> None:
     if not await require_admin(callback): return
     material_id = int(callback.data.rsplit(":", 1)[1]); material = materials_db.get_material(material_id)
     section_id = material.section_id if material else 0; materials_db.delete_material(material_id)
-    await callback.message.edit_text("Материал удалён.", reply_markup=admin_section_keyboard(section_id)); await callback.answer()
+    await callback.message.edit_text("✅ Материал удалён.", reply_markup=admin_section_keyboard(section_id)); await callback.answer()
 
 
 @router.message(StateFilter(None))
 async def outside_mode(message: Message) -> None:
-    await message.answer("Сначала выберите раздел в главном меню.", reply_markup=main_menu(message.from_user.id if message.from_user else None))
+    await message.answer(
+        "Чтобы продолжить, выберите нужный раздел:",
+        reply_markup=main_menu(message.from_user.id if message.from_user else None),
+    )
 
 
 async def main() -> None:
