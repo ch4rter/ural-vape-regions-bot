@@ -9,6 +9,7 @@ import tempfile
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 from difflib import SequenceMatcher
 from itertools import chain
 from pathlib import Path
@@ -24,6 +25,7 @@ from dotenv import load_dotenv
 from openpyxl import load_workbook
 
 from materials_db import Material, MaterialsDB
+from prices_db import WAREHOUSES, GroupDetails, PricesDB, parse_price_file, save_price_source
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -31,13 +33,16 @@ RESULTS_PER_PAGE = 10
 router = Router()
 catalog: "Catalog"
 materials_db: MaterialsDB
+prices_db: PricesDB
 admin_ids: set[int] = set()
 active_excel_path: Path
 managed_excel_path: Path
+price_storage_path: Path
 
 
 class AppState(StatesGroup):
     region_search = State()
+    price_search = State()
 
 
 class AdminState(StatesGroup):
@@ -48,6 +53,8 @@ class AdminState(StatesGroup):
     material_upload = State()
     excel_upload = State()
     excel_confirmation = State()
+    price_upload = State()
+    price_confirmation = State()
 
 
 def normalize(value: str) -> str:
@@ -170,6 +177,7 @@ def is_admin(user_id: int | None) -> bool:
 def main_menu(user_id: int | None) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="🔎 Поиск менеджера", callback_data="main:region")],
+        [InlineKeyboardButton(text="💰 Цены и наличие", callback_data="main:prices")],
         [InlineKeyboardButton(text="🗃 База данных", callback_data="main:database")],
     ]
     if is_admin(user_id):
@@ -355,6 +363,140 @@ async def change_page(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
+def money(value: Decimal) -> str:
+    quantized = value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return f"{quantized:,.2f}".replace(",", " ").replace(".", ",")
+
+
+def discounted(value: Decimal, percent: int) -> Decimal:
+    return value * (Decimal(100 - percent) / Decimal(100))
+
+
+def variant_word(count: int) -> str:
+    if count % 10 == 1 and count % 100 != 11:
+        return "вариант"
+    if count % 10 in (2, 3, 4) and count % 100 not in (12, 13, 14):
+        return "варианта"
+    return "вариантов"
+
+
+def price_group_label(display_name: str, category_name: str) -> str:
+    label = f"{display_name} · {category_name}"
+    return label if len(label) <= 64 else f"{label[:61]}..."
+
+
+def format_price_group(details: GroupDetails) -> str:
+    lines = [
+        f"💰 <b>{html.escape(details.summary.display_name)}</b>",
+        f"Категория: <b>{html.escape(details.summary.category_name)}</b>",
+        f"Уникальных вариантов: <b>{details.unique_variants}</b>",
+        "",
+        "🏢 <b>Наличие и ассортимент</b>",
+    ]
+    for warehouse in ("center", "west", "ural"):
+        count = details.summary.warehouse_counts.get(warehouse, 0)
+        if count:
+            lines.append(f"✅ {WAREHOUSES[warehouse]} — <b>{count}</b> {variant_word(count)}")
+        else:
+            lines.append(f"❌ {WAREHOUSES[warehouse]} — нет в прайсе")
+    lines.extend(["", "💳 <b>Цены внутри группы</b>"])
+    for number, tier in enumerate(details.tiers, 1):
+        if len(details.tiers) > 1:
+            lines.extend([
+                "",
+                f"<b>Ценовой уровень {number}</b> · {tier.variant_count} {variant_word(tier.variant_count)}",
+            ])
+        lines.append("<pre>Скидка       Нал      Безнал")
+        for percent in (0, 5, 10, 15):
+            cash = money(discounted(tier.cash, percent))
+            cashless = money(discounted(tier.cashless, percent))
+            lines.append(f"{percent:>3}%  {cash:>9}  {cashless:>10}")
+        lines[-1] = f"{lines[-1]}</pre>"
+    return "\n".join(lines)
+
+
+@router.callback_query(F.data == "main:prices")
+async def open_price_search(callback: CallbackQuery, state: FSMContext) -> None:
+    if not prices_db.import_statuses():
+        await callback.answer("Прайсы пока не загружены.", show_alert=True)
+        return
+    await state.set_state(AppState.price_search)
+    await callback.message.edit_text(
+        "💰 <b>Цены и наличие</b>\n\n"
+        "Введите название товарной группы. Можно использовать бренд, модель, категорию "
+        "или их часть — точное совпадение не требуется.\n\n"
+        "Например: <code>OGGO VLIQ</code> или <code>Dojo 12000</code>",
+        reply_markup=back_main(),
+    )
+    await callback.answer()
+
+
+@router.message(AppState.price_search, F.text)
+async def search_prices(message: Message) -> None:
+    query = message.text.strip()
+    if len(query) > 200:
+        await message.answer("⚠️ Запрос слишком длинный. Укажите только товарную группу.", reply_markup=back_main())
+        return
+    groups = prices_db.search_groups(query)
+    if not groups:
+        await message.answer(
+            "🤷 <b>Товарная группа не найдена</b>\n\n"
+            "Попробуйте сократить запрос, проверить название бренда или указать модель.",
+            reply_markup=back_main(),
+        )
+        return
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=price_group_label(group.display_name, group.category_name),
+                callback_data=f"price:g:{group.callback_id}",
+            )
+        ]
+        for group in groups
+    ]
+    rows.extend([
+        [InlineKeyboardButton(text="🔎 Новый поиск", callback_data="main:prices")],
+        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")],
+    ])
+    await message.answer(
+        f"🔎 <b>Подходящих групп: {len(groups)}</b>\n\nВыберите нужную:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.message(AppState.price_search)
+async def price_non_text(message: Message) -> None:
+    await message.answer("Отправьте название товара обычным текстом.", reply_markup=back_main())
+
+
+@router.callback_query(F.data.startswith("price:g:"))
+async def show_price_group(callback: CallbackQuery) -> None:
+    try:
+        callback_id = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректный запрос.", show_alert=True)
+        return
+    details = prices_db.group_details(callback_id)
+    if not details:
+        await callback.answer("Прайс обновился. Выполните поиск ещё раз.", show_alert=True)
+        return
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔎 Новый поиск", callback_data="main:prices")],
+        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")],
+    ])
+    text = format_price_group(details)
+    if len(text) <= 4000:
+        await callback.message.edit_text(text, reply_markup=keyboard)
+    else:
+        await callback.message.edit_text(
+            f"💰 <b>{html.escape(details.summary.display_name)}</b>\n\n"
+            "В группе много ценовых уровней — отправляю подробный расчёт отдельным сообщением.",
+            reply_markup=keyboard,
+        )
+        await callback.message.answer(text)
+    await callback.answer()
+
+
 def products_keyboard(admin: bool = False) -> InlineKeyboardMarkup:
     products = materials_db.list_products(visible_only=not admin)
     rows = []
@@ -365,6 +507,7 @@ def products_keyboard(admin: bool = False) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text=text, callback_data=f"{prefix}:{product.id}")])
     if admin:
         rows.append([InlineKeyboardButton(text="➕ Добавить товар", callback_data="adm:add_product")])
+        rows.append([InlineKeyboardButton(text="💰 Обновить прайсы", callback_data="adm:prices")])
         rows.append([InlineKeyboardButton(text="📊 Обновить Excel", callback_data="adm:excel")])
         rows.append([InlineKeyboardButton(text="💾 Скачать резервную копию", callback_data="adm:backup")])
     rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")])
@@ -449,9 +592,11 @@ async def require_admin(callback: CallbackQuery) -> bool:
 
 
 async def cleanup_pending_excel(state: FSMContext) -> None:
-    pending = (await state.get_data()).get("pending_excel")
-    if pending:
-        Path(pending).unlink(missing_ok=True)
+    data = await state.get_data()
+    for key in ("pending_excel", "pending_price"):
+        pending = data.get(key)
+        if pending:
+            Path(pending).unlink(missing_ok=True)
 
 
 def build_backup_archive(archive_path: Path) -> None:
@@ -461,18 +606,32 @@ def build_backup_archive(archive_path: Path) -> None:
         excel_copy = temp_dir / "managers.xlsx"
         materials_db.backup_to(database_copy)
         shutil.copy2(active_excel_path, excel_copy)
+        prices_database = globals().get("prices_db")
+        prices_copy = temp_dir / "prices.sqlite3"
+        if prices_database is not None:
+            prices_database.backup_to(prices_copy)
         metadata = temp_dir / "README.txt"
         metadata.write_text(
             "Резервная копия Ural Vape Regions Bot\n"
             f"Создана: {datetime.now().astimezone().isoformat(timespec='seconds')}\n"
             f"Записей территорий: {len(catalog.entries)}\n"
             "materials.sqlite3 — товары, разделы и материалы\n"
-            "managers.xlsx — действующая таблица территорий\n",
+            "managers.xlsx — действующая таблица территорий\n"
+            "prices.sqlite3 — загруженные складские цены и товарные группы\n"
+            "price_files/ — последние исходные прайсы складов\n",
             encoding="utf-8",
         )
         with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             archive.write(database_copy, database_copy.name)
             archive.write(excel_copy, excel_copy.name)
+            if prices_copy.exists():
+                archive.write(prices_copy, prices_copy.name)
+            storage = globals().get("price_storage_path")
+            if storage and storage.exists():
+                for warehouse in WAREHOUSES:
+                    source = storage / f"{warehouse}.xlsx"
+                    if source.exists():
+                        archive.write(source, f"price_files/{source.name}")
             archive.write(metadata, metadata.name)
 
 
@@ -494,7 +653,7 @@ async def download_backup(callback: CallbackQuery) -> None:
                 FSInputFile(archive_path),
                 caption=(
                     "✅ <b>Резервная копия готова</b>\n\n"
-                    "В архиве находятся база товаров и действующая таблица территорий. "
+                    "В архиве находятся база материалов, таблица территорий и складские прайсы. "
                     "Храните файл в надёжном месте."
                 ),
             )
@@ -627,6 +786,188 @@ async def cancel_excel(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.edit_text(
         "Обновление таблицы отменено. Действующие данные не изменились.",
         reply_markup=products_keyboard(admin=True),
+    )
+    await callback.answer()
+
+
+def price_admin_keyboard() -> InlineKeyboardMarkup:
+    statuses = prices_db.import_statuses()
+    rows = []
+    for warehouse in ("center", "west", "ural"):
+        marker = "✅" if warehouse in statuses else "➕"
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{marker} {WAREHOUSES[warehouse]}",
+                callback_data=f"adm:price_wh:{warehouse}",
+            )
+        ])
+    rows.append([InlineKeyboardButton(text="⬅️ К управлению", callback_data="main:admin")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def price_status_text() -> str:
+    statuses = prices_db.import_statuses()
+    lines = [
+        "💰 <b>Управление прайсами</b>",
+        "",
+        "Выберите склад, для которого хотите загрузить свежий прайс.",
+        "Данные остальных складов не изменятся.",
+        "",
+    ]
+    for warehouse in ("center", "west", "ural"):
+        status = statuses.get(warehouse)
+        if status:
+            date = (status["price_date"] or status["updated_at"] or "").split("T", 1)[0]
+            lines.append(
+                f"✅ <b>{WAREHOUSES[warehouse]}</b> — {status['item_count']} позиций, "
+                f"прайс от {html.escape(date)}"
+            )
+        else:
+            lines.append(f"➕ <b>{WAREHOUSES[warehouse]}</b> — прайс не загружен")
+    return "\n".join(lines)
+
+
+@router.callback_query(F.data == "adm:prices")
+async def admin_prices(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin(callback):
+        return
+    await cleanup_pending_excel(state)
+    await state.clear()
+    await callback.message.edit_text(price_status_text(), reply_markup=price_admin_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:price_wh:"))
+async def start_price_upload(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin(callback):
+        return
+    warehouse = callback.data.rsplit(":", 1)[1]
+    if warehouse not in WAREHOUSES:
+        await callback.answer("Неизвестный склад.", show_alert=True)
+        return
+    await cleanup_pending_excel(state)
+    await state.set_state(AdminState.price_upload)
+    await state.update_data(price_warehouse=warehouse)
+    await callback.message.edit_text(
+        f"💰 <b>Обновление прайса</b>\n"
+        f"Склад: <b>{WAREHOUSES[warehouse]}</b>\n\n"
+        "Отправьте свежий прайс в формате <code>.xlsx</code>. Бот проверит структуру, "
+        "товарные группы и цены, после чего покажет сводку перед применением.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="adm:prices")]]
+        ),
+    )
+    await callback.answer()
+
+
+@router.message(AdminState.price_upload)
+async def receive_price_file(message: Message, state: FSMContext, bot: Bot) -> None:
+    if not is_admin(message.from_user.id) or message.chat.type != "private":
+        return
+    data = await state.get_data()
+    warehouse = data.get("price_warehouse")
+    if warehouse not in WAREHOUSES:
+        await state.clear()
+        await message.answer("Склад не выбран. Начните загрузку заново.")
+        return
+    if not message.document or not (message.document.file_name or "").lower().endswith(".xlsx"):
+        await message.answer("⚠️ Отправьте прайс как документ в формате <code>.xlsx</code>.")
+        return
+    pending_dir = price_storage_path / "pending"
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    pending_path = pending_dir / f"{warehouse}_{message.document.file_unique_id}.xlsx"
+    await message.answer("⏳ Прайс получен. Проверяю группы, цены и ассортимент…")
+    try:
+        await bot.download(message.document.file_id, destination=pending_path)
+        parsed = await asyncio.to_thread(parse_price_file, pending_path)
+    except Exception as error:
+        pending_path.unlink(missing_ok=True)
+        logging.warning("Отклонён прайс склада %s: %s", warehouse, error)
+        await message.answer(
+            "❌ <b>Прайс не прошёл проверку</b>\n\n"
+            f"Причина: {html.escape(str(error))}\n\n"
+            "Действующие цены не изменены."
+        )
+        return
+    await state.set_state(AdminState.price_confirmation)
+    await state.update_data(
+        pending_price=str(pending_path),
+        price_warehouse=warehouse,
+        price_file_name=message.document.file_name,
+    )
+    price_date = parsed.price_date.split("T", 1)[0] if parsed.price_date else "не указана"
+    await message.answer(
+        "✅ <b>Прайс успешно проверен</b>\n\n"
+        f"Склад: <b>{WAREHOUSES[warehouse]}</b>\n"
+        f"Дата прайса: <b>{html.escape(price_date)}</b>\n"
+        f"Товарных групп: <b>{len(parsed.groups)}</b>\n"
+        f"Товарных позиций: <b>{parsed.item_count}</b>\n"
+        f"Акционных позиций исключено: <b>{parsed.ignored_actions}</b>\n\n"
+        "Применить этот прайс? Предыдущая версия выбранного склада будет сохранена.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Применить", callback_data="adm:apply_price")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:cancel_price")],
+        ]),
+    )
+
+
+def apply_pending_price(
+    pending_path: Path, warehouse: str, file_name: str
+) -> tuple[int, int, Path | None]:
+    parsed = parse_price_file(pending_path)
+    backup_dir = price_storage_path / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    database_backup = backup_dir / f"prices_before_{warehouse}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.sqlite3"
+    prices_db.backup_to(database_backup)
+    source_backup = save_price_source(pending_path, price_storage_path, warehouse)
+    prices_db.replace_warehouse(warehouse, parsed, file_name)
+    pending_path.unlink(missing_ok=True)
+    return len(parsed.groups), parsed.item_count, source_backup
+
+
+@router.callback_query(F.data == "adm:apply_price")
+async def apply_price(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin(callback):
+        return
+    data = await state.get_data()
+    warehouse = data.get("price_warehouse")
+    pending_path = Path(data.get("pending_price", ""))
+    if warehouse not in WAREHOUSES or not pending_path.is_file():
+        await state.clear()
+        await callback.answer("Файл проверки не найден. Загрузите прайс ещё раз.", show_alert=True)
+        return
+    await callback.answer("Применяю прайс…")
+    try:
+        group_count, item_count, _ = await asyncio.to_thread(
+            apply_pending_price, pending_path, warehouse, data.get("price_file_name", pending_path.name)
+        )
+    except Exception:
+        logging.exception("Не удалось применить прайс склада %s", warehouse)
+        await callback.message.edit_text(
+            "❌ Не удалось применить прайс. Предыдущие данные сохранены.",
+            reply_markup=price_admin_keyboard(),
+        )
+        return
+    await state.clear()
+    await callback.message.edit_text(
+        "✅ <b>Прайс обновлён</b>\n\n"
+        f"Склад: <b>{WAREHOUSES[warehouse]}</b>\n"
+        f"Товарных групп: <b>{group_count}</b>\n"
+        f"Товарных позиций: <b>{item_count}</b>\n\n"
+        "Новые цены и наличие уже доступны менеджерам. Перезапуск бота не требуется.",
+        reply_markup=price_admin_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "adm:cancel_price")
+async def cancel_price(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin(callback):
+        return
+    await cleanup_pending_excel(state)
+    await state.clear()
+    await callback.message.edit_text(
+        "Загрузка прайса отменена. Действующие цены не изменились.",
+        reply_markup=price_admin_keyboard(),
     )
     await callback.answer()
 
@@ -957,7 +1298,8 @@ async def outside_mode(message: Message) -> None:
 
 
 async def main() -> None:
-    global catalog, materials_db, admin_ids, active_excel_path, managed_excel_path
+    global catalog, materials_db, prices_db, admin_ids
+    global active_excel_path, managed_excel_path, price_storage_path
     load_dotenv(BASE_DIR / ".env")
     token = os.getenv("BOT_TOKEN", "").strip()
     if not token:
@@ -965,13 +1307,18 @@ async def main() -> None:
     excel_path = Path(os.getenv("EXCEL_PATH", "managers.xlsx"))
     managed_excel_path = Path(os.getenv("MANAGED_EXCEL_PATH", "data/managers.xlsx"))
     db_path = Path(os.getenv("MATERIALS_DB", "data/materials.sqlite3"))
+    prices_db_path = Path(os.getenv("PRICES_DB", "data/prices.sqlite3"))
+    price_storage_path = Path(os.getenv("PRICE_STORAGE", "data/prices"))
     if not excel_path.is_absolute(): excel_path = BASE_DIR / excel_path
     if not managed_excel_path.is_absolute(): managed_excel_path = BASE_DIR / managed_excel_path
     if not db_path.is_absolute(): db_path = BASE_DIR / db_path
+    if not prices_db_path.is_absolute(): prices_db_path = BASE_DIR / prices_db_path
+    if not price_storage_path.is_absolute(): price_storage_path = BASE_DIR / price_storage_path
     admin_ids = {int(value.strip()) for value in os.getenv("ADMIN_IDS", "5533726476").split(",") if value.strip()}
     active_excel_path = managed_excel_path if managed_excel_path.exists() else excel_path
     catalog = Catalog(active_excel_path)
     materials_db = MaterialsDB(db_path)
+    prices_db = PricesDB(prices_db_path)
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
