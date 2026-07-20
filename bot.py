@@ -30,6 +30,7 @@ from prices_db import WAREHOUSES, GroupDetails, PricesDB, parse_price_file, save
 
 BASE_DIR = Path(__file__).resolve().parent
 RESULTS_PER_PAGE = 10
+PRICE_VARIANTS_PER_PAGE = 12
 router = Router()
 catalog: "Catalog"
 materials_db: MaterialsDB
@@ -406,13 +407,59 @@ def format_price_group(details: GroupDetails) -> str:
                 "",
                 f"<b>Ценовой уровень {number}</b> · {tier.variant_count} {variant_word(tier.variant_count)}",
             ])
-        lines.append("<pre>Скидка       Нал      Безнал")
         for percent in (0, 5, 10, 15):
             cash = money(discounted(tier.cash, percent))
             cashless = money(discounted(tier.cashless, percent))
-            lines.append(f"{percent:>3}%  {cash:>9}  {cashless:>10}")
-        lines[-1] = f"{lines[-1]}</pre>"
+            label = "Без скидки" if percent == 0 else f"Скидка {percent}%"
+            lines.extend([
+                "",
+                f"<b>{label}</b>",
+                f"• Нал — <b>{cash} ₽</b>",
+                f"• Безнал — <b>{cashless} ₽</b>",
+            ])
     return "\n".join(lines)
+
+
+def format_price_variants(summary, variants, page: int) -> str:
+    page_count = max(1, (len(variants) + PRICE_VARIANTS_PER_PAGE - 1) // PRICE_VARIANTS_PER_PAGE)
+    page = max(0, min(page, page_count - 1))
+    start = page * PRICE_VARIANTS_PER_PAGE
+    shown = variants[start : start + PRICE_VARIANTS_PER_PAGE]
+    lines = [
+        f"🎨 <b>{html.escape(summary.display_name)}</b>",
+        f"Вкусов и цветов: <b>{len(variants)}</b>",
+    ]
+    if page_count > 1:
+        lines.append(f"Страница <b>{page + 1}</b> из <b>{page_count}</b>")
+    for number, variant in enumerate(shown, start=start + 1):
+        warehouses = " · ".join(
+            WAREHOUSES[key] for key in ("center", "west", "ural") if key in variant.warehouses
+        )
+        lines.extend([
+            "",
+            f"<b>{number}.</b> {html.escape(variant.name)}",
+            f"📍 {html.escape(warehouses)}",
+        ])
+    return "\n".join(lines)
+
+
+def price_variants_keyboard(callback_id: int, page: int, total: int) -> InlineKeyboardMarkup:
+    page_count = max(1, (total + PRICE_VARIANTS_PER_PAGE - 1) // PRICE_VARIANTS_PER_PAGE)
+    navigation = []
+    if page > 0:
+        navigation.append(
+            InlineKeyboardButton(text="⬅️ Назад", callback_data=f"price:v:{callback_id}:{page - 1}")
+        )
+    if page + 1 < page_count:
+        navigation.append(
+            InlineKeyboardButton(text="Далее ➡️", callback_data=f"price:v:{callback_id}:{page + 1}")
+        )
+    rows = [navigation] if navigation else []
+    rows.extend([
+        [InlineKeyboardButton(text="💰 Вернуться к ценам", callback_data=f"price:g:{callback_id}")],
+        [InlineKeyboardButton(text="🔎 Новый поиск", callback_data="main:prices")],
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 @router.callback_query(F.data == "main:prices")
@@ -481,6 +528,7 @@ async def show_price_group(callback: CallbackQuery) -> None:
         await callback.answer("Прайс обновился. Выполните поиск ещё раз.", show_alert=True)
         return
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎨 Вкусы и цвета", callback_data=f"price:v:{callback_id}:0")],
         [InlineKeyboardButton(text="🔎 Новый поиск", callback_data="main:prices")],
         [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")],
     ])
@@ -494,6 +542,26 @@ async def show_price_group(callback: CallbackQuery) -> None:
             reply_markup=keyboard,
         )
         await callback.message.answer(text)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("price:v:"))
+async def show_price_variants(callback: CallbackQuery) -> None:
+    try:
+        _, _, raw_id, raw_page = callback.data.split(":", 3)
+        callback_id, page = int(raw_id), int(raw_page)
+    except ValueError:
+        await callback.answer("Некорректный запрос.", show_alert=True)
+        return
+    result = prices_db.group_variants(callback_id)
+    if not result:
+        await callback.answer("Прайс обновился. Выполните поиск ещё раз.", show_alert=True)
+        return
+    summary, variants = result
+    await callback.message.edit_text(
+        format_price_variants(summary, variants, page),
+        reply_markup=price_variants_keyboard(callback_id, page, len(variants)),
+    )
     await callback.answer()
 
 
@@ -902,7 +970,7 @@ async def receive_price_file(message: Message, state: FSMContext, bot: Bot) -> N
         f"Дата прайса: <b>{html.escape(price_date)}</b>\n"
         f"Товарных групп: <b>{len(parsed.groups)}</b>\n"
         f"Товарных позиций: <b>{parsed.item_count}</b>\n"
-        f"Акционных позиций исключено: <b>{parsed.ignored_actions}</b>\n\n"
+        f"Позиций с пометкой «АКЦИЯ»: <b>{parsed.action_count}</b>\n\n"
         "Применить этот прайс? Предыдущая версия выбранного склада будет сохранена.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Применить", callback_data="adm:apply_price")],

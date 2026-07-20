@@ -41,6 +41,16 @@ def clean_group_name(full_path: str) -> str:
     return re.sub(r"\s+", " ", name).strip()
 
 
+def variant_display_name(name: str) -> str:
+    name = re.sub(r"^\s*АКЦИЯ\s+", "", name, flags=re.IGNORECASE).strip()
+    if " - " in name:
+        return name.split(" - ", 1)[1].strip()
+    flavor_match = re.search(r"\bс ароматом\s+(.+)$", name, flags=re.IGNORECASE)
+    if flavor_match:
+        return flavor_match.group(1).strip()
+    return name
+
+
 def category_from_path(full_path: str) -> tuple[str, str]:
     normalized = normalize_price_text(full_path)
     rules = (
@@ -91,7 +101,7 @@ class ParsedPrice:
     sheet_name: str
     price_date: str | None
     groups: tuple[ParsedGroup, ...]
-    ignored_actions: int
+    action_count: int
 
     @property
     def item_count(self) -> int:
@@ -120,6 +130,12 @@ class GroupDetails:
     summary: GroupSummary
     tiers: tuple[PriceTier, ...]
     unique_variants: int
+
+
+@dataclass(frozen=True)
+class VariantAvailability:
+    name: str
+    warehouses: tuple[str, ...]
 
 
 def parse_price_file(path: Path) -> ParsedPrice:
@@ -159,7 +175,8 @@ def parse_price_file(path: Path) -> ParsedPrice:
     parsed_groups = []
     current_path = None
     current_items = []
-    ignored_actions = 0
+    action_count = 0
+    action_groups = {}
 
     def finish_group() -> None:
         nonlocal current_items
@@ -190,12 +207,37 @@ def parse_price_file(path: Path) -> ParsedPrice:
         if not name or cash is None or cashless is None or not current_path:
             continue
         if normalize_price_text(name).startswith("акция "):
-            ignored_actions += 1
+            action_count += 1
+            clean_name = re.sub(r"^\s*АКЦИЯ\s+", "", name, flags=re.IGNORECASE)
+            base_name = clean_name.split(" - ", 1)[0].strip() if " - " in clean_name else clean_name
+            category_key, category_name = category_from_path(current_path)
+            merge_key = f"{category_key}|{normalize_price_text(base_name)}"
+            if merge_key not in action_groups:
+                action_groups[merge_key] = {
+                    "display": base_name,
+                    "path": f"{current_path}/{base_name}",
+                    "category_key": category_key,
+                    "category_name": category_name,
+                    "items": [],
+                }
+            code = str(values[code_idx] or "").strip() if len(values) > code_idx else ""
+            action_groups[merge_key]["items"].append(ParsedItem(code, clean_name, cash, cashless))
             continue
         code = str(values[code_idx] or "").strip() if len(values) > code_idx else ""
         current_items.append(ParsedItem(code, name, cash, cashless))
     finish_group()
     workbook.close()
+    for merge_key, group in action_groups.items():
+        parsed_groups.append(
+            ParsedGroup(
+                merge_key,
+                group["display"],
+                group["path"],
+                group["category_key"],
+                group["category_name"],
+                tuple(group["items"]),
+            )
+        )
     combined = {}
     for group in parsed_groups:
         existing = combined.get(group.merge_key)
@@ -213,7 +255,7 @@ def parse_price_file(path: Path) -> ParsedPrice:
     parsed_groups = list(combined.values())
     if not parsed_groups or not sum(len(group.items) for group in parsed_groups):
         raise ValueError("В прайсе не найдено товарных групп с корректными ценами.")
-    return ParsedPrice(sheet.title, price_date, tuple(parsed_groups), ignored_actions)
+    return ParsedPrice(sheet.title, price_date, tuple(parsed_groups), action_count)
 
 
 class PricesDB:
@@ -384,6 +426,30 @@ class PricesDB:
             for (cash, cashless), identities in sorted(tiers.items())
         )
         return GroupDetails(summary, price_tiers, len(variants))
+
+    def group_variants(self, callback_id: int) -> tuple[GroupSummary, tuple[VariantAvailability, ...]] | None:
+        summaries = {group.callback_id: group for group in self.group_summaries()}
+        summary = summaries.get(callback_id)
+        if not summary:
+            return None
+        with closing(self._connect()) as connection, connection:
+            rows = connection.execute(
+                """SELECT g.warehouse, i.code, i.name
+                   FROM price_items i JOIN price_groups g ON g.id = i.group_id
+                   WHERE g.merge_key = ? ORDER BY i.position""",
+                (summary.merge_key,),
+            ).fetchall()
+        variants = {}
+        for row in rows:
+            identity = row["code"] or normalize_price_text(row["name"])
+            if identity not in variants:
+                variants[identity] = {"name": variant_display_name(row["name"]), "warehouses": set()}
+            variants[identity]["warehouses"].add(row["warehouse"])
+        result = tuple(
+            VariantAvailability(value["name"], tuple(sorted(value["warehouses"])))
+            for value in sorted(variants.values(), key=lambda item: normalize_price_text(item["name"]))
+        )
+        return summary, result
 
     def backup_to(self, destination: Path) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)

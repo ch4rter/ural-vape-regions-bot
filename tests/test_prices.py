@@ -27,17 +27,19 @@ def test_price_parser_uses_group_rows_and_ignores_actions(tmp_path):
     make_price(path)
     parsed = parse_price_file(path)
 
-    assert len(parsed.groups) == 1
-    assert parsed.groups[0].display_name == "VLIQ OGGO BALANCE 20"
-    assert parsed.groups[0].category_name == "Жидкости"
-    assert len(parsed.groups[0].items) == 2
-    assert parsed.ignored_actions == 1
+    assert len(parsed.groups) == 2
+    regular = next(group for group in parsed.groups if group.display_name == "VLIQ OGGO BALANCE 20")
+    action = next(group for group in parsed.groups if group.display_name == "VLIQ OGGO BALANCE Арбуз")
+    assert regular.category_name == "Жидкости"
+    assert len(regular.items) == 2
+    assert action.items[0].name == "VLIQ OGGO BALANCE Арбуз"
+    assert parsed.action_count == 1
 
 
 def test_warehouse_replacement_search_and_aggregation(tmp_path):
     center = tmp_path / "center.xlsx"
     west = tmp_path / "west.xlsx"
-    make_price(center)
+    make_price(center, include_action=False)
     make_price(west, suffix=" West", include_action=False)
     db = PricesDB(tmp_path / "prices.sqlite3")
     db.replace_warehouse("center", parse_price_file(center), center.name)
