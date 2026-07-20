@@ -1,9 +1,9 @@
 from decimal import Decimal
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
 from bot import discounted, money, variant_word
-from prices_db import PricesDB, clean_group_name, parse_price_file
+from prices_db import PricesDB, clean_group_name, generate_discounted_price, parse_price_file
 
 
 def make_price(path, suffix="", include_action=True):
@@ -65,3 +65,23 @@ def test_prices_and_group_name_formatting():
     assert variant_word(1) == "вариант"
     assert variant_word(2) == "варианта"
     assert variant_word(15) == "вариантов"
+
+
+def test_discounted_excel_changes_copy_but_not_original(tmp_path):
+    source = tmp_path / "base.xlsx"
+    destination = tmp_path / "discount.xlsx"
+    make_price(source)
+
+    changed = generate_discounted_price(source, destination, 10)
+    assert changed == 3
+
+    base = load_workbook(source, data_only=True)
+    discounted_book = load_workbook(destination, data_only=True)
+    assert base.active["D10"].value == 235
+    assert discounted_book.active["D8"].value == "от 50т.р. нал — скидка 10%"
+    assert discounted_book.active["E8"].value == "от 50т.р. безнал — скидка 10%"
+    assert discounted_book.active["D10"].value == 211.5
+    assert discounted_book.active["E10"].value == 233.1
+    assert discounted_book.active["D11"].value == 90
+    base.close()
+    discounted_book.close()

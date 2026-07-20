@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import tempfile
 import zipfile
+from typing import Any, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
@@ -14,7 +15,7 @@ from difflib import SequenceMatcher
 from itertools import chain
 from pathlib import Path
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart, StateFilter
@@ -25,7 +26,14 @@ from dotenv import load_dotenv
 from openpyxl import load_workbook
 
 from materials_db import Material, MaterialsDB
-from prices_db import WAREHOUSES, GroupDetails, PricesDB, parse_price_file, save_price_source
+from prices_db import (
+    WAREHOUSES,
+    GroupDetails,
+    PricesDB,
+    generate_discounted_price,
+    parse_price_file,
+    save_price_source,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -56,6 +64,30 @@ class AdminState(StatesGroup):
     excel_confirmation = State()
     price_upload = State()
     price_confirmation = State()
+    access_user = State()
+
+
+class AccessMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[Any, dict[str, Any]], Awaitable[Any]],
+        event: Message | CallbackQuery,
+        data: dict[str, Any],
+    ) -> Any:
+        user = event.from_user
+        if not user or is_admin(user.id) or materials_db.authorize_user(user.id, user.username):
+            return await handler(event, data)
+        if isinstance(event, CallbackQuery):
+            await event.answer("Доступ к боту не предоставлен.", show_alert=True)
+        else:
+            username = f"@{user.username}" if user.username else "не указан"
+            await event.answer(
+                "🔒 <b>Доступ ограничен</b>\n\n"
+                "Бот предназначен для сотрудников компании. Передайте администратору один из идентификаторов:\n\n"
+                f"• Telegram ID: <code>{user.id}</code>\n"
+                f"• Username: <code>{html.escape(username)}</code>"
+            )
+        return None
 
 
 def normalize(value: str) -> str:
@@ -179,6 +211,7 @@ def main_menu(user_id: int | None) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="🔎 Поиск менеджера", callback_data="main:region")],
         [InlineKeyboardButton(text="💰 Цены и наличие", callback_data="main:prices")],
+        [InlineKeyboardButton(text="📄 Прайсы", callback_data="main:price_files")],
         [InlineKeyboardButton(text="🗃 База данных", callback_data="main:database")],
     ]
     if is_admin(user_id):
@@ -462,6 +495,99 @@ def price_variants_keyboard(callback_id: int, page: int, total: int) -> InlineKe
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def downloadable_prices_keyboard() -> InlineKeyboardMarkup:
+    statuses = prices_db.import_statuses()
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"🏢 {WAREHOUSES[warehouse]}",
+                callback_data=f"files:w:{warehouse}",
+            )
+        ]
+        for warehouse in ("center", "west", "ural")
+        if warehouse in statuses
+    ]
+    rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == "main:price_files")
+async def open_downloadable_prices(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    if not prices_db.import_statuses():
+        await callback.answer("Прайсы пока не загружены.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "📄 <b>Прайсы</b>\n\n"
+        "Выберите склад. Можно скачать исходный прайс с базовыми ценами или версию, "
+        "в которой цены нал/безнал уже уменьшены на 10%.",
+        reply_markup=downloadable_prices_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("files:w:"))
+async def select_price_warehouse(callback: CallbackQuery) -> None:
+    warehouse = callback.data.rsplit(":", 1)[1]
+    status = prices_db.import_statuses().get(warehouse)
+    if warehouse not in WAREHOUSES or not status:
+        await callback.answer("Прайс этого склада пока недоступен.", show_alert=True)
+        return
+    price_date = (status["price_date"] or status["updated_at"] or "").split("T", 1)[0]
+    await callback.message.edit_text(
+        f"📄 <b>{WAREHOUSES[warehouse]}</b>\n\n"
+        f"Дата прайса: <b>{html.escape(price_date)}</b>\n"
+        f"Товарных позиций: <b>{status['item_count']}</b>\n\n"
+        "Выберите нужный вариант:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Базовые цены", callback_data=f"files:get:{warehouse}:base")],
+            [InlineKeyboardButton(text="Цены со скидкой 10%", callback_data=f"files:get:{warehouse}:10")],
+            [InlineKeyboardButton(text="⬅️ К складам", callback_data="main:price_files")],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("files:get:"))
+async def send_price_file(callback: CallbackQuery) -> None:
+    try:
+        _, _, warehouse, version = callback.data.split(":", 3)
+    except ValueError:
+        await callback.answer("Некорректный запрос.", show_alert=True)
+        return
+    if warehouse not in WAREHOUSES or version not in ("base", "10"):
+        await callback.answer("Некорректный запрос.", show_alert=True)
+        return
+    source = price_storage_path / f"{warehouse}.xlsx"
+    if not source.exists():
+        await callback.answer("Исходный файл не найден. Попросите администратора обновить прайс.", show_alert=True)
+        return
+    await callback.answer("Готовлю файл…")
+    warehouse_name = WAREHOUSES[warehouse]
+    if version == "base":
+        await callback.message.answer_document(
+            FSInputFile(source, filename=f"прайс {warehouse_name} базовый.xlsx"),
+            caption=f"📄 <b>{warehouse_name}</b> · базовые цены",
+        )
+        return
+    try:
+        with tempfile.TemporaryDirectory() as temp_name:
+            destination = Path(temp_name) / f"прайс {warehouse_name} скидка 10.xlsx"
+            changed = await asyncio.to_thread(generate_discounted_price, source, destination, 10)
+            await callback.message.answer_document(
+                FSInputFile(destination, filename=destination.name),
+                caption=(
+                    f"📄 <b>{warehouse_name}</b> · цены со скидкой 10%\n\n"
+                    f"Пересчитано товарных позиций: <b>{changed}</b>"
+                ),
+            )
+    except Exception:
+        logging.exception("Не удалось сформировать прайс со скидкой для %s", warehouse)
+        await callback.message.answer(
+            "⚠️ Не удалось сформировать файл. Попробуйте ещё раз или сообщите администратору."
+        )
+
+
 @router.callback_query(F.data == "main:prices")
 async def open_price_search(callback: CallbackQuery, state: FSMContext) -> None:
     if not prices_db.import_statuses():
@@ -576,6 +702,7 @@ def products_keyboard(admin: bool = False) -> InlineKeyboardMarkup:
     if admin:
         rows.append([InlineKeyboardButton(text="➕ Добавить товар", callback_data="adm:add_product")])
         rows.append([InlineKeyboardButton(text="💰 Обновить прайсы", callback_data="adm:prices")])
+        rows.append([InlineKeyboardButton(text="👥 Белый список", callback_data="adm:access")])
         rows.append([InlineKeyboardButton(text="📊 Обновить Excel", callback_data="adm:excel")])
         rows.append([InlineKeyboardButton(text="💾 Скачать резервную копию", callback_data="adm:backup")])
     rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")])
@@ -1054,6 +1181,118 @@ async def admin_menu(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
+def access_user_label(user) -> str:
+    parts = []
+    if user.username:
+        parts.append(f"@{user.username}")
+    if user.telegram_id:
+        parts.append(f"ID {user.telegram_id}")
+    return " · ".join(parts)
+
+
+def access_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"🗑 {access_user_label(user)}",
+                callback_data=f"adm:confirm_access:{user.id}",
+            )
+        ]
+        for user in materials_db.list_access_users()
+    ]
+    rows.extend([
+        [InlineKeyboardButton(text="➕ Добавить пользователя", callback_data="adm:add_access")],
+        [InlineKeyboardButton(text="⬅️ К управлению", callback_data="main:admin")],
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == "adm:access")
+async def manage_access(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin(callback):
+        return
+    await state.clear()
+    users = materials_db.list_access_users()
+    await callback.message.edit_text(
+        "👥 <b>Белый список</b>\n\n"
+        f"Пользователей с доступом: <b>{len(users)}</b>\n\n"
+        "Добавьте Telegram ID или @username. Username будет привязан к постоянному ID "
+        "при первом обращении пользователя к боту.\n\n"
+        "Чтобы удалить доступ, нажмите строку пользователя с символом 🗑.",
+        reply_markup=access_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adm:add_access")
+async def ask_access_user(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin(callback):
+        return
+    await state.set_state(AdminState.access_user)
+    await callback.message.edit_text(
+        "➕ <b>Новый пользователь</b>\n\n"
+        "Отправьте один идентификатор:\n\n"
+        "• числовой Telegram ID, например <code>5533726476</code>;\n"
+        "• username с символом @, например <code>@username</code>.\n\n"
+        "ID надёжнее, потому что username пользователь может изменить.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="adm:access")]]
+        ),
+    )
+    await callback.answer()
+
+
+@router.message(AdminState.access_user, F.text)
+async def save_access_user(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    try:
+        user = materials_db.add_access_user(message.text)
+    except ValueError as error:
+        await message.answer(f"⚠️ {html.escape(str(error))}")
+        return
+    except sqlite3.IntegrityError:
+        await message.answer("⚠️ Такой пользователь уже находится в белом списке.")
+        return
+    await state.clear()
+    await message.answer(
+        f"✅ Доступ предоставлен: <b>{html.escape(access_user_label(user))}</b>",
+        reply_markup=access_keyboard(),
+    )
+
+
+@router.callback_query(F.data.startswith("adm:confirm_access:"))
+async def confirm_access_delete(callback: CallbackQuery) -> None:
+    if not await require_admin(callback):
+        return
+    access_id = int(callback.data.rsplit(":", 1)[1])
+    user = materials_db.get_access_user(access_id)
+    if not user:
+        await callback.answer("Пользователь уже удалён.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "⚠️ <b>Закрыть доступ?</b>\n\n"
+        f"Пользователь: <b>{html.escape(access_user_label(user))}</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Да, закрыть доступ", callback_data=f"adm:delete_access:{access_id}")],
+            [InlineKeyboardButton(text="Отмена", callback_data="adm:access")],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:delete_access:"))
+async def delete_access_user(callback: CallbackQuery) -> None:
+    if not await require_admin(callback):
+        return
+    materials_db.delete_access_user(int(callback.data.rsplit(":", 1)[1]))
+    await callback.message.edit_text(
+        "✅ Доступ пользователя закрыт.",
+        reply_markup=access_keyboard(),
+    )
+    await callback.answer()
+
+
 @router.callback_query(F.data == "adm:add_product")
 async def admin_add_product(callback: CallbackQuery, state: FSMContext) -> None:
     if not await require_admin(callback):
@@ -1389,6 +1628,8 @@ async def main() -> None:
     prices_db = PricesDB(prices_db_path)
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dispatcher = Dispatcher()
+    router.message.outer_middleware(AccessMiddleware())
+    router.callback_query.outer_middleware(AccessMiddleware())
     dispatcher.include_router(router)
     await bot.delete_webhook(drop_pending_updates=False)
     await dispatcher.start_polling(bot)

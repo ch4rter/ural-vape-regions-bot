@@ -1,4 +1,5 @@
 import sqlite3
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,6 +27,13 @@ class Material:
     file_id: str | None
     caption: str | None
     file_name: str | None
+
+
+@dataclass(frozen=True)
+class AccessUser:
+    id: int
+    telegram_id: int | None
+    username: str | None
 
 
 class MaterialsDB:
@@ -70,8 +78,86 @@ class MaterialsDB:
                     position INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS access_users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_id INTEGER UNIQUE,
+                    username TEXT COLLATE NOCASE UNIQUE,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    CHECK(telegram_id IS NOT NULL OR username IS NOT NULL)
+                );
                 """
             )
+
+    def add_access_user(self, value: str) -> AccessUser:
+        value = value.strip()
+        telegram_id = None
+        username = None
+        if not value.startswith("@") and value.isdigit():
+            telegram_id = int(value)
+            if telegram_id <= 0:
+                raise ValueError("Telegram ID должен быть положительным числом.")
+        else:
+            username = value.lstrip("@").lower()
+            if not re.fullmatch(r"[a-zA-Z0-9_]{5,32}", username):
+                raise ValueError("Username должен содержать 5–32 латинских символа, цифры или _. ")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "INSERT INTO access_users(telegram_id, username) VALUES (?, ?)",
+                (telegram_id, username),
+            )
+            access_id = cursor.lastrowid
+            connection.commit()
+        return self.get_access_user(access_id)
+
+    def get_access_user(self, access_id: int) -> AccessUser | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT id, telegram_id, username FROM access_users WHERE id = ?", (access_id,)
+            ).fetchone()
+        return self._access_user(row) if row else None
+
+    def list_access_users(self) -> list[AccessUser]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id, telegram_id, username FROM access_users ORDER BY created_at, id"
+            ).fetchall()
+        return [self._access_user(row) for row in rows]
+
+    def delete_access_user(self, access_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM access_users WHERE id = ?", (access_id,))
+
+    def authorize_user(self, telegram_id: int, username: str | None) -> bool:
+        normalized_username = username.lower() if username else None
+        with self._connect() as connection:
+            by_id = connection.execute(
+                "SELECT id FROM access_users WHERE telegram_id = ?", (telegram_id,)
+            ).fetchone()
+            if by_id:
+                return True
+            if not normalized_username:
+                return False
+            by_username = connection.execute(
+                "SELECT id, telegram_id FROM access_users WHERE username = ? COLLATE NOCASE",
+                (normalized_username,),
+            ).fetchone()
+            if not by_username:
+                return False
+            if by_username["telegram_id"] is not None:
+                return by_username["telegram_id"] == telegram_id
+            try:
+                connection.execute(
+                    "UPDATE access_users SET telegram_id = ? WHERE id = ? AND telegram_id IS NULL",
+                    (telegram_id, by_username["id"]),
+                )
+                connection.commit()
+            except sqlite3.IntegrityError:
+                return False
+            return True
+
+    @staticmethod
+    def _access_user(row: sqlite3.Row) -> AccessUser:
+        return AccessUser(row["id"], row["telegram_id"], row["username"])
 
     def backup_to(self, destination: Path) -> None:
         """Create a consistent SQLite backup, including pending WAL changes."""

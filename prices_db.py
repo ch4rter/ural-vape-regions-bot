@@ -5,7 +5,7 @@ from collections import defaultdict
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -474,3 +474,50 @@ def save_price_source(source: Path, storage_dir: Path, warehouse: str) -> Path |
         shutil.copy2(destination, backup)
     shutil.copy2(source, destination)
     return backup
+
+
+def generate_discounted_price(source: Path, destination: Path, percent: int = 10) -> int:
+    if percent <= 0 or percent >= 100:
+        raise ValueError("Скидка должна быть от 1 до 99 процентов.")
+    workbook = load_workbook(source, data_only=False)
+    sheet = workbook.active
+    header_row = None
+    headers = None
+    for row_number, row in enumerate(sheet.iter_rows(min_row=1, max_row=30), 1):
+        normalized = [normalize_price_text(str(cell.value or "")) for cell in row]
+        if (
+            any(value == "наименование" for value in normalized)
+            and any("50т р нал" in value for value in normalized)
+            and any("50т р безнал" in value for value in normalized)
+        ):
+            header_row, headers = row_number, normalized
+            break
+    if not header_row or headers is None:
+        workbook.close()
+        raise ValueError("Не найдена строка заголовков прайса.")
+    name_idx = headers.index("наименование") + 1
+    cash_idx = next(i for i, value in enumerate(headers, 1) if "50т р нал" in value)
+    cashless_idx = next(i for i, value in enumerate(headers, 1) if "50т р безнал" in value)
+    sheet.cell(header_row, cash_idx).value = f"от 50т.р. нал — скидка {percent}%"
+    sheet.cell(header_row, cashless_idx).value = f"от 50т.р. безнал — скидка {percent}%"
+    multiplier = Decimal(100 - percent) / Decimal(100)
+    changed = 0
+    for row_number in range(header_row + 1, sheet.max_row + 1):
+        if not sheet.cell(row_number, name_idx).value:
+            continue
+        row_changed = False
+        for column in (cash_idx, cashless_idx):
+            cell = sheet.cell(row_number, column)
+            original = to_decimal(cell.value)
+            if original is None:
+                continue
+            discounted_price = (original * multiplier).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            cell.value = float(discounted_price)
+            cell.number_format = "0.00"
+            row_changed = True
+        if row_changed:
+            changed += 1
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    workbook.save(destination)
+    workbook.close()
+    return changed

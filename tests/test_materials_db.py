@@ -52,3 +52,18 @@ def test_consistent_backup(tmp_path):
     restored = MaterialsDB(backup_path)
     assert restored.list_products()[0].name == "OGGO VLIQ"
     assert restored.list_materials(section.id)[0].file_id == "photo-id"
+
+
+def test_access_by_id_and_username_binding(tmp_path):
+    db = MaterialsDB(tmp_path / "materials.sqlite3")
+    by_id = db.add_access_user("123456789")
+    by_username = db.add_access_user("@Sales_Manager")
+
+    assert db.authorize_user(123456789, None) is True
+    assert db.authorize_user(777777777, "sales_manager") is True
+    bound = db.get_access_user(by_username.id)
+    assert bound.telegram_id == 777777777
+    assert db.authorize_user(888888888, "sales_manager") is False
+
+    db.delete_access_user(by_id.id)
+    assert db.authorize_user(123456789, None) is False
