@@ -52,6 +52,7 @@ admin_ids: set[int] = set()
 active_excel_path: Path
 managed_excel_path: Path
 price_storage_path: Path
+price_updates_in_progress: set[str] = set()
 
 MANAGER_LINKS = {
     "валера": "uvvalera",
@@ -236,6 +237,16 @@ def back_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")]]
     )
+
+
+async def edit_or_answer(
+    message: Message, text: str, reply_markup: InlineKeyboardMarkup | None = None
+) -> None:
+    try:
+        await message.edit_text(text, reply_markup=reply_markup)
+    except Exception:
+        logging.exception("Не удалось изменить служебное сообщение, отправляю новое")
+        await message.answer(text, reply_markup=reply_markup)
 
 
 async def show_main(target: Message, user_id: int | None, *, edit: bool = False) -> None:
@@ -1574,21 +1585,36 @@ async def apply_price(callback: CallbackQuery, state: FSMContext) -> None:
         await state.clear()
         await callback.answer("Файл проверки не найден. Загрузите прайс ещё раз.", show_alert=True)
         return
-    await callback.answer("Применяю прайс…")
+    if warehouse in price_updates_in_progress:
+        await callback.answer("Прайс этого склада уже обрабатывается. Дождитесь завершения.", show_alert=True)
+        return
+    price_updates_in_progress.add(warehouse)
+    await callback.answer()
     try:
+        await edit_or_answer(
+            callback.message,
+            "⏳ <b>Применяю прайс</b>\n\n"
+            f"Склад: <b>{WAREHOUSES[warehouse]}</b>\n\n"
+            "Проверяю изменения цен и наличия, сохраняю предыдущую версию и формирую отчёт. "
+            "Это может занять некоторое время — повторно нажимать ничего не нужно."
+        )
         group_count, item_count, _, report = await asyncio.to_thread(
             apply_pending_price, pending_path, warehouse, data.get("price_file_name", pending_path.name)
         )
     except Exception:
         logging.exception("Не удалось применить прайс склада %s", warehouse)
-        await callback.message.edit_text(
+        await edit_or_answer(
+            callback.message,
             "❌ Не удалось применить прайс. Предыдущие данные сохранены.",
             reply_markup=price_admin_keyboard(),
         )
         return
+    finally:
+        price_updates_in_progress.discard(warehouse)
     await state.clear()
     if report:
-        await callback.message.edit_text(
+        await edit_or_answer(
+            callback.message,
             "✅ <b>Прайс обновлён</b>\n\n" + format_price_report(report),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="📥 Скачать подробный Excel", callback_data=f"reports:file:{warehouse}")],
@@ -1597,7 +1623,8 @@ async def apply_price(callback: CallbackQuery, state: FSMContext) -> None:
             ]),
         )
     else:
-        await callback.message.edit_text(
+        await edit_or_answer(
+            callback.message,
             "✅ <b>Прайс обновлён</b>\n\n"
             f"Склад: <b>{WAREHOUSES[warehouse]}</b>\n"
             f"Товарных групп: <b>{group_count}</b>\n"
