@@ -584,7 +584,25 @@ def downloadable_prices_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def price_reports_keyboard() -> InlineKeyboardMarkup:
+def combined_report_bundle() -> tuple[dict[str, dict] | None, str | None]:
+    reports = prices_db.latest_reports()
+    required = ("center", "west", "ural")
+    if any(warehouse not in reports for warehouse in required):
+        return None, "Сначала загрузите свежие прайсы всех трёх складов."
+    today = datetime.now().astimezone().date().isoformat()
+    if any(str(reports[warehouse].get("created_at", "")).split("T", 1)[0] != today for warehouse in required):
+        return None, "Для общей рассылки нужны три отчёта, сформированные сегодня."
+    return {warehouse: reports[warehouse] for warehouse in required}, None
+
+
+def combined_report_signature(reports: dict[str, dict]) -> str:
+    return "|".join(
+        f"{warehouse}:{reports[warehouse].get('created_at')}:{reports[warehouse].get('current_file')}"
+        for warehouse in ("center", "west", "ural")
+    )
+
+
+def price_reports_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
     reports = prices_db.latest_reports()
     rows = [
         [InlineKeyboardButton(
@@ -592,6 +610,13 @@ def price_reports_keyboard() -> InlineKeyboardMarkup:
         )]
         for warehouse in ("center", "west", "ural") if warehouse in reports
     ]
+    combined, _ = combined_report_bundle()
+    if is_admin(user_id) and combined:
+        signature = combined_report_signature(combined)
+        if not prices_db.report_broadcast_sent(signature):
+            rows.append([InlineKeyboardButton(
+                text="📣 Отправить общий отчёт", callback_data="reports:broadcast_all"
+            )])
     rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -623,24 +648,37 @@ def format_price_report(report: dict) -> str:
     )
 
 
-def report_actions_keyboard(warehouse: str, user_id: int | None) -> InlineKeyboardMarkup:
+def report_actions_keyboard(warehouse: str) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(
         text="📥 Скачать подробный Excel", callback_data=f"reports:file:{warehouse}"
     )]]
-    if is_admin(user_id):
-        rows.append([InlineKeyboardButton(
-            text="📣 Отправить уведомление", callback_data=f"reports:broadcast:{warehouse}"
-        )])
     rows.append([InlineKeyboardButton(text="⬅️ К складам", callback_data="main:price_reports")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def format_report_notification(report: dict) -> str:
-    return (
-        "🔔 <b>Обновлён складской прайс</b>\n\n"
-        + format_price_report(report)
-        + "\n\nОткройте отчёт, чтобы скачать подробный Excel со списком изменений."
-    )
+def format_combined_report_notification(reports: dict[str, dict]) -> str:
+    lines = ["🔔 <b>Прайсы обновлены</b>", "", "Свежие цены и остатки загружены по всем складам."]
+    total_added = total_removed = total_prices = 0
+    for warehouse in ("center", "west", "ural"):
+        report = reports[warehouse]
+        added, removed = len(report["added"]), len(report["removed"])
+        changed = len(report["price_changes"])
+        total_added += added
+        total_removed += removed
+        total_prices += changed
+        lines.extend([
+            "", f"🏢 <b>{WAREHOUSES[warehouse]}</b>",
+            f"➕ Появилось: <b>{added}</b> · ❌ Закончилось: <b>{removed}</b>",
+            f"💰 Изменилось цен: <b>{changed}</b>",
+        ])
+    lines.extend([
+        "", "📊 <b>Итого по трём складам</b>",
+        f"➕ Появилось: <b>{total_added}</b>",
+        f"❌ Закончилось: <b>{total_removed}</b>",
+        f"💰 Изменилось цен: <b>{total_prices}</b>",
+        "", "Подробные отчёты доступны в разделе «Изменения прайсов».",
+    ])
+    return "\n".join(lines)
 
 
 @router.callback_query(F.data == "main:price_reports")
@@ -658,7 +696,7 @@ async def open_price_reports(callback: CallbackQuery, state: FSMContext) -> None
         await callback.message.edit_text(
             "📊 <b>Изменения прайсов</b>\n\n"
             "Здесь хранится только последнее сравнение для каждого склада. Выберите склад:",
-            reply_markup=price_reports_keyboard(),
+            reply_markup=price_reports_keyboard(callback.from_user.id),
         )
     await callback.answer()
 
@@ -672,45 +710,51 @@ async def show_price_report(callback: CallbackQuery) -> None:
         return
     await callback.message.edit_text(
         format_price_report(report),
-        reply_markup=report_actions_keyboard(warehouse, callback.from_user.id),
+        reply_markup=report_actions_keyboard(warehouse),
     )
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("reports:broadcast:"))
+@router.callback_query(F.data == "reports:broadcast_all")
 async def confirm_report_broadcast(callback: CallbackQuery) -> None:
     if not await require_admin(callback):
         return
-    warehouse = callback.data.rsplit(":", 1)[1]
-    report = prices_db.latest_report(warehouse)
-    if warehouse not in WAREHOUSES or not report:
-        await callback.answer("Отчёт этого склада пока недоступен.", show_alert=True)
+    reports, error = combined_report_bundle()
+    if not reports:
+        await callback.answer(error or "Общий отчёт пока недоступен.", show_alert=True)
+        return
+    signature = combined_report_signature(reports)
+    if prices_db.report_broadcast_sent(signature):
+        await callback.answer("Этот общий отчёт уже был отправлен.", show_alert=True)
         return
     users = materials_db.list_access_users()
     ready = len({user.telegram_id for user in users if user.telegram_id})
     waiting = sum(user.telegram_id is None for user in users)
     await callback.message.edit_text(
         "📣 <b>Предпросмотр уведомления</b>\n\n"
-        + format_report_notification(report)
+        + format_combined_report_notification(reports)
         + f"\n\nПолучателей: <b>{ready}</b>"
         + (f"\nБез Telegram ID: <b>{waiting}</b> — будут пропущены" if waiting else "")
         + "\n\nОтправить это уведомление пользователям белого списка?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Отправить", callback_data=f"reports:send:{warehouse}")],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"reports:show:{warehouse}")],
+            [InlineKeyboardButton(text="✅ Отправить", callback_data="reports:send_all")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="main:price_reports")],
         ]),
     )
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("reports:send:"))
+@router.callback_query(F.data == "reports:send_all")
 async def send_report_broadcast(callback: CallbackQuery, bot: Bot) -> None:
     if not await require_admin(callback):
         return
-    warehouse = callback.data.rsplit(":", 1)[1]
-    report = prices_db.latest_report(warehouse)
-    if warehouse not in WAREHOUSES or not report:
-        await callback.answer("Отчёт этого склада пока недоступен.", show_alert=True)
+    reports, error = combined_report_bundle()
+    if not reports:
+        await callback.answer(error or "Общий отчёт пока недоступен.", show_alert=True)
+        return
+    signature = combined_report_signature(reports)
+    if prices_db.report_broadcast_sent(signature):
+        await callback.answer("Этот общий отчёт уже был отправлен.", show_alert=True)
         return
     recipients = sorted({
         user.telegram_id for user in materials_db.list_access_users() if user.telegram_id
@@ -719,22 +763,22 @@ async def send_report_broadcast(callback: CallbackQuery, bot: Bot) -> None:
     await callback.answer("Начинаю рассылку…")
     await callback.message.edit_text(
         "⏳ <b>Отправляю уведомление</b>\n\n"
-        f"Склад: <b>{WAREHOUSES[warehouse]}</b>\n"
+        "Отчёт: <b>Москва · Санкт-Петербург · Челябинск</b>\n"
         f"Получателей: <b>{len(recipients)}</b>"
     )
     sent = 0
     failed = 0
     markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Открыть отчёт", callback_data=f"reports:show:{warehouse}")]
+        [InlineKeyboardButton(text="📊 Открыть отчёты", callback_data="main:price_reports")]
     ])
     for telegram_id in recipients:
         try:
-            await bot.send_message(telegram_id, format_report_notification(report), reply_markup=markup)
+            await bot.send_message(telegram_id, format_combined_report_notification(reports), reply_markup=markup)
             sent += 1
         except TelegramRetryAfter as error:
             await asyncio.sleep(error.retry_after)
             try:
-                await bot.send_message(telegram_id, format_report_notification(report), reply_markup=markup)
+                await bot.send_message(telegram_id, format_combined_report_notification(reports), reply_markup=markup)
                 sent += 1
             except Exception:
                 failed += 1
@@ -742,13 +786,15 @@ async def send_report_broadcast(callback: CallbackQuery, bot: Bot) -> None:
         except Exception:
             failed += 1
             logging.exception("Не удалось отправить отчёт пользователю %s", telegram_id)
+    if sent:
+        prices_db.mark_report_broadcast_sent(signature)
     await callback.message.edit_text(
         "✅ <b>Рассылка завершена</b>\n\n"
         f"Успешно отправлено: <b>{sent}</b>\n"
         f"Не удалось отправить: <b>{failed}</b>\n"
         f"Без привязанного Telegram ID: <b>{missing_ids}</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Вернуться к отчёту", callback_data=f"reports:show:{warehouse}")]
+            [InlineKeyboardButton(text="⬅️ Вернуться к отчётам", callback_data="main:price_reports")]
         ]),
     )
 
@@ -1618,7 +1664,7 @@ async def apply_price(callback: CallbackQuery, state: FSMContext) -> None:
             "✅ <b>Прайс обновлён</b>\n\n" + format_price_report(report),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="📥 Скачать подробный Excel", callback_data=f"reports:file:{warehouse}")],
-                [InlineKeyboardButton(text="📣 Отправить уведомление", callback_data=f"reports:broadcast:{warehouse}")],
+                [InlineKeyboardButton(text="📊 К изменениям прайсов", callback_data="main:price_reports")],
                 [InlineKeyboardButton(text="💰 К управлению прайсами", callback_data="adm:prices")],
             ]),
         )

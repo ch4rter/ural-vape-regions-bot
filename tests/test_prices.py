@@ -2,7 +2,14 @@ from decimal import Decimal
 
 from openpyxl import Workbook, load_workbook
 
-from bot import discounted, format_price_report, manager_html, money, variant_word
+from bot import (
+    discounted,
+    format_combined_report_notification,
+    format_price_report,
+    manager_html,
+    money,
+    variant_word,
+)
 from prices_db import (
     ParsedGroup,
     ParsedItem,
@@ -171,11 +178,22 @@ def test_latest_price_change_report_replaces_previous_report(tmp_path):
     assert isinstance(formatted, str)
     assert "Изменения прайса" in formatted
     assert "Появилось: <b>1</b>" in formatted
+    combined = {
+        warehouse: {**report, "warehouse": warehouse}
+        for warehouse in ("center", "west", "ural")
+    }
+    notification = format_combined_report_notification(combined)
+    assert "Прайсы обновлены" in notification
+    assert "Итого по трём складам" in notification
+    assert "Появилось: <b>3</b>" in notification
     assert [item["code"] for item in report["added"]] == ["004"]
     assert [item["code"] for item in report["removed"]] == ["003"]
     assert [item["code"] for item in report["price_changes"]] == ["001"]
     db.save_latest_report(report)
     assert db.latest_report("center")["current_file"] == "new.xlsx"
+    assert db.report_broadcast_sent("daily-signature") is False
+    db.mark_report_broadcast_sent("daily-signature")
+    assert db.report_broadcast_sent("daily-signature") is True
 
     destination = tmp_path / "changes.xlsx"
     generate_change_report_excel(report, destination)

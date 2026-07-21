@@ -316,6 +316,11 @@ class PricesDB:
                     report_json TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS price_broadcast_state (
+                    id INTEGER PRIMARY KEY CHECK(id = 1),
+                    report_signature TEXT NOT NULL,
+                    sent_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
                 """
             )
 
@@ -449,6 +454,23 @@ class PricesDB:
         with closing(self._connect()) as connection:
             rows = connection.execute("SELECT warehouse, report_json FROM price_latest_reports").fetchall()
         return {row["warehouse"]: json.loads(row["report_json"]) for row in rows}
+
+    def report_broadcast_sent(self, signature: str) -> bool:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT report_signature FROM price_broadcast_state WHERE id = 1"
+            ).fetchone()
+        return bool(row and row["report_signature"] == signature)
+
+    def mark_report_broadcast_sent(self, signature: str) -> None:
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """INSERT INTO price_broadcast_state(id, report_signature, sent_at)
+                   VALUES (1, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(id) DO UPDATE SET
+                       report_signature=excluded.report_signature, sent_at=CURRENT_TIMESTAMP""",
+                (signature,),
+            )
 
     def group_summaries(self) -> list[GroupSummary]:
         with closing(self._connect()) as connection, connection:
