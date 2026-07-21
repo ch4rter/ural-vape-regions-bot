@@ -61,6 +61,9 @@ def test_warehouse_replacement_search_and_aggregation(tmp_path):
     details = db.group_details(results[0].callback_id)
     assert len(details.tiers) == 2
     assert details.unique_variants == 2
+    selected_keys, availability = db.selection_availability([results[0].callback_id])
+    assert selected_keys == [results[0].merge_key]
+    assert availability["001"] == {"center", "west"}
 
     replacement = tmp_path / "replacement.xlsx"
     make_price(replacement, suffix=" New", include_action=False)
@@ -111,7 +114,8 @@ def test_selected_price_contains_only_chosen_groups_and_discount(tmp_path):
     selected = db.search_groups("VLIQ OGGO BALANCE 20")[0]
     destination = tmp_path / "selection.xlsx"
 
-    changed = generate_selected_price(source, destination, [selected.merge_key], 10)
+    merge_keys, availability = db.selection_availability([selected.callback_id])
+    changed = generate_selected_price(source, destination, merge_keys, availability, 10)
 
     assert changed == 2
     workbook = load_workbook(destination, data_only=True)
@@ -123,6 +127,11 @@ def test_selected_price_contains_only_chosen_groups_and_discount(tmp_path):
     mango_row = values.index("VLIQ OGGO BALANCE Манго") + 1
     assert sheet.cell(mango_row, 4).value == 211.5
     assert sheet.cell(mango_row, 5).value == 233.1
+    assert [sheet.cell(8, column).value for column in (17, 18, 19)] == [
+        "Москва", "Санкт-Петербург", "Челябинск"
+    ]
+    assert sheet.cell(mango_row, 17).value == "Есть"
+    assert sheet.cell(mango_row, 18).value == "—"
     assert "A2:E2" in {str(value) for value in sheet.merged_cells.ranges}
     cherry_row = values.index("VLIQ OGGO BALANCE Вишня") + 1
     workbook.close()

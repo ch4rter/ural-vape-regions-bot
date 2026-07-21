@@ -889,8 +889,7 @@ async def export_selected_prices(callback: CallbackQuery, state: FSMContext) -> 
     try:
         with tempfile.TemporaryDirectory() as temp_name:
             suffix = "скидка 10" if discount else "базовые цены"
-            summaries = {group.callback_id: group for group in prices_db.group_summaries()}
-            merge_keys = [summaries[value].merge_key for value in selected if value in summaries]
+            merge_keys, availability = prices_db.selection_availability(selected)
             sent = 0
             for warehouse in ("center", "west", "ural"):
                 source = price_storage_path / f"{warehouse}.xlsx"
@@ -899,7 +898,7 @@ async def export_selected_prices(callback: CallbackQuery, state: FSMContext) -> 
                 destination = Path(temp_name) / f"прайс {WAREHOUSES[warehouse]} подборка {suffix}.xlsx"
                 try:
                     count = await asyncio.to_thread(
-                        generate_selected_price, source, destination, merge_keys, discount
+                        generate_selected_price, source, destination, merge_keys, availability, discount
                     )
                 except ValueError as error:
                     if "отсутствуют" in str(error):

@@ -1,6 +1,7 @@
 import re
 import shutil
 import sqlite3
+import tempfile
 from copy import copy
 from collections import defaultdict
 from contextlib import closing
@@ -9,6 +10,8 @@ from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
 from difflib import SequenceMatcher
 from pathlib import Path
+from xml.etree import ElementTree
+from zipfile import ZIP_DEFLATED, ZipFile
 
 from openpyxl import load_workbook
 from openpyxl.formula.translate import Translator
@@ -487,6 +490,29 @@ class PricesDB:
         )
         return summary, result
 
+    def selection_availability(
+        self, callback_ids: list[int]
+    ) -> tuple[list[str], dict[str, set[str]]]:
+        summaries = {group.callback_id: group for group in self.group_summaries()}
+        merge_keys = list(dict.fromkeys(
+            summaries[value].merge_key for value in callback_ids if value in summaries
+        ))
+        if not merge_keys:
+            return [], {}
+        placeholders = ",".join("?" for _ in merge_keys)
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                f"""SELECT g.warehouse, i.code, i.name
+                    FROM price_items i JOIN price_groups g ON g.id = i.group_id
+                    WHERE g.merge_key IN ({placeholders})""",
+                merge_keys,
+            ).fetchall()
+        availability: dict[str, set[str]] = defaultdict(set)
+        for row in rows:
+            identity = row["code"] or normalize_price_text(row["name"])
+            availability[identity].add(row["warehouse"])
+        return merge_keys, dict(availability)
+
     def backup_to(self, destination: Path) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
         source = self._connect()
@@ -563,6 +589,7 @@ def generate_selected_price(
     source: Path,
     destination: Path,
     merge_keys: list[str],
+    availability: dict[str, set[str]],
     discount: int = 0,
 ) -> int:
     """Filter a native warehouse price while preserving its original workbook design."""
@@ -595,6 +622,7 @@ def generate_selected_price(
     group_rows: list[int] = []
     selected_group_rows: set[int] = set()
     selected_item_rows: set[int] = set()
+    selected_identities: dict[int, str] = {}
     current_path = None
     current_group_row = None
     first_group_row = None
@@ -622,6 +650,9 @@ def generate_selected_price(
             row_key = f"{category_key}|{normalize_price_text(clean_group_name(current_path))}"
         if row_key in selected_keys:
             selected_item_rows.add(row_number)
+            code = str(sheet.cell(row_number, 1).value or "").strip()
+            comparable_name = re.sub(r"^\s*АКЦИЯ\s+", "", name, flags=re.IGNORECASE)
+            selected_identities[row_number] = code or normalize_price_text(comparable_name)
             if current_group_row is not None:
                 selected_group_rows.add(current_group_row)
 
@@ -709,6 +740,22 @@ def generate_selected_price(
             translated = formula
         sheet.cell(mapped_row, column).value = translated
 
+    availability_columns = {"center": 17, "west": 18, "ural": 19}
+    for warehouse, column in availability_columns.items():
+        header = sheet.cell(header_row, column)
+        header.value = WAREHOUSES[warehouse]
+        header._style = copy(sheet.cell(header_row, cash_col)._style)
+        header.alignment = copy(sheet.cell(header_row, cash_col).alignment)
+        sheet.column_dimensions[get_column_letter(column)].width = 20
+    for old_row, identity in selected_identities.items():
+        mapped_row = row_map[old_row]
+        warehouses = availability.get(identity, set())
+        for warehouse, column in availability_columns.items():
+            cell = sheet.cell(mapped_row, column)
+            cell._style = copy(sheet.cell(mapped_row, cash_col)._style)
+            cell.alignment = copy(sheet.cell(mapped_row, cash_col).alignment)
+            cell.value = "Есть" if warehouse in warehouses else "—"
+
     if discount:
         sheet.cell(header_row, cash_col).value = f"от 50т.р. нал — скидка {discount}%"
         sheet.cell(header_row, cashless_col).value = f"от 50т.р. безнал — скидка {discount}%"
@@ -724,4 +771,63 @@ def generate_selected_price(
     destination.parent.mkdir(parents=True, exist_ok=True)
     workbook.save(destination)
     workbook.close()
+    restore_native_drawings(source, destination)
     return len(selected_item_rows)
+
+
+def restore_native_drawings(source: Path, destination: Path) -> None:
+    """Restore drawing parts unsupported by openpyxl (notably absolute anchors)."""
+    with ZipFile(source) as source_zip, ZipFile(destination) as output_zip:
+        source_names = set(source_zip.namelist())
+        source_sheet = source_zip.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        output_sheet = output_zip.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        drawing_tags = re.findall(
+            r"<(?:drawing|legacyDrawing|legacyDrawingHF|picture)\b[^>]*/>", source_sheet
+        )
+        if drawing_tags and not any(tag.split()[0] in output_sheet for tag in drawing_tags):
+            if "xmlns:r=" not in output_sheet:
+                output_sheet = output_sheet.replace(
+                    "<worksheet ",
+                    '<worksheet xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" ',
+                    1,
+                )
+            output_sheet = output_sheet.replace("</worksheet>", "".join(drawing_tags) + "</worksheet>")
+
+        content_types = ElementTree.fromstring(output_zip.read("[Content_Types].xml"))
+        source_types = ElementTree.fromstring(source_zip.read("[Content_Types].xml"))
+        existing_types = {(child.tag, tuple(sorted(child.attrib.items()))) for child in content_types}
+        for child in source_types:
+            signature = (child.tag, tuple(sorted(child.attrib.items())))
+            if signature not in existing_types and (
+                "drawing" in child.attrib.get("PartName", "")
+                or child.attrib.get("Extension", "").casefold() in {"jpeg", "jpg", "png", "gif", "svg"}
+            ):
+                content_types.append(copy(child))
+
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", dir=destination.parent, delete=False) as temp_file:
+            replacement = Path(temp_file.name)
+        try:
+            with ZipFile(replacement, "w", ZIP_DEFLATED) as rebuilt:
+                for item in output_zip.infolist():
+                    name = item.filename
+                    if name in {"xl/worksheets/sheet1.xml", "[Content_Types].xml"}:
+                        continue
+                    if name == "xl/worksheets/_rels/sheet1.xml.rels" and name in source_names:
+                        continue
+                    if name.startswith(("xl/drawings/", "xl/media/")) and name in source_names:
+                        continue
+                    rebuilt.writestr(item, output_zip.read(name))
+                rebuilt.writestr("xl/worksheets/sheet1.xml", output_sheet.encode("utf-8"))
+                rebuilt.writestr(
+                    "[Content_Types].xml",
+                    ElementTree.tostring(content_types, encoding="utf-8", xml_declaration=True),
+                )
+                sheet_relationships = "xl/worksheets/_rels/sheet1.xml.rels"
+                if sheet_relationships in source_names:
+                    rebuilt.writestr(sheet_relationships, source_zip.read(sheet_relationships))
+                for name in source_names:
+                    if name.startswith(("xl/drawings/", "xl/media/")):
+                        rebuilt.writestr(name, source_zip.read(name))
+            shutil.move(replacement, destination)
+        finally:
+            replacement.unlink(missing_ok=True)
