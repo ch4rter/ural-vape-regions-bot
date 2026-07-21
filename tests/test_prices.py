@@ -4,9 +4,13 @@ from openpyxl import Workbook, load_workbook
 
 from bot import discounted, manager_html, money, variant_word
 from prices_db import (
+    ParsedGroup,
+    ParsedItem,
+    ParsedPrice,
     PricesDB,
     clean_group_name,
     generate_discounted_price,
+    generate_change_report_excel,
     generate_selected_price,
     parse_price_file,
 )
@@ -139,3 +143,40 @@ def test_selected_price_contains_only_chosen_groups_and_discount(tmp_path):
     formulas = load_workbook(destination, data_only=False)
     assert formulas.active.cell(cherry_row, 6).value == f"=D{cherry_row}*G{cherry_row}"
     formulas.close()
+
+
+def test_latest_price_change_report_replaces_previous_report(tmp_path):
+    source = tmp_path / "old.xlsx"
+    make_price(source, include_action=False)
+    db = PricesDB(tmp_path / "prices.sqlite3")
+    old = parse_price_file(source)
+    db.replace_warehouse("center", old, source.name)
+    original_group = old.groups[0]
+    new = ParsedPrice(
+        "Sheet", "2026-07-22", (
+            ParsedGroup(
+                original_group.merge_key, original_group.display_name, original_group.full_path,
+                original_group.category_key, original_group.category_name,
+                (
+                    ParsedItem("001", "VLIQ OGGO BALANCE Манго", Decimal("250"), Decimal("275")),
+                    ParsedItem("004", "VLIQ OGGO BALANCE Киви", Decimal("240"), Decimal("265")),
+                ),
+            ),
+        ), 0,
+    )
+
+    report = db.build_change_report("center", new, "new.xlsx")
+    assert report is not None
+    assert [item["code"] for item in report["added"]] == ["004"]
+    assert [item["code"] for item in report["removed"]] == ["003"]
+    assert [item["code"] for item in report["price_changes"]] == ["001"]
+    db.save_latest_report(report)
+    assert db.latest_report("center")["current_file"] == "new.xlsx"
+
+    destination = tmp_path / "changes.xlsx"
+    generate_change_report_excel(report, destination)
+    workbook = load_workbook(destination, data_only=True)
+    assert workbook["Появилось"]["A2"].value == "004"
+    assert workbook["Закончилось"]["A2"].value == "003"
+    assert workbook["Изменились цены"]["A2"].value == "001"
+    workbook.close()

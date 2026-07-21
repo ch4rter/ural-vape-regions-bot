@@ -2,6 +2,7 @@ import re
 import shutil
 import sqlite3
 import tempfile
+import json
 from copy import copy
 from collections import defaultdict
 from contextlib import closing
@@ -13,8 +14,9 @@ from pathlib import Path
 from xml.etree import ElementTree
 from zipfile import ZIP_DEFLATED, ZipFile
 
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.formula.translate import Translator
+from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 
@@ -309,6 +311,11 @@ class PricesDB:
                 );
                 CREATE INDEX IF NOT EXISTS idx_price_groups_merge_key ON price_groups(merge_key);
                 CREATE INDEX IF NOT EXISTS idx_price_items_group_id ON price_items(group_id);
+                CREATE TABLE IF NOT EXISTS price_latest_reports (
+                    warehouse TEXT PRIMARY KEY,
+                    report_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
                 """
             )
 
@@ -351,6 +358,97 @@ class PricesDB:
         with closing(self._connect()) as connection, connection:
             rows = connection.execute("SELECT * FROM price_imports").fetchall()
         return {row["warehouse"]: row for row in rows}
+
+    def build_change_report(
+        self, warehouse: str, parsed: ParsedPrice, new_file_name: str
+    ) -> dict | None:
+        statuses = self.import_statuses()
+        previous = statuses.get(warehouse)
+        if not previous:
+            return None
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """SELECT g.merge_key, g.display_name, i.code, i.name, i.cash, i.cashless
+                   FROM price_items i JOIN price_groups g ON g.id = i.group_id
+                   WHERE g.warehouse = ?""",
+                (warehouse,),
+            ).fetchall()
+
+        def identity(code: str, name: str, merge_key: str) -> str:
+            return code.strip() if code and code.strip() else f"{merge_key}|{normalize_price_text(name)}"
+
+        old_items = {}
+        for row in rows:
+            key = identity(row["code"] or "", row["name"], row["merge_key"])
+            old_items[key] = {
+                "code": row["code"] or "", "name": row["name"],
+                "group": row["display_name"], "merge_key": row["merge_key"],
+                "cash": row["cash"], "cashless": row["cashless"],
+            }
+        new_items = {}
+        for group in parsed.groups:
+            for item in group.items:
+                key = identity(item.code, item.name, group.merge_key)
+                new_items[key] = {
+                    "code": item.code, "name": item.name,
+                    "group": group.display_name, "merge_key": group.merge_key,
+                    "cash": str(item.cash), "cashless": str(item.cashless),
+                }
+
+        added = [new_items[key] for key in new_items.keys() - old_items.keys()]
+        removed = [old_items[key] for key in old_items.keys() - new_items.keys()]
+        price_changes = []
+        for key in old_items.keys() & new_items.keys():
+            old, new = old_items[key], new_items[key]
+            if Decimal(old["cash"]) == Decimal(new["cash"]) and Decimal(old["cashless"]) == Decimal(new["cashless"]):
+                continue
+            price_changes.append({
+                "code": new["code"] or old["code"], "name": new["name"],
+                "group": new["group"],
+                "old_cash": old["cash"], "new_cash": new["cash"],
+                "old_cashless": old["cashless"], "new_cashless": new["cashless"],
+            })
+        old_groups = {value["merge_key"]: value["group"] for value in old_items.values()}
+        new_groups = {value["merge_key"]: value["group"] for value in new_items.values()}
+        added.sort(key=lambda item: normalize_price_text(f"{item['group']} {item['name']}"))
+        removed.sort(key=lambda item: normalize_price_text(f"{item['group']} {item['name']}"))
+        price_changes.sort(key=lambda item: normalize_price_text(f"{item['group']} {item['name']}"))
+        return {
+            "warehouse": warehouse,
+            "previous_file": previous["file_name"],
+            "current_file": new_file_name,
+            "previous_date": previous["price_date"] or previous["updated_at"],
+            "current_date": parsed.price_date or datetime.now().isoformat(timespec="seconds"),
+            "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "previous_count": len(old_items), "current_count": len(new_items),
+            "added": added, "removed": removed, "price_changes": price_changes,
+            "added_groups": sorted(new_groups[key] for key in new_groups.keys() - old_groups.keys()),
+            "removed_groups": sorted(old_groups[key] for key in old_groups.keys() - new_groups.keys()),
+        }
+
+    def save_latest_report(self, report: dict | None) -> None:
+        if not report:
+            return
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """INSERT INTO price_latest_reports(warehouse, report_json, created_at)
+                   VALUES (?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(warehouse) DO UPDATE SET
+                       report_json=excluded.report_json, created_at=CURRENT_TIMESTAMP""",
+                (report["warehouse"], json.dumps(report, ensure_ascii=False)),
+            )
+
+    def latest_report(self, warehouse: str) -> dict | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT report_json FROM price_latest_reports WHERE warehouse = ?", (warehouse,)
+            ).fetchone()
+        return json.loads(row["report_json"]) if row else None
+
+    def latest_reports(self) -> dict[str, dict]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute("SELECT warehouse, report_json FROM price_latest_reports").fetchall()
+        return {row["warehouse"]: json.loads(row["report_json"]) for row in rows}
 
     def group_summaries(self) -> list[GroupSummary]:
         with closing(self._connect()) as connection, connection:
@@ -522,6 +620,88 @@ class PricesDB:
         finally:
             target.close()
             source.close()
+
+
+def generate_change_report_excel(report: dict, destination: Path) -> None:
+    workbook = Workbook()
+    summary = workbook.active
+    summary.title = "Сводка"
+    warehouse_name = WAREHOUSES.get(report["warehouse"], report["warehouse"])
+    summary_rows = (
+        ("Отчёт об изменениях прайса", warehouse_name),
+        ("Предыдущий прайс", report["previous_file"]),
+        ("Текущий прайс", report["current_file"]),
+        ("Было позиций", report["previous_count"]),
+        ("Стало позиций", report["current_count"]),
+        ("Появилось", len(report["added"])),
+        ("Закончилось", len(report["removed"])),
+        ("Изменились цены", len(report["price_changes"])),
+        ("Новые группы", len(report["added_groups"])),
+        ("Исчезнувшие группы", len(report["removed_groups"])),
+    )
+    for row in summary_rows:
+        summary.append(row)
+    summary.column_dimensions["A"].width = 28
+    summary.column_dimensions["B"].width = 55
+    summary["A1"].font = Font(bold=True, size=14, color="FFFFFF")
+    summary["B1"].font = Font(bold=True, size=14, color="FFFFFF")
+    for cell in summary[1]:
+        cell.fill = PatternFill("solid", fgColor="1F4E78")
+
+    def add_items_sheet(title: str, items: list[dict], price_prefix: str = "") -> None:
+        sheet = workbook.create_sheet(title)
+        if price_prefix:
+            headers = ["Код", "Товарная группа", "Наименование", "Нал", "Безнал"]
+        else:
+            headers = [
+                "Код", "Товарная группа", "Наименование",
+                "Старая цена нал", "Новая цена нал", "Изменение нал",
+                "Старая цена безнал", "Новая цена безнал", "Изменение безнал",
+            ]
+        sheet.append(headers)
+        for cell in sheet[1]:
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor="5B9BD5")
+        for item in items:
+            if price_prefix:
+                sheet.append([
+                    item["code"], item["group"], item["name"],
+                    float(Decimal(item["cash"])), float(Decimal(item["cashless"])),
+                ])
+            else:
+                old_cash, new_cash = Decimal(item["old_cash"]), Decimal(item["new_cash"])
+                old_cashless, new_cashless = Decimal(item["old_cashless"]), Decimal(item["new_cashless"])
+                sheet.append([
+                    item["code"], item["group"], item["name"],
+                    float(old_cash), float(new_cash), float(new_cash - old_cash),
+                    float(old_cashless), float(new_cashless), float(new_cashless - old_cashless),
+                ])
+        sheet.freeze_panes = "A2"
+        sheet.auto_filter.ref = sheet.dimensions
+        widths = (16, 35, 70, 19, 19, 19, 22, 22, 22)
+        for index, width in enumerate(widths[:sheet.max_column], 1):
+            sheet.column_dimensions[get_column_letter(index)].width = width
+        for row in sheet.iter_rows(min_row=2, min_col=4):
+            for cell in row:
+                cell.number_format = "0.00"
+
+    add_items_sheet("Появилось", report["added"], "new")
+    add_items_sheet("Закончилось", report["removed"], "old")
+    add_items_sheet("Изменились цены", report["price_changes"])
+    groups = workbook.create_sheet("Изменения групп")
+    groups.append(["Изменение", "Товарная группа"])
+    for cell in groups[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="5B9BD5")
+    for name in report["added_groups"]:
+        groups.append(["Новая группа", name])
+    for name in report["removed_groups"]:
+        groups.append(["Исчезла", name])
+    groups.column_dimensions["A"].width = 22
+    groups.column_dimensions["B"].width = 70
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    workbook.save(destination)
+    workbook.close()
 
 
 def save_price_source(source: Path, storage_dir: Path, warehouse: str) -> Path | None:

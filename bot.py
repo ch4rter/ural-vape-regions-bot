@@ -30,6 +30,7 @@ from prices_db import (
     WAREHOUSES,
     GroupDetails,
     PricesDB,
+    generate_change_report_excel,
     generate_discounted_price,
     generate_selected_price,
     parse_price_file,
@@ -222,6 +223,7 @@ def main_menu(user_id: int | None) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🔎 Поиск менеджера", callback_data="main:region")],
         [InlineKeyboardButton(text="💰 Цены и наличие", callback_data="main:prices")],
         [InlineKeyboardButton(text="📄 Прайсы", callback_data="main:price_files")],
+        [InlineKeyboardButton(text="📊 Изменения прайсов", callback_data="main:price_reports")],
         [InlineKeyboardButton(text="🗃 База данных", callback_data="main:database")],
     ]
     if is_admin(user_id):
@@ -568,6 +570,104 @@ def downloadable_prices_keyboard() -> InlineKeyboardMarkup:
     ]
     rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def price_reports_keyboard() -> InlineKeyboardMarkup:
+    reports = prices_db.latest_reports()
+    rows = [
+        [InlineKeyboardButton(
+            text=f"📊 {WAREHOUSES[warehouse]}", callback_data=f"reports:show:{warehouse}"
+        )]
+        for warehouse in ("center", "west", "ural") if warehouse in reports
+    ]
+    rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def format_price_report(report: dict) -> str:
+    increased = sum(
+        Decimal(item["new_cash"]) > Decimal(item["old_cash"])
+        or Decimal(item["new_cashless"]) > Decimal(item["old_cashless"])
+        for item in report["price_changes"]
+    )
+    decreased = sum(
+        Decimal(item["new_cash"]) < Decimal(item["old_cash"])
+        or Decimal(item["new_cashless"]) < Decimal(item["old_cashless"])
+        for item in report["price_changes"]
+    )
+    previous_date = str(report["previous_date"]).split("T", 1)[0]
+    current_date = str(report["current_date"]).split("T", 1)[0]
+    return (
+        f"📊 <b>Изменения прайса · {WAREHOUSES[report['warehouse']]}</b>\n\n"
+        f"Сравнение: <b>{html.escape(previous_date)}</b> → <b>{html.escape(current_date)}</b>\n"
+        f"Позиций: <b>{report['previous_count']}</b> → <b>{report['current_count']}</b>\n\n"
+        f"➕ Появилось: <b>{len(report['added'])}</b>\n"
+        f"❌ Закончилось: <b>{len(report['removed'])}</b>\n"
+        f"📈 Подорожало: <b>{increased}</b>\n"
+        f"📉 Подешевело: <b>{decreased}</b>\n"
+        f"🆕 Новых групп: <b>{len(report['added_groups'])}</b>\n"
+        f"⛔ Исчезнувших групп: <b>{len(report['removed_groups'])}</b>\n\n"
+        "Подробный список товаров и изменения обеих цен находятся в Excel-отчёте."
+    )
+
+
+@router.callback_query(F.data == "main:price_reports")
+async def open_price_reports(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    reports = prices_db.latest_reports()
+    if not reports:
+        await callback.message.edit_text(
+            "📊 <b>Изменения прайсов</b>\n\n"
+            "Отчётов пока нет. Первый отчёт появится после следующего обновления склада, "
+            "для которого уже загружен предыдущий прайс.",
+            reply_markup=back_main(),
+        )
+    else:
+        await callback.message.edit_text(
+            "📊 <b>Изменения прайсов</b>\n\n"
+            "Здесь хранится только последнее сравнение для каждого склада. Выберите склад:",
+            reply_markup=price_reports_keyboard(),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("reports:show:"))
+async def show_price_report(callback: CallbackQuery) -> None:
+    warehouse = callback.data.rsplit(":", 1)[1]
+    report = prices_db.latest_report(warehouse)
+    if warehouse not in WAREHOUSES or not report:
+        await callback.answer("Отчёт этого склада пока недоступен.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        format_price_report(report),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📥 Скачать подробный Excel", callback_data=f"reports:file:{warehouse}")],
+            [InlineKeyboardButton(text="⬅️ К складам", callback_data="main:price_reports")],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("reports:file:"))
+async def download_price_report(callback: CallbackQuery) -> None:
+    warehouse = callback.data.rsplit(":", 1)[1]
+    report = prices_db.latest_report(warehouse)
+    if warehouse not in WAREHOUSES or not report:
+        await callback.answer("Отчёт этого склада пока недоступен.", show_alert=True)
+        return
+    await callback.answer("Готовлю отчёт…")
+    try:
+        with tempfile.TemporaryDirectory() as temp_name:
+            date = str(report["current_date"]).split("T", 1)[0]
+            destination = Path(temp_name) / f"изменения прайса {WAREHOUSES[warehouse]} {date}.xlsx"
+            await asyncio.to_thread(generate_change_report_excel, report, destination)
+            await callback.message.answer_document(
+                FSInputFile(destination, filename=destination.name),
+                caption=f"📊 <b>Изменения прайса · {WAREHOUSES[warehouse]}</b>",
+            )
+    except Exception:
+        logging.exception("Не удалось сформировать отчёт прайса %s", warehouse)
+        await callback.message.answer("⚠️ Не удалось сформировать отчёт. Попробуйте ещё раз.")
 
 
 @router.callback_query(F.data == "main:price_files")
@@ -1355,16 +1455,18 @@ async def receive_price_file(message: Message, state: FSMContext, bot: Bot) -> N
 
 def apply_pending_price(
     pending_path: Path, warehouse: str, file_name: str
-) -> tuple[int, int, Path | None]:
+) -> tuple[int, int, Path | None, dict | None]:
     parsed = parse_price_file(pending_path)
+    report = prices_db.build_change_report(warehouse, parsed, file_name)
     backup_dir = price_storage_path / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
     database_backup = backup_dir / f"prices_before_{warehouse}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.sqlite3"
     prices_db.backup_to(database_backup)
     source_backup = save_price_source(pending_path, price_storage_path, warehouse)
     prices_db.replace_warehouse(warehouse, parsed, file_name)
+    prices_db.save_latest_report(report)
     pending_path.unlink(missing_ok=True)
-    return len(parsed.groups), parsed.item_count, source_backup
+    return len(parsed.groups), parsed.item_count, source_backup, report
 
 
 @router.callback_query(F.data == "adm:apply_price")
@@ -1380,7 +1482,7 @@ async def apply_price(callback: CallbackQuery, state: FSMContext) -> None:
         return
     await callback.answer("Применяю прайс…")
     try:
-        group_count, item_count, _ = await asyncio.to_thread(
+        group_count, item_count, _, report = await asyncio.to_thread(
             apply_pending_price, pending_path, warehouse, data.get("price_file_name", pending_path.name)
         )
     except Exception:
@@ -1391,14 +1493,23 @@ async def apply_price(callback: CallbackQuery, state: FSMContext) -> None:
         )
         return
     await state.clear()
-    await callback.message.edit_text(
-        "✅ <b>Прайс обновлён</b>\n\n"
-        f"Склад: <b>{WAREHOUSES[warehouse]}</b>\n"
-        f"Товарных групп: <b>{group_count}</b>\n"
-        f"Товарных позиций: <b>{item_count}</b>\n\n"
-        "Новые цены и наличие уже доступны менеджерам. Перезапуск бота не требуется.",
-        reply_markup=price_admin_keyboard(),
-    )
+    if report:
+        await callback.message.edit_text(
+            "✅ <b>Прайс обновлён</b>\n\n" + format_price_report(report),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📥 Скачать подробный Excel", callback_data=f"reports:file:{warehouse}")],
+                [InlineKeyboardButton(text="💰 К управлению прайсами", callback_data="adm:prices")],
+            ]),
+        )
+    else:
+        await callback.message.edit_text(
+            "✅ <b>Прайс обновлён</b>\n\n"
+            f"Склад: <b>{WAREHOUSES[warehouse]}</b>\n"
+            f"Товарных групп: <b>{group_count}</b>\n"
+            f"Товарных позиций: <b>{item_count}</b>\n\n"
+            "Это первая загрузка склада, поэтому сравнение появится при следующем обновлении.",
+            reply_markup=price_admin_keyboard(),
+        )
 
 
 @router.callback_query(F.data == "adm:cancel_price")
