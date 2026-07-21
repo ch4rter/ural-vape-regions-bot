@@ -370,7 +370,7 @@ class PricesDB:
             for key, value in merged.items()
         ]
 
-    def search_groups(self, query: str, limit: int = 8) -> list[GroupSummary]:
+    def search_groups(self, query: str, limit: int = 100) -> list[GroupSummary]:
         query_norm = normalize_price_text(query)
         query_tokens = query_norm.split()
         if not query_tokens:
@@ -400,7 +400,26 @@ class PricesDB:
                 exact_bonus = 0.15 if query_norm in normalize_price_text(group.display_name) else 0
                 ranked.append((score + exact_bonus, sum(group.warehouse_counts.values()), group))
         ranked.sort(key=lambda value: (value[0], value[1]), reverse=True)
-        return [group for _, _, group in ranked[:limit]]
+        buckets = defaultdict(list)
+        for score, item_count, group in ranked:
+            buckets[group.category_name].append((score, item_count, group))
+        preferred_categories = (
+            "Жидкости",
+            "Одноразовые системы",
+            "Электронные системы",
+            "Картриджи",
+            "Конструкторы и ароматизаторы",
+        )
+        category_order = [category for category in preferred_categories if category in buckets]
+        category_order.extend(category for category in buckets if category not in category_order)
+        diversified = []
+        while any(buckets.values()):
+            for category in category_order:
+                if buckets[category]:
+                    diversified.append(buckets[category].pop(0)[2])
+                    if len(diversified) >= limit:
+                        return diversified
+        return diversified
 
     def group_details(self, callback_id: int) -> GroupDetails | None:
         summaries = {group.callback_id: group for group in self.group_summaries()}

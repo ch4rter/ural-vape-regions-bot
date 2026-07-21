@@ -39,6 +39,7 @@ from prices_db import (
 BASE_DIR = Path(__file__).resolve().parent
 RESULTS_PER_PAGE = 10
 PRICE_VARIANTS_PER_PAGE = 12
+PRICE_GROUPS_PER_PAGE = 8
 router = Router()
 catalog: "Catalog"
 materials_db: MaterialsDB
@@ -419,6 +420,44 @@ def price_group_label(display_name: str, category_name: str) -> str:
     return label if len(label) <= 64 else f"{label[:61]}..."
 
 
+def price_search_keyboard(group_ids: list[int], page: int) -> InlineKeyboardMarkup:
+    summaries = {group.callback_id: group for group in prices_db.group_summaries()}
+    available = [summaries[group_id] for group_id in group_ids if group_id in summaries]
+    page_count = max(1, (len(available) + PRICE_GROUPS_PER_PAGE - 1) // PRICE_GROUPS_PER_PAGE)
+    page = max(0, min(page, page_count - 1))
+    start = page * PRICE_GROUPS_PER_PAGE
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=price_group_label(group.display_name, group.category_name),
+                callback_data=f"price:g:{group.callback_id}",
+            )
+        ]
+        for group in available[start : start + PRICE_GROUPS_PER_PAGE]
+    ]
+    navigation = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"price:r:{page - 1}"))
+    if page + 1 < page_count:
+        navigation.append(InlineKeyboardButton(text="Далее ➡️", callback_data=f"price:r:{page + 1}"))
+    if navigation:
+        rows.append(navigation)
+    rows.extend([
+        [InlineKeyboardButton(text="🔎 Новый поиск", callback_data="main:prices")],
+        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")],
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def price_search_text(total: int, page: int) -> str:
+    page_count = max(1, (total + PRICE_GROUPS_PER_PAGE - 1) // PRICE_GROUPS_PER_PAGE)
+    page = max(0, min(page, page_count - 1))
+    text = f"🔎 <b>Подходящих групп: {total}</b>"
+    if page_count > 1:
+        text += f"\nСтраница <b>{page + 1}</b> из <b>{page_count}</b>"
+    return f"{text}\n\nВыберите нужную:"
+
+
 def format_price_group(details: GroupDetails) -> str:
     lines = [
         f"💰 <b>{html.escape(details.summary.display_name)}</b>",
@@ -594,6 +633,7 @@ async def open_price_search(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Прайсы пока не загружены.", show_alert=True)
         return
     await state.set_state(AppState.price_search)
+    await state.update_data(price_result_ids=[])
     await callback.message.edit_text(
         "💰 <b>Цены и наличие</b>\n\n"
         "Введите название товарной группы. Можно использовать бренд, модель, категорию "
@@ -605,7 +645,7 @@ async def open_price_search(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 @router.message(AppState.price_search, F.text)
-async def search_prices(message: Message) -> None:
+async def search_prices(message: Message, state: FSMContext) -> None:
     query = message.text.strip()
     if len(query) > 200:
         await message.answer("⚠️ Запрос слишком длинный. Укажите только товарную группу.", reply_markup=back_main())
@@ -618,23 +658,30 @@ async def search_prices(message: Message) -> None:
             reply_markup=back_main(),
         )
         return
-    rows = [
-        [
-            InlineKeyboardButton(
-                text=price_group_label(group.display_name, group.category_name),
-                callback_data=f"price:g:{group.callback_id}",
-            )
-        ]
-        for group in groups
-    ]
-    rows.extend([
-        [InlineKeyboardButton(text="🔎 Новый поиск", callback_data="main:prices")],
-        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")],
-    ])
+    group_ids = [group.callback_id for group in groups]
+    await state.update_data(price_result_ids=group_ids)
     await message.answer(
-        f"🔎 <b>Подходящих групп: {len(groups)}</b>\n\nВыберите нужную:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        price_search_text(len(groups), 0),
+        reply_markup=price_search_keyboard(group_ids, 0),
     )
+
+
+@router.callback_query(F.data.startswith("price:r:"))
+async def change_price_results_page(callback: CallbackQuery, state: FSMContext) -> None:
+    try:
+        page = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректная страница.", show_alert=True)
+        return
+    group_ids = (await state.get_data()).get("price_result_ids", [])
+    if not group_ids:
+        await callback.answer("Выполните поиск ещё раз.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        price_search_text(len(group_ids), page),
+        reply_markup=price_search_keyboard(group_ids, page),
+    )
+    await callback.answer()
 
 
 @router.message(AppState.price_search)
