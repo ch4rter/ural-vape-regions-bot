@@ -2,8 +2,14 @@ from decimal import Decimal
 
 from openpyxl import Workbook, load_workbook
 
-from bot import discounted, money, variant_word
-from prices_db import PricesDB, clean_group_name, generate_discounted_price, parse_price_file
+from bot import discounted, manager_html, money, variant_word
+from prices_db import (
+    PricesDB,
+    clean_group_name,
+    generate_discounted_price,
+    generate_selected_price,
+    parse_price_file,
+)
 
 
 def make_price(path, suffix="", include_action=True):
@@ -58,6 +64,10 @@ def test_warehouse_replacement_search_and_aggregation(tmp_path):
     result = db.search_groups("VLIQ BALANCE")[0]
     assert result.warehouse_counts == {"west": 2, "center": 2}
 
+    liquid_results = db.search_groups("жидкость OGGO")
+    assert liquid_results
+    assert all(group.category_name == "Жидкости" for group in liquid_results)
+
 
 def test_prices_and_group_name_formatting():
     assert clean_group_name("ЭС/Одноразовые/1. Д Vaporesso Dojo 12000") == "Vaporesso Dojo 12000"
@@ -65,6 +75,8 @@ def test_prices_and_group_name_formatting():
     assert variant_word(1) == "вариант"
     assert variant_word(2) == "варианта"
     assert variant_word(15) == "вариантов"
+    assert manager_html("Андрей") == '<b><a href="https://t.me/shmidtuv">Андрей</a></b>'
+    assert manager_html("Другой") == "<b>Другой</b>"
 
 
 def test_discounted_excel_changes_copy_but_not_original(tmp_path):
@@ -85,3 +97,26 @@ def test_discounted_excel_changes_copy_but_not_original(tmp_path):
     assert discounted_book.active["D11"].value == 90
     base.close()
     discounted_book.close()
+
+
+def test_selected_price_contains_only_chosen_groups_and_discount(tmp_path):
+    source = tmp_path / "center.xlsx"
+    make_price(source)
+    db = PricesDB(tmp_path / "prices.sqlite3")
+    db.replace_warehouse("center", parse_price_file(source), source.name)
+    selected = db.search_groups("VLIQ OGGO BALANCE 20")[0]
+    destination = tmp_path / "selection.xlsx"
+
+    changed = generate_selected_price(db, [selected.callback_id], destination, 10)
+
+    assert changed == 2
+    workbook = load_workbook(destination, data_only=True)
+    sheet = workbook["Москва"]
+    values = [cell.value for cell in sheet["B"]]
+    assert "VLIQ OGGO BALANCE Манго" in values
+    assert "VLIQ OGGO BALANCE Вишня" in values
+    assert "VLIQ OGGO BALANCE Арбуз" not in values
+    mango_row = values.index("VLIQ OGGO BALANCE Манго") + 1
+    assert sheet.cell(mango_row, 3).value == 211.5
+    assert sheet.cell(mango_row, 4).value == 233.1
+    workbook.close()

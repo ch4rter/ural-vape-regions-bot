@@ -31,6 +31,7 @@ from prices_db import (
     GroupDetails,
     PricesDB,
     generate_discounted_price,
+    generate_selected_price,
     parse_price_file,
     save_price_source,
 )
@@ -40,6 +41,7 @@ BASE_DIR = Path(__file__).resolve().parent
 RESULTS_PER_PAGE = 10
 PRICE_VARIANTS_PER_PAGE = 12
 PRICE_GROUPS_PER_PAGE = 8
+MAX_SELECTED_PRICE_GROUPS = 50
 router = Router()
 catalog: "Catalog"
 materials_db: MaterialsDB
@@ -48,6 +50,13 @@ admin_ids: set[int] = set()
 active_excel_path: Path
 managed_excel_path: Path
 price_storage_path: Path
+
+MANAGER_LINKS = {
+    "валера": "uvvalera",
+    "андрей": "shmidtuv",
+    "матвей": "ural_vape",
+    "евгений": "evgenuralv",
+}
 
 
 class AppState(StatesGroup):
@@ -279,6 +288,14 @@ def unique_results(entries: list[Entry]) -> list[tuple[str, str, str]]:
     return list(dict.fromkeys((entry.name, entry.location, entry.manager) for entry in entries))
 
 
+def manager_html(manager: str) -> str:
+    escaped = html.escape(manager)
+    username = MANAGER_LINKS.get(normalize(manager))
+    if not username:
+        return f"<b>{escaped}</b>"
+    return f'<b><a href="https://t.me/{username}">{escaped}</a></b>'
+
+
 def format_result(entries: list[Entry], page: int = 0) -> str:
     unique = unique_results(entries)
     if len(unique) == 1:
@@ -286,7 +303,7 @@ def format_result(entries: list[Entry], page: int = 0) -> str:
         lines = ["✅ <b>Менеджер найден</b>", "", f"📍 Территория: <b>{html.escape(name)}</b>"]
         if location:
             lines.append(f"🗺 Местоположение: <b>{html.escape(location)}</b>")
-        lines.append(f"👤 Менеджер: <b>{html.escape(manager)}</b>")
+        lines.append(f"👤 Менеджер: {manager_html(manager)}")
         return "\n".join(lines)
     page_count = (len(unique) + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE
     page = max(0, min(page, page_count - 1))
@@ -300,7 +317,7 @@ def format_result(entries: list[Entry], page: int = 0) -> str:
         block = [f"\n<b>{number}.</b> 📍 Территория: <b>{html.escape(name)}</b>"]
         if location:
             block.append(f"🗺 Местоположение: <b>{html.escape(location)}</b>")
-        block.append(f"👤 Менеджер: <b>{html.escape(manager)}</b>")
+        block.append(f"👤 Менеджер: {manager_html(manager)}")
         lines.append("\n".join(block))
     return "\n".join(lines)
 
@@ -443,6 +460,8 @@ def price_search_keyboard(group_ids: list[int], page: int) -> InlineKeyboardMark
     if navigation:
         rows.append(navigation)
     rows.extend([
+        [InlineKeyboardButton(text="➕ Добавить все результаты", callback_data="price:add_all")],
+        [InlineKeyboardButton(text="🧺 Моя подборка", callback_data="price:cart")],
         [InlineKeyboardButton(text="🔎 Новый поиск", callback_data="main:prices")],
         [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")],
     ])
@@ -529,6 +548,7 @@ def price_variants_keyboard(callback_id: int, page: int, total: int) -> InlineKe
     rows = [navigation] if navigation else []
     rows.extend([
         [InlineKeyboardButton(text="💰 Вернуться к ценам", callback_data=f"price:g:{callback_id}")],
+        [InlineKeyboardButton(text="⬅️ К результатам поиска", callback_data="price:back")],
         [InlineKeyboardButton(text="🔎 Новый поиск", callback_data="main:prices")],
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -633,7 +653,7 @@ async def open_price_search(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Прайсы пока не загружены.", show_alert=True)
         return
     await state.set_state(AppState.price_search)
-    await state.update_data(price_result_ids=[])
+    await state.update_data(price_result_ids=[], price_result_page=0)
     await callback.message.edit_text(
         "💰 <b>Цены и наличие</b>\n\n"
         "Введите название товарной группы. Можно использовать бренд, модель, категорию "
@@ -659,7 +679,7 @@ async def search_prices(message: Message, state: FSMContext) -> None:
         )
         return
     group_ids = [group.callback_id for group in groups]
-    await state.update_data(price_result_ids=group_ids)
+    await state.update_data(price_result_ids=group_ids, price_result_page=0)
     await message.answer(
         price_search_text(len(groups), 0),
         reply_markup=price_search_keyboard(group_ids, 0),
@@ -677,6 +697,7 @@ async def change_price_results_page(callback: CallbackQuery, state: FSMContext) 
     if not group_ids:
         await callback.answer("Выполните поиск ещё раз.", show_alert=True)
         return
+    await state.update_data(price_result_page=page)
     await callback.message.edit_text(
         price_search_text(len(group_ids), page),
         reply_markup=price_search_keyboard(group_ids, page),
@@ -690,32 +711,195 @@ async def price_non_text(message: Message) -> None:
 
 
 @router.callback_query(F.data.startswith("price:g:"))
-async def show_price_group(callback: CallbackQuery) -> None:
+async def show_price_group(callback: CallbackQuery, state: FSMContext) -> None:
     try:
         callback_id = int(callback.data.rsplit(":", 1)[1])
     except ValueError:
         await callback.answer("Некорректный запрос.", show_alert=True)
         return
-    details = prices_db.group_details(callback_id)
-    if not details:
+    if not await render_price_group(callback.message, callback_id, state):
         await callback.answer("Прайс обновился. Выполните поиск ещё раз.", show_alert=True)
         return
+    await callback.answer()
+
+
+async def render_price_group(message: Message, callback_id: int, state: FSMContext) -> bool:
+    details = prices_db.group_details(callback_id)
+    if not details:
+        return False
+    selected_ids = set((await state.get_data()).get("price_selected_ids", []))
+    selected = callback_id in selected_ids
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎨 Вкусы и цвета", callback_data=f"price:v:{callback_id}:0")],
+        [InlineKeyboardButton(
+            text="✅ В подборке" if selected else "➕ Добавить в подборку",
+            callback_data=f"price:remove:{callback_id}" if selected else f"price:add:{callback_id}",
+        )],
+        [InlineKeyboardButton(text="⬅️ К результатам поиска", callback_data="price:back")],
         [InlineKeyboardButton(text="🔎 Новый поиск", callback_data="main:prices")],
         [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")],
     ])
     text = format_price_group(details)
     if len(text) <= 4000:
-        await callback.message.edit_text(text, reply_markup=keyboard)
+        await message.edit_text(text, reply_markup=keyboard)
     else:
-        await callback.message.edit_text(
+        await message.edit_text(
             f"💰 <b>{html.escape(details.summary.display_name)}</b>\n\n"
             "В группе много ценовых уровней — отправляю подробный расчёт отдельным сообщением.",
             reply_markup=keyboard,
         )
-        await callback.message.answer(text)
+        await message.answer(text)
+    return True
+
+
+@router.callback_query(F.data == "price:back")
+async def back_to_price_results(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    group_ids = data.get("price_result_ids", [])
+    page = data.get("price_result_page", 0)
+    if not group_ids:
+        await callback.answer("Результаты поиска уже недоступны. Выполните поиск ещё раз.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        price_search_text(len(group_ids), page),
+        reply_markup=price_search_keyboard(group_ids, page),
+    )
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("price:add:"))
+async def add_price_group(callback: CallbackQuery, state: FSMContext) -> None:
+    try:
+        callback_id = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректный товар.", show_alert=True)
+        return
+    data = await state.get_data()
+    selected = list(dict.fromkeys([*data.get("price_selected_ids", []), callback_id]))
+    if len(selected) > MAX_SELECTED_PRICE_GROUPS:
+        await callback.answer(f"В подборку можно добавить до {MAX_SELECTED_PRICE_GROUPS} групп.", show_alert=True)
+        return
+    await state.update_data(price_selected_ids=selected)
+    await callback.answer(f"Добавлено в подборку: {len(selected)}")
+    await render_price_group(callback.message, callback_id, state)
+
+
+@router.callback_query(F.data.startswith("price:remove:"))
+async def remove_price_group(callback: CallbackQuery, state: FSMContext) -> None:
+    try:
+        callback_id = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректный товар.", show_alert=True)
+        return
+    data = await state.get_data()
+    selected = [value for value in data.get("price_selected_ids", []) if value != callback_id]
+    await state.update_data(price_selected_ids=selected)
+    await callback.answer("Удалено из подборки")
+    await render_price_group(callback.message, callback_id, state)
+
+
+@router.callback_query(F.data == "price:add_all")
+async def add_all_price_results(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    result_ids = data.get("price_result_ids", [])
+    selected = list(dict.fromkeys([*data.get("price_selected_ids", []), *result_ids]))
+    truncated = len(selected) > MAX_SELECTED_PRICE_GROUPS
+    selected = selected[:MAX_SELECTED_PRICE_GROUPS]
+    await state.update_data(price_selected_ids=selected)
+    message = f"Добавлено в подборку: {len(selected)}"
+    if truncated:
+        message += f" (достигнут лимит {MAX_SELECTED_PRICE_GROUPS})"
+    await callback.answer(message, show_alert=True)
+
+
+def price_cart_keyboard(selected_ids: list[int]) -> InlineKeyboardMarkup:
+    summaries = {group.callback_id: group for group in prices_db.group_summaries()}
+    rows = [
+        [InlineKeyboardButton(
+            text=f"❌ {price_group_label(summaries[value].display_name, summaries[value].category_name)}",
+            callback_data=f"price:cart_remove:{value}",
+        )]
+        for value in selected_ids if value in summaries
+    ]
+    if rows:
+        rows.extend([
+            [InlineKeyboardButton(text="📄 Сформировать базовый прайс", callback_data="price:export:0")],
+            [InlineKeyboardButton(text="📄 Сформировать прайс −10%", callback_data="price:export:10")],
+            [InlineKeyboardButton(text="🗑 Очистить подборку", callback_data="price:cart_clear")],
+        ])
+    rows.extend([
+        [InlineKeyboardButton(text="⬅️ К результатам поиска", callback_data="price:back")],
+        [InlineKeyboardButton(text="🔎 Новый поиск", callback_data="main:prices")],
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == "price:cart")
+async def show_price_cart(callback: CallbackQuery, state: FSMContext) -> None:
+    selected = (await state.get_data()).get("price_selected_ids", [])
+    text = (
+        f"🧺 <b>Подборка для прайса</b>\n\nВыбрано товарных групп: <b>{len(selected)}</b>\n\n"
+        "Нажмите на товар, чтобы удалить его, либо сформируйте Excel-файл."
+        if selected else
+        "🧺 <b>Подборка пока пуста</b>\n\nДобавьте одну группу из карточки товара или все результаты поиска целиком."
+    )
+    await callback.message.edit_text(text, reply_markup=price_cart_keyboard(selected))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("price:cart_remove:"))
+async def remove_from_price_cart(callback: CallbackQuery, state: FSMContext) -> None:
+    try:
+        callback_id = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректный товар.", show_alert=True)
+        return
+    data = await state.get_data()
+    await state.update_data(price_selected_ids=[v for v in data.get("price_selected_ids", []) if v != callback_id])
+    selected = (await state.get_data()).get("price_selected_ids", [])
+    await callback.message.edit_text(
+        f"🧺 <b>Подборка для прайса</b>\n\nВыбрано товарных групп: <b>{len(selected)}</b>",
+        reply_markup=price_cart_keyboard(selected),
+    )
+    await callback.answer("Удалено")
+
+
+@router.callback_query(F.data == "price:cart_clear")
+async def clear_price_cart(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.update_data(price_selected_ids=[])
+    await callback.message.edit_text(
+        "🧺 <b>Подборка пока пуста</b>\n\nДобавьте одну группу из карточки товара или все результаты поиска целиком.",
+        reply_markup=price_cart_keyboard([]),
+    )
+    await callback.answer("Подборка очищена")
+
+
+@router.callback_query(F.data.startswith("price:export:"))
+async def export_selected_prices(callback: CallbackQuery, state: FSMContext) -> None:
+    try:
+        discount = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректная скидка.", show_alert=True)
+        return
+    selected = (await state.get_data()).get("price_selected_ids", [])
+    if not selected:
+        await callback.answer("Сначала добавьте товары в подборку.", show_alert=True)
+        return
+    await callback.answer("Формирую прайс…")
+    try:
+        with tempfile.TemporaryDirectory() as temp_name:
+            suffix = "скидка 10" if discount else "базовые цены"
+            destination = Path(temp_name) / f"прайс подборка {suffix}.xlsx"
+            count = await asyncio.to_thread(generate_selected_price, prices_db, selected, destination, discount)
+            await callback.message.answer_document(
+                FSInputFile(destination, filename=destination.name),
+                caption=(f"📄 <b>Прайс по выбранным товарам</b>\n\n"
+                         f"Товарных позиций: <b>{count}</b> · "
+                         f"{'скидка 10%' if discount else 'базовые цены'}"),
+            )
+    except Exception:
+        logging.exception("Не удалось сформировать прайс по подборке")
+        await callback.message.answer("⚠️ Не удалось сформировать файл. Попробуйте ещё раз.")
 
 
 @router.callback_query(F.data.startswith("price:v:"))

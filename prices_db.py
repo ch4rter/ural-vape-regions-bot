@@ -9,7 +9,8 @@ from decimal import Decimal, ROUND_HALF_UP
 from difflib import SequenceMatcher
 from pathlib import Path
 
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment, Font, PatternFill
 
 
 WAREHOUSES = {
@@ -375,8 +376,22 @@ class PricesDB:
         query_tokens = query_norm.split()
         if not query_tokens:
             return []
+        category_intent = None
+        category_markers = (
+            (("жидкост",), "Жидкости"),
+            (("ароматизатор", "конструктор"), "Конструкторы и ароматизаторы"),
+            (("однораз",), "Одноразовые системы"),
+            (("картридж",), "Картриджи"),
+            (("электронн",), "Электронные системы"),
+        )
+        for markers, category in category_markers:
+            if any(any(token.startswith(marker) for marker in markers) for token in query_tokens):
+                category_intent = category
+                break
         ranked = []
         for group in self.group_summaries():
+            if category_intent and group.category_name != category_intent:
+                continue
             candidate = normalize_price_text(
                 f"{group.display_name} {group.category_name} {group.search_text}"
             )
@@ -540,3 +555,101 @@ def generate_discounted_price(source: Path, destination: Path, percent: int = 10
     workbook.save(destination)
     workbook.close()
     return changed
+
+
+def generate_selected_price(
+    db: PricesDB,
+    callback_ids: list[int],
+    destination: Path,
+    discount: int = 0,
+) -> int:
+    """Create a clean multi-warehouse workbook containing only selected groups."""
+    if discount not in (0, 10):
+        raise ValueError("Поддерживаются базовые цены или скидка 10%.")
+    summaries = {group.callback_id: group for group in db.group_summaries()}
+    merge_keys = list(dict.fromkeys(
+        summaries[value].merge_key for value in callback_ids if value in summaries
+    ))
+    if not merge_keys:
+        raise ValueError("В подборке нет доступных товарных групп.")
+
+    placeholders = ",".join("?" for _ in merge_keys)
+    with closing(db._connect()) as connection:
+        rows = connection.execute(
+            f"""SELECT g.warehouse, g.merge_key, g.display_name, g.category_name,
+                       g.position AS group_position, i.code, i.name, i.cash, i.cashless,
+                       i.position AS item_position
+                FROM price_groups g JOIN price_items i ON i.group_id = g.id
+                WHERE g.merge_key IN ({placeholders})
+                ORDER BY g.position, i.position""",
+            merge_keys,
+        ).fetchall()
+
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+    total = 0
+    multiplier = Decimal(100 - discount) / Decimal(100)
+    title_fill = PatternFill("solid", fgColor="1F4E78")
+    group_fill = PatternFill("solid", fgColor="D9EAF7")
+    header_fill = PatternFill("solid", fgColor="5B9BD5")
+    for warehouse in ("center", "west", "ural"):
+        warehouse_rows = [row for row in rows if row["warehouse"] == warehouse]
+        if not warehouse_rows:
+            continue
+        sheet = workbook.create_sheet(WAREHOUSES[warehouse][:31])
+        sheet.merge_cells("A1:D1")
+        sheet["A1"] = f"Прайс по выбранным товарам — {WAREHOUSES[warehouse]}"
+        sheet["A1"].font = Font(bold=True, color="FFFFFF", size=14)
+        sheet["A1"].fill = title_fill
+        sheet["A1"].alignment = Alignment(horizontal="center")
+        sheet.merge_cells("A2:D2")
+        sheet["A2"] = (
+            f"Цены со скидкой {discount}%" if discount else "Базовые цены"
+        )
+        sheet["A2"].alignment = Alignment(horizontal="center")
+        current_row = 4
+        last_key = None
+        for row in warehouse_rows:
+            if row["merge_key"] != last_key:
+                if last_key is not None:
+                    current_row += 1
+                sheet.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=4)
+                group_cell = sheet.cell(current_row, 1)
+                group_cell.value = f"{row['display_name']} · {row['category_name']}"
+                group_cell.font = Font(bold=True)
+                group_cell.fill = group_fill
+                current_row += 1
+                headers = (
+                    "Код",
+                    "Наименование",
+                    f"Нал — скидка {discount}%" if discount else "Нал",
+                    f"Безнал — скидка {discount}%" if discount else "Безнал",
+                )
+                for column, value in enumerate(headers, 1):
+                    cell = sheet.cell(current_row, column, value)
+                    cell.font = Font(bold=True, color="FFFFFF")
+                    cell.fill = header_fill
+                    cell.alignment = Alignment(horizontal="center")
+                current_row += 1
+                last_key = row["merge_key"]
+            cash = (Decimal(row["cash"]) * multiplier).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            cashless = (Decimal(row["cashless"]) * multiplier).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            sheet.cell(current_row, 1, row["code"] or "")
+            sheet.cell(current_row, 2, row["name"])
+            sheet.cell(current_row, 3, float(cash)).number_format = "0.00"
+            sheet.cell(current_row, 4, float(cashless)).number_format = "0.00"
+            current_row += 1
+            total += 1
+        sheet.freeze_panes = "A4"
+        sheet.auto_filter.ref = f"A4:D{sheet.max_row}"
+        sheet.column_dimensions["A"].width = 16
+        sheet.column_dimensions["B"].width = 68
+        sheet.column_dimensions["C"].width = 20
+        sheet.column_dimensions["D"].width = 20
+
+    if not workbook.sheetnames:
+        raise ValueError("Выбранные товары отсутствуют в действующих прайсах.")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    workbook.save(destination)
+    workbook.close()
+    return total
