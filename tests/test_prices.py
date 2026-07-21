@@ -2,7 +2,7 @@ from decimal import Decimal
 
 from openpyxl import Workbook, load_workbook
 
-from bot import discounted, manager_html, money, variant_word
+from bot import discounted, format_price_report, manager_html, money, variant_word
 from prices_db import (
     ParsedGroup,
     ParsedItem,
@@ -167,6 +167,10 @@ def test_latest_price_change_report_replaces_previous_report(tmp_path):
 
     report = db.build_change_report("center", new, "new.xlsx")
     assert report is not None
+    formatted = format_price_report(report)
+    assert isinstance(formatted, str)
+    assert "Изменения прайса" in formatted
+    assert "Появилось: <b>1</b>" in formatted
     assert [item["code"] for item in report["added"]] == ["004"]
     assert [item["code"] for item in report["removed"]] == ["003"]
     assert [item["code"] for item in report["price_changes"]] == ["001"]

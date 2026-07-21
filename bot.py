@@ -602,6 +602,25 @@ def format_price_report(report: dict) -> str:
         or Decimal(item["new_cashless"]) > Decimal(item["old_cashless"])
         for item in report["price_changes"]
     )
+    decreased = sum(
+        Decimal(item["new_cash"]) < Decimal(item["old_cash"])
+        or Decimal(item["new_cashless"]) < Decimal(item["old_cashless"])
+        for item in report["price_changes"]
+    )
+    previous_date = str(report["previous_date"]).split("T", 1)[0]
+    current_date = str(report["current_date"]).split("T", 1)[0]
+    return (
+        f"📊 <b>Изменения прайса · {WAREHOUSES[report['warehouse']]}</b>\n\n"
+        f"Сравнение: <b>{html.escape(previous_date)}</b> → <b>{html.escape(current_date)}</b>\n"
+        f"Позиций: <b>{report['previous_count']}</b> → <b>{report['current_count']}</b>\n\n"
+        f"➕ Появилось: <b>{len(report['added'])}</b>\n"
+        f"❌ Закончилось: <b>{len(report['removed'])}</b>\n"
+        f"📈 Подорожало: <b>{increased}</b>\n"
+        f"📉 Подешевело: <b>{decreased}</b>\n"
+        f"🆕 Новых групп: <b>{len(report['added_groups'])}</b>\n"
+        f"⛔ Исчезнувших групп: <b>{len(report['removed_groups'])}</b>\n\n"
+        "Подробный список товаров и изменения обеих цен находятся в Excel-отчёте."
+    )
 
 
 def report_actions_keyboard(warehouse: str, user_id: int | None) -> InlineKeyboardMarkup:
@@ -621,25 +640,6 @@ def format_report_notification(report: dict) -> str:
         "🔔 <b>Обновлён складской прайс</b>\n\n"
         + format_price_report(report)
         + "\n\nОткройте отчёт, чтобы скачать подробный Excel со списком изменений."
-    )
-    decreased = sum(
-        Decimal(item["new_cash"]) < Decimal(item["old_cash"])
-        or Decimal(item["new_cashless"]) < Decimal(item["old_cashless"])
-        for item in report["price_changes"]
-    )
-    previous_date = str(report["previous_date"]).split("T", 1)[0]
-    current_date = str(report["current_date"]).split("T", 1)[0]
-    return (
-        f"📊 <b>Изменения прайса · {WAREHOUSES[report['warehouse']]}</b>\n\n"
-        f"Сравнение: <b>{html.escape(previous_date)}</b> → <b>{html.escape(current_date)}</b>\n"
-        f"Позиций: <b>{report['previous_count']}</b> → <b>{report['current_count']}</b>\n\n"
-        f"➕ Появилось: <b>{len(report['added'])}</b>\n"
-        f"❌ Закончилось: <b>{len(report['removed'])}</b>\n"
-        f"📈 Подорожало: <b>{increased}</b>\n"
-        f"📉 Подешевело: <b>{decreased}</b>\n"
-        f"🆕 Новых групп: <b>{len(report['added_groups'])}</b>\n"
-        f"⛔ Исчезнувших групп: <b>{len(report['removed_groups'])}</b>\n\n"
-        "Подробный список товаров и изменения обеих цен находятся в Excel-отчёте."
     )
 
 
