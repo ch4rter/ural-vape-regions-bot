@@ -18,6 +18,7 @@ from pathlib import Path
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -590,6 +591,26 @@ def format_price_report(report: dict) -> str:
         or Decimal(item["new_cashless"]) > Decimal(item["old_cashless"])
         for item in report["price_changes"]
     )
+
+
+def report_actions_keyboard(warehouse: str, user_id: int | None) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(
+        text="📥 Скачать подробный Excel", callback_data=f"reports:file:{warehouse}"
+    )]]
+    if is_admin(user_id):
+        rows.append([InlineKeyboardButton(
+            text="📣 Отправить уведомление", callback_data=f"reports:broadcast:{warehouse}"
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️ К складам", callback_data="main:price_reports")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def format_report_notification(report: dict) -> str:
+    return (
+        "🔔 <b>Обновлён складской прайс</b>\n\n"
+        + format_price_report(report)
+        + "\n\nОткройте отчёт, чтобы скачать подробный Excel со списком изменений."
+    )
     decreased = sum(
         Decimal(item["new_cash"]) < Decimal(item["old_cash"])
         or Decimal(item["new_cashless"]) < Decimal(item["old_cashless"])
@@ -640,12 +661,85 @@ async def show_price_report(callback: CallbackQuery) -> None:
         return
     await callback.message.edit_text(
         format_price_report(report),
+        reply_markup=report_actions_keyboard(warehouse, callback.from_user.id),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("reports:broadcast:"))
+async def confirm_report_broadcast(callback: CallbackQuery) -> None:
+    if not await require_admin(callback):
+        return
+    warehouse = callback.data.rsplit(":", 1)[1]
+    report = prices_db.latest_report(warehouse)
+    if warehouse not in WAREHOUSES or not report:
+        await callback.answer("Отчёт этого склада пока недоступен.", show_alert=True)
+        return
+    users = materials_db.list_access_users()
+    ready = len({user.telegram_id for user in users if user.telegram_id})
+    waiting = sum(user.telegram_id is None for user in users)
+    await callback.message.edit_text(
+        "📣 <b>Предпросмотр уведомления</b>\n\n"
+        + format_report_notification(report)
+        + f"\n\nПолучателей: <b>{ready}</b>"
+        + (f"\nБез Telegram ID: <b>{waiting}</b> — будут пропущены" if waiting else "")
+        + "\n\nОтправить это уведомление пользователям белого списка?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📥 Скачать подробный Excel", callback_data=f"reports:file:{warehouse}")],
-            [InlineKeyboardButton(text="⬅️ К складам", callback_data="main:price_reports")],
+            [InlineKeyboardButton(text="✅ Отправить", callback_data=f"reports:send:{warehouse}")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"reports:show:{warehouse}")],
         ]),
     )
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("reports:send:"))
+async def send_report_broadcast(callback: CallbackQuery, bot: Bot) -> None:
+    if not await require_admin(callback):
+        return
+    warehouse = callback.data.rsplit(":", 1)[1]
+    report = prices_db.latest_report(warehouse)
+    if warehouse not in WAREHOUSES or not report:
+        await callback.answer("Отчёт этого склада пока недоступен.", show_alert=True)
+        return
+    recipients = sorted({
+        user.telegram_id for user in materials_db.list_access_users() if user.telegram_id
+    })
+    missing_ids = sum(user.telegram_id is None for user in materials_db.list_access_users())
+    await callback.answer("Начинаю рассылку…")
+    await callback.message.edit_text(
+        "⏳ <b>Отправляю уведомление</b>\n\n"
+        f"Склад: <b>{WAREHOUSES[warehouse]}</b>\n"
+        f"Получателей: <b>{len(recipients)}</b>"
+    )
+    sent = 0
+    failed = 0
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Открыть отчёт", callback_data=f"reports:show:{warehouse}")]
+    ])
+    for telegram_id in recipients:
+        try:
+            await bot.send_message(telegram_id, format_report_notification(report), reply_markup=markup)
+            sent += 1
+        except TelegramRetryAfter as error:
+            await asyncio.sleep(error.retry_after)
+            try:
+                await bot.send_message(telegram_id, format_report_notification(report), reply_markup=markup)
+                sent += 1
+            except Exception:
+                failed += 1
+                logging.exception("Не удалось отправить отчёт пользователю %s", telegram_id)
+        except Exception:
+            failed += 1
+            logging.exception("Не удалось отправить отчёт пользователю %s", telegram_id)
+    await callback.message.edit_text(
+        "✅ <b>Рассылка завершена</b>\n\n"
+        f"Успешно отправлено: <b>{sent}</b>\n"
+        f"Не удалось отправить: <b>{failed}</b>\n"
+        f"Без привязанного Telegram ID: <b>{missing_ids}</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Вернуться к отчёту", callback_data=f"reports:show:{warehouse}")]
+        ]),
+    )
 
 
 @router.callback_query(F.data.startswith("reports:file:"))
@@ -1498,6 +1592,7 @@ async def apply_price(callback: CallbackQuery, state: FSMContext) -> None:
             "✅ <b>Прайс обновлён</b>\n\n" + format_price_report(report),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="📥 Скачать подробный Excel", callback_data=f"reports:file:{warehouse}")],
+                [InlineKeyboardButton(text="📣 Отправить уведомление", callback_data=f"reports:broadcast:{warehouse}")],
                 [InlineKeyboardButton(text="💰 К управлению прайсами", callback_data="adm:prices")],
             ]),
         )
