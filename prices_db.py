@@ -740,13 +740,15 @@ def generate_selected_price(
             translated = formula
         sheet.cell(mapped_row, column).value = translated
 
-    availability_columns = {"center": 17, "west": 18, "ural": 19}
+    availability_columns = {"center": 9, "west": 10, "ural": 11}
     for warehouse, column in availability_columns.items():
         header = sheet.cell(header_row, column)
         header.value = WAREHOUSES[warehouse]
         header._style = copy(sheet.cell(header_row, cash_col)._style)
         header.alignment = copy(sheet.cell(header_row, cash_col).alignment)
-        sheet.column_dimensions[get_column_letter(column)].width = 20
+        column_letter = get_column_letter(column)
+        current_width = sheet.column_dimensions[column_letter].width or 0
+        sheet.column_dimensions[column_letter].width = max(current_width, 20)
     for old_row, identity in selected_identities.items():
         mapped_row = row_map[old_row]
         warehouses = availability.get(identity, set())
@@ -754,7 +756,8 @@ def generate_selected_price(
             cell = sheet.cell(mapped_row, column)
             cell._style = copy(sheet.cell(mapped_row, cash_col)._style)
             cell.alignment = copy(sheet.cell(mapped_row, cash_col).alignment)
-            cell.value = "Есть" if warehouse in warehouses else "—"
+            cell.value = "✅" if warehouse in warehouses else "❌"
+    sheet.freeze_panes = "A9"
 
     if discount:
         sheet.cell(header_row, cash_col).value = f"от 50т.р. нал — скидка {discount}%"

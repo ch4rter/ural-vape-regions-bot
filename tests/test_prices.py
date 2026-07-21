@@ -127,11 +127,12 @@ def test_selected_price_contains_only_chosen_groups_and_discount(tmp_path):
     mango_row = values.index("VLIQ OGGO BALANCE Манго") + 1
     assert sheet.cell(mango_row, 4).value == 211.5
     assert sheet.cell(mango_row, 5).value == 233.1
-    assert [sheet.cell(8, column).value for column in (17, 18, 19)] == [
+    assert [sheet.cell(8, column).value for column in (9, 10, 11)] == [
         "Москва", "Санкт-Петербург", "Челябинск"
     ]
-    assert sheet.cell(mango_row, 17).value == "Есть"
-    assert sheet.cell(mango_row, 18).value == "—"
+    assert sheet.cell(mango_row, 9).value == "✅"
+    assert sheet.cell(mango_row, 10).value == "❌"
+    assert sheet.freeze_panes == "A9"
     assert "A2:E2" in {str(value) for value in sheet.merged_cells.ranges}
     cherry_row = values.index("VLIQ OGGO BALANCE Вишня") + 1
     workbook.close()
