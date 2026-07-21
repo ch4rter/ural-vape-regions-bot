@@ -1,6 +1,7 @@
 import re
 import shutil
 import sqlite3
+from copy import copy
 from collections import defaultdict
 from contextlib import closing
 from dataclasses import dataclass
@@ -9,8 +10,9 @@ from decimal import Decimal, ROUND_HALF_UP
 from difflib import SequenceMatcher
 from pathlib import Path
 
-from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl import load_workbook
+from openpyxl.formula.translate import Translator
+from openpyxl.utils import get_column_letter
 
 
 WAREHOUSES = {
@@ -558,98 +560,168 @@ def generate_discounted_price(source: Path, destination: Path, percent: int = 10
 
 
 def generate_selected_price(
-    db: PricesDB,
-    callback_ids: list[int],
+    source: Path,
     destination: Path,
+    merge_keys: list[str],
     discount: int = 0,
 ) -> int:
-    """Create a clean multi-warehouse workbook containing only selected groups."""
+    """Filter a native warehouse price while preserving its original workbook design."""
     if discount not in (0, 10):
         raise ValueError("Поддерживаются базовые цены или скидка 10%.")
-    summaries = {group.callback_id: group for group in db.group_summaries()}
-    merge_keys = list(dict.fromkeys(
-        summaries[value].merge_key for value in callback_ids if value in summaries
-    ))
     if not merge_keys:
         raise ValueError("В подборке нет доступных товарных групп.")
+    selected_keys = set(merge_keys)
+    workbook = load_workbook(source, data_only=False)
+    sheet = workbook.active
+    header_row = None
+    headers = None
+    for row_number, row in enumerate(sheet.iter_rows(min_row=1, max_row=30), 1):
+        normalized = [normalize_price_text(str(cell.value or "")) for cell in row]
+        if (
+            any(value == "наименование" for value in normalized)
+            and any("50т р нал" in value for value in normalized)
+            and any("50т р безнал" in value for value in normalized)
+        ):
+            header_row, headers = row_number, normalized
+            break
+    if not header_row or headers is None:
+        workbook.close()
+        raise ValueError("Не найдена строка заголовков прайса.")
+    name_col = headers.index("наименование") + 1
+    cash_col = next(i for i, value in enumerate(headers, 1) if "50т р нал" in value)
+    cashless_col = next(i for i, value in enumerate(headers, 1) if "50т р безнал" in value)
 
-    placeholders = ",".join("?" for _ in merge_keys)
-    with closing(db._connect()) as connection:
-        rows = connection.execute(
-            f"""SELECT g.warehouse, g.merge_key, g.display_name, g.category_name,
-                       g.position AS group_position, i.code, i.name, i.cash, i.cashless,
-                       i.position AS item_position
-                FROM price_groups g JOIN price_items i ON i.group_id = g.id
-                WHERE g.merge_key IN ({placeholders})
-                ORDER BY g.position, i.position""",
-            merge_keys,
-        ).fetchall()
-
-    workbook = Workbook()
-    workbook.remove(workbook.active)
-    total = 0
-    multiplier = Decimal(100 - discount) / Decimal(100)
-    title_fill = PatternFill("solid", fgColor="1F4E78")
-    group_fill = PatternFill("solid", fgColor="D9EAF7")
-    header_fill = PatternFill("solid", fgColor="5B9BD5")
-    for warehouse in ("center", "west", "ural"):
-        warehouse_rows = [row for row in rows if row["warehouse"] == warehouse]
-        if not warehouse_rows:
+    keep_rows = [True] * (sheet.max_row + 1)
+    group_rows: list[int] = []
+    selected_group_rows: set[int] = set()
+    selected_item_rows: set[int] = set()
+    current_path = None
+    current_group_row = None
+    first_group_row = None
+    last_item_row = None
+    for row_number in range(header_row + 1, sheet.max_row + 1):
+        first = str(sheet.cell(row_number, 1).value or "").strip()
+        name = str(sheet.cell(row_number, name_col).value or "").strip()
+        cash = to_decimal(sheet.cell(row_number, cash_col).value)
+        cashless = to_decimal(sheet.cell(row_number, cashless_col).value)
+        if first and "/" in first and (not name or cash is None or cashless is None):
+            current_path = first
+            current_group_row = row_number
+            group_rows.append(row_number)
+            first_group_row = first_group_row or row_number
             continue
-        sheet = workbook.create_sheet(WAREHOUSES[warehouse][:31])
-        sheet.merge_cells("A1:D1")
-        sheet["A1"] = f"Прайс по выбранным товарам — {WAREHOUSES[warehouse]}"
-        sheet["A1"].font = Font(bold=True, color="FFFFFF", size=14)
-        sheet["A1"].fill = title_fill
-        sheet["A1"].alignment = Alignment(horizontal="center")
-        sheet.merge_cells("A2:D2")
-        sheet["A2"] = (
-            f"Цены со скидкой {discount}%" if discount else "Базовые цены"
-        )
-        sheet["A2"].alignment = Alignment(horizontal="center")
-        current_row = 4
-        last_key = None
-        for row in warehouse_rows:
-            if row["merge_key"] != last_key:
-                if last_key is not None:
-                    current_row += 1
-                sheet.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=4)
-                group_cell = sheet.cell(current_row, 1)
-                group_cell.value = f"{row['display_name']} · {row['category_name']}"
-                group_cell.font = Font(bold=True)
-                group_cell.fill = group_fill
-                current_row += 1
-                headers = (
-                    "Код",
-                    "Наименование",
-                    f"Нал — скидка {discount}%" if discount else "Нал",
-                    f"Безнал — скидка {discount}%" if discount else "Безнал",
-                )
-                for column, value in enumerate(headers, 1):
-                    cell = sheet.cell(current_row, column, value)
-                    cell.font = Font(bold=True, color="FFFFFF")
-                    cell.fill = header_fill
-                    cell.alignment = Alignment(horizontal="center")
-                current_row += 1
-                last_key = row["merge_key"]
-            cash = (Decimal(row["cash"]) * multiplier).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-            cashless = (Decimal(row["cashless"]) * multiplier).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-            sheet.cell(current_row, 1, row["code"] or "")
-            sheet.cell(current_row, 2, row["name"])
-            sheet.cell(current_row, 3, float(cash)).number_format = "0.00"
-            sheet.cell(current_row, 4, float(cashless)).number_format = "0.00"
-            current_row += 1
-            total += 1
-        sheet.freeze_panes = "A4"
-        sheet.auto_filter.ref = f"A4:D{sheet.max_row}"
-        sheet.column_dimensions["A"].width = 16
-        sheet.column_dimensions["B"].width = 68
-        sheet.column_dimensions["C"].width = 20
-        sheet.column_dimensions["D"].width = 20
+        if not current_path or not name or cash is None or cashless is None:
+            continue
+        last_item_row = row_number
+        category_key, _ = category_from_path(current_path)
+        if normalize_price_text(name).startswith("акция "):
+            clean_name = re.sub(r"^\s*АКЦИЯ\s+", "", name, flags=re.IGNORECASE)
+            base_name = clean_name.split(" - ", 1)[0].strip() if " - " in clean_name else clean_name
+            row_key = f"{category_key}|{normalize_price_text(base_name)}"
+        else:
+            row_key = f"{category_key}|{normalize_price_text(clean_group_name(current_path))}"
+        if row_key in selected_keys:
+            selected_item_rows.add(row_number)
+            if current_group_row is not None:
+                selected_group_rows.add(current_group_row)
 
-    if not workbook.sheetnames:
-        raise ValueError("Выбранные товары отсутствуют в действующих прайсах.")
+    if not selected_item_rows or first_group_row is None or last_item_row is None:
+        workbook.close()
+        raise ValueError("Выбранные товары отсутствуют в исходном прайсе.")
+    for row_number in range(first_group_row, last_item_row + 1):
+        keep_rows[row_number] = row_number in selected_item_rows or row_number in selected_group_rows
+
+    original_max_row = sheet.max_row
+    formulas = {
+        (cell.row, cell.column): cell.value
+        for row in sheet.iter_rows()
+        for cell in row
+        if isinstance(cell.value, str) and cell.value.startswith("=") and keep_rows[cell.row]
+    }
+    original_dimensions = {index: copy(dimension) for index, dimension in sheet.row_dimensions.items()}
+    merged_ranges = [copy(cell_range) for cell_range in sheet.merged_cells.ranges]
+    anchored_objects = [*getattr(sheet, "_images", []), *getattr(sheet, "_charts", [])]
+    for cell_range in list(sheet.merged_cells.ranges):
+        sheet.unmerge_cells(str(cell_range))
+
+    row_map = {}
+    new_row = 0
+    for old_row in range(1, original_max_row + 1):
+        if keep_rows[old_row]:
+            new_row += 1
+            row_map[old_row] = new_row
+    remove_ranges = []
+    range_start = None
+    for row_number in range(1, original_max_row + 2):
+        remove = row_number <= original_max_row and not keep_rows[row_number]
+        if remove and range_start is None:
+            range_start = row_number
+        elif not remove and range_start is not None:
+            remove_ranges.append((range_start, row_number - range_start))
+            range_start = None
+    for start, amount in reversed(remove_ranges):
+        sheet.delete_rows(start, amount)
+
+    removed_anchors = []
+    for anchored in anchored_objects:
+        anchor = getattr(anchored, "anchor", None)
+        marker = getattr(anchor, "_from", None)
+        if marker is None:
+            continue
+        original_row = marker.row + 1
+        if original_row in row_map:
+            marker.row = row_map[original_row] - 1
+        else:
+            removed_anchors.append(anchored)
+            continue
+        end_marker = getattr(anchor, "to", None)
+        if end_marker is not None:
+            original_end_row = end_marker.row + 1
+            if original_end_row in row_map:
+                end_marker.row = row_map[original_end_row] - 1
+    sheet._images = [value for value in getattr(sheet, "_images", []) if value not in removed_anchors]
+    sheet._charts = [value for value in getattr(sheet, "_charts", []) if value not in removed_anchors]
+
+    sheet.row_dimensions.clear()
+    for old_row, dimension in original_dimensions.items():
+        if old_row not in row_map:
+            continue
+        mapped = copy(dimension)
+        mapped.index = row_map[old_row]
+        sheet.row_dimensions[row_map[old_row]] = mapped
+    for cell_range in merged_ranges:
+        mapped_rows = [row_map.get(row) for row in range(cell_range.min_row, cell_range.max_row + 1)]
+        if not mapped_rows or any(row is None for row in mapped_rows):
+            continue
+        if mapped_rows != list(range(mapped_rows[0], mapped_rows[-1] + 1)):
+            continue
+        sheet.merge_cells(
+            start_row=mapped_rows[0], start_column=cell_range.min_col,
+            end_row=mapped_rows[-1], end_column=cell_range.max_col,
+        )
+    for (old_row, column), formula in formulas.items():
+        mapped_row = row_map[old_row]
+        old_coordinate = f"{get_column_letter(column)}{old_row}"
+        new_coordinate = sheet.cell(mapped_row, column).coordinate
+        try:
+            translated = Translator(formula, origin=old_coordinate).translate_formula(new_coordinate)
+        except Exception:
+            translated = formula
+        sheet.cell(mapped_row, column).value = translated
+
+    if discount:
+        sheet.cell(header_row, cash_col).value = f"от 50т.р. нал — скидка {discount}%"
+        sheet.cell(header_row, cashless_col).value = f"от 50т.р. безнал — скидка {discount}%"
+        multiplier = Decimal(100 - discount) / Decimal(100)
+        for old_row in selected_item_rows:
+            mapped_row = row_map[old_row]
+            for column in (cash_col, cashless_col):
+                cell = sheet.cell(mapped_row, column)
+                original = to_decimal(cell.value)
+                if original is not None:
+                    cell.value = float((original * multiplier).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+                    cell.number_format = "0.00"
     destination.parent.mkdir(parents=True, exist_ok=True)
     workbook.save(destination)
     workbook.close()
-    return total
+    return len(selected_item_rows)

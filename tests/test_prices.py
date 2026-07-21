@@ -25,6 +25,10 @@ def make_price(path, suffix="", include_action=True):
         sheet.append(["002", "АКЦИЯ VLIQ OGGO BALANCE Арбуз", "шт", 100, 110])
     sheet.append(["ЭС/3.Жидкости/Производитель OGGO/VLIQ OGGO BALANCE 20"])
     sheet.append(["003", f"VLIQ OGGO BALANCE Вишня{suffix}", "шт", 247, 270])
+    sheet.merge_cells("A2:E2")
+    sheet["A2"] = "Минимальный заказ — 50 000 ₽"
+    sheet["F10"] = "=D10*G10"
+    sheet["F13"] = "=D13*G13"
     workbook.save(path)
 
 
@@ -107,16 +111,21 @@ def test_selected_price_contains_only_chosen_groups_and_discount(tmp_path):
     selected = db.search_groups("VLIQ OGGO BALANCE 20")[0]
     destination = tmp_path / "selection.xlsx"
 
-    changed = generate_selected_price(db, [selected.callback_id], destination, 10)
+    changed = generate_selected_price(source, destination, [selected.merge_key], 10)
 
     assert changed == 2
     workbook = load_workbook(destination, data_only=True)
-    sheet = workbook["Москва"]
+    sheet = workbook.active
     values = [cell.value for cell in sheet["B"]]
     assert "VLIQ OGGO BALANCE Манго" in values
     assert "VLIQ OGGO BALANCE Вишня" in values
     assert "VLIQ OGGO BALANCE Арбуз" not in values
     mango_row = values.index("VLIQ OGGO BALANCE Манго") + 1
-    assert sheet.cell(mango_row, 3).value == 211.5
-    assert sheet.cell(mango_row, 4).value == 233.1
+    assert sheet.cell(mango_row, 4).value == 211.5
+    assert sheet.cell(mango_row, 5).value == 233.1
+    assert "A2:E2" in {str(value) for value in sheet.merged_cells.ranges}
+    cherry_row = values.index("VLIQ OGGO BALANCE Вишня") + 1
     workbook.close()
+    formulas = load_workbook(destination, data_only=False)
+    assert formulas.active.cell(cherry_row, 6).value == f"=D{cherry_row}*G{cherry_row}"
+    formulas.close()

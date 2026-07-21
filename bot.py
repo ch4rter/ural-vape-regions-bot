@@ -889,14 +889,31 @@ async def export_selected_prices(callback: CallbackQuery, state: FSMContext) -> 
     try:
         with tempfile.TemporaryDirectory() as temp_name:
             suffix = "скидка 10" if discount else "базовые цены"
-            destination = Path(temp_name) / f"прайс подборка {suffix}.xlsx"
-            count = await asyncio.to_thread(generate_selected_price, prices_db, selected, destination, discount)
-            await callback.message.answer_document(
-                FSInputFile(destination, filename=destination.name),
-                caption=(f"📄 <b>Прайс по выбранным товарам</b>\n\n"
-                         f"Товарных позиций: <b>{count}</b> · "
-                         f"{'скидка 10%' if discount else 'базовые цены'}"),
-            )
+            summaries = {group.callback_id: group for group in prices_db.group_summaries()}
+            merge_keys = [summaries[value].merge_key for value in selected if value in summaries]
+            sent = 0
+            for warehouse in ("center", "west", "ural"):
+                source = price_storage_path / f"{warehouse}.xlsx"
+                if not source.exists():
+                    continue
+                destination = Path(temp_name) / f"прайс {WAREHOUSES[warehouse]} подборка {suffix}.xlsx"
+                try:
+                    count = await asyncio.to_thread(
+                        generate_selected_price, source, destination, merge_keys, discount
+                    )
+                except ValueError as error:
+                    if "отсутствуют" in str(error):
+                        continue
+                    raise
+                await callback.message.answer_document(
+                    FSInputFile(destination, filename=destination.name),
+                    caption=(f"📄 <b>{WAREHOUSES[warehouse]}</b> · выбранные товары\n\n"
+                             f"Товарных позиций: <b>{count}</b> · "
+                             f"{'скидка 10%' if discount else 'базовые цены'}"),
+                )
+                sent += 1
+            if not sent:
+                raise ValueError("Выбранные товары отсутствуют в действующих прайсах.")
     except Exception:
         logging.exception("Не удалось сформировать прайс по подборке")
         await callback.message.answer("⚠️ Не удалось сформировать файл. Попробуйте ещё раз.")
