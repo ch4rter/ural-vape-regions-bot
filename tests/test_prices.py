@@ -5,6 +5,7 @@ from openpyxl import Workbook, load_workbook
 from bot import (
     discounted,
     format_combined_report_notification,
+    format_price_item,
     format_price_report,
     manager_html,
     money,
@@ -143,6 +144,42 @@ def test_parser_keeps_brand_context_for_generic_and_short_group_names(tmp_path):
     assert "consumables|vaporesso расходники" in keys
     assert "consumables|geekvape расходники" in keys
     assert "liquids|oggo x elfliq ice 20mg" in keys
+
+
+def test_specific_position_search_uses_name_not_product_code(tmp_path):
+    db = PricesDB(tmp_path / "prices.sqlite3")
+    group = ParsedGroup(
+        "consumables|vaporesso расходники", "Vaporesso Расходники",
+        "ЭС/5.Расходники/Vaporesso/Расходники", "consumables", "Расходники",
+        (
+            ParsedItem("027881", "Картридж Vaporesso XROS (2мл) - 0.6 ohm COREX 3.0", Decimal("532"), Decimal("549")),
+            ParsedItem("027180", "Картридж Vaporesso XROS (3мл) - 0.6 ohm", Decimal("556"), Decimal("570")),
+        ),
+    )
+    db.replace_warehouse("center", ParsedPrice("Прайс", None, (group,), 0), "center.xlsx")
+    west_group = ParsedGroup(
+        group.merge_key, group.display_name, group.full_path, group.category_key, group.category_name,
+        (ParsedItem("027881", group.items[0].name, Decimal("532"), Decimal("549")),),
+    )
+    db.replace_warehouse("west", ParsedPrice("Прайс", None, (west_group,), 0), "west.xlsx")
+
+    results = db.search_items("vaporesso xros 0.6 2мл")
+    assert len(results) == 1
+    assert "(2мл)" in results[0].name
+    assert results[0].warehouse_prices == {
+        "center": (Decimal("532"), Decimal("549")),
+        "west": (Decimal("532"), Decimal("549")),
+    }
+    assert db.search_items("027881") == []
+
+    card = format_price_item(results[0])
+    assert "Москва · Санкт-Петербург" in card
+    assert "−15%" in card
+    assert "027881" not in card
+
+    _, variants = db.group_variants(db.search_groups("vaporesso")[0].callback_id)
+    two_ml = next(item for item in variants if "2мл" in item.name)
+    assert two_ml.warehouse_prices["center"] == (Decimal("532"), Decimal("549"))
 
 
 def test_selected_price_contains_only_chosen_groups_and_discount(tmp_path):

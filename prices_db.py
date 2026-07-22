@@ -168,6 +168,16 @@ class GroupDetails:
 class VariantAvailability:
     name: str
     warehouses: tuple[str, ...]
+    warehouse_prices: dict[str, tuple[Decimal, Decimal]]
+
+
+@dataclass(frozen=True)
+class ItemSummary:
+    callback_id: int
+    name: str
+    group_name: str
+    category_name: str
+    warehouse_prices: dict[str, tuple[Decimal, Decimal]]
 
 
 def parse_price_file(path: Path) -> ParsedPrice:
@@ -617,7 +627,7 @@ class PricesDB:
             return None
         with closing(self._connect()) as connection, connection:
             rows = connection.execute(
-                """SELECT g.warehouse, i.code, i.name
+                """SELECT g.warehouse, i.code, i.name, i.cash, i.cashless
                    FROM price_items i JOIN price_groups g ON g.id = i.group_id
                    WHERE g.merge_key = ? ORDER BY i.position""",
                 (summary.merge_key,),
@@ -626,13 +636,72 @@ class PricesDB:
         for row in rows:
             identity = row["code"] or normalize_price_text(row["name"])
             if identity not in variants:
-                variants[identity] = {"name": variant_display_name(row["name"]), "warehouses": set()}
+                # Здесь показывается конкретная товарная позиция, поэтому сохраняем
+                # полное название. Обрезание по " - " скрывало модель/объём у
+                # расходников и делало разные ценовые позиции неразличимыми.
+                variants[identity] = {"name": row["name"], "warehouses": set(), "prices": {}}
             variants[identity]["warehouses"].add(row["warehouse"])
+            variants[identity]["prices"][row["warehouse"]] = (
+                Decimal(row["cash"]), Decimal(row["cashless"])
+            )
         result = tuple(
-            VariantAvailability(value["name"], tuple(sorted(value["warehouses"])))
+            VariantAvailability(value["name"], tuple(sorted(value["warehouses"])), value["prices"])
             for value in sorted(variants.values(), key=lambda item: normalize_price_text(item["name"]))
         )
         return summary, result
+
+    def item_summaries(self) -> list[ItemSummary]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """SELECT i.id, i.code, i.name, i.cash, i.cashless,
+                          g.warehouse, g.display_name, g.category_name
+                   FROM price_items i JOIN price_groups g ON g.id = i.group_id
+                   ORDER BY g.position, i.position"""
+            ).fetchall()
+        merged = {}
+        for row in rows:
+            identity = row["code"] or normalize_price_text(row["name"])
+            if identity not in merged:
+                merged[identity] = {
+                    "id": row["id"], "name": row["name"], "group": row["display_name"],
+                    "category": row["category_name"], "prices": {},
+                }
+            merged[identity]["prices"][row["warehouse"]] = (
+                Decimal(row["cash"]), Decimal(row["cashless"])
+            )
+        return [
+            ItemSummary(value["id"], value["name"], value["group"], value["category"], value["prices"])
+            for value in merged.values()
+        ]
+
+    def search_items(self, query: str, limit: int = 50) -> list[ItemSummary]:
+        query_norm = normalize_price_text(query)
+        tokens = query_norm.split()
+        if not tokens:
+            return []
+        ranked = []
+        for item in self.item_summaries():
+            candidate = normalize_price_text(item.name)
+            words = candidate.split()
+            scores = []
+            for token in tokens:
+                if token in words:
+                    scores.append(1.0)
+                elif token in candidate:
+                    scores.append(0.94)
+                elif token.isdigit():
+                    scores.append(0.0)
+                else:
+                    scores.append(max((SequenceMatcher(None, token, word).ratio() for word in words), default=0))
+            if all(score >= (0.82 if len(token) <= 2 else 0.68) for token, score in zip(tokens, scores)):
+                score = sum(scores) / len(scores)
+                exact_bonus = 0.2 if query_norm in candidate else 0
+                ranked.append((score + exact_bonus, -len(candidate), item))
+        ranked.sort(key=lambda value: (value[0], value[1]), reverse=True)
+        return [item for _, _, item in ranked[:limit]]
+
+    def item_details(self, callback_id: int) -> ItemSummary | None:
+        return next((item for item in self.item_summaries() if item.callback_id == callback_id), None)
 
     def selection_availability(
         self, callback_ids: list[int]

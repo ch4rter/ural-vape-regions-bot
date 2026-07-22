@@ -34,6 +34,7 @@ from prices_db import (
     generate_change_report_excel,
     generate_discounted_price,
     generate_selected_price,
+    normalize_price_text,
     parse_price_file,
     save_price_source,
 )
@@ -41,7 +42,8 @@ from prices_db import (
 
 BASE_DIR = Path(__file__).resolve().parent
 RESULTS_PER_PAGE = 10
-PRICE_VARIANTS_PER_PAGE = 12
+PRICE_VARIANTS_PER_PAGE = 6
+PRICE_ITEMS_PER_PAGE = 6
 PRICE_GROUPS_PER_PAGE = 8
 MAX_SELECTED_PRICE_GROUPS = 50
 SERVICE_CHAT_ID = -5565597780
@@ -513,6 +515,42 @@ def price_search_text(total: int, page: int) -> str:
     return f"{text}\n\nВыберите нужную:"
 
 
+def price_item_label(name: str) -> str:
+    return name if len(name) <= 64 else f"{name[:61]}..."
+
+
+def price_item_search_keyboard(item_ids: list[int], page: int) -> InlineKeyboardMarkup:
+    summaries = {item.callback_id: item for item in prices_db.item_summaries()}
+    available = [summaries[item_id] for item_id in item_ids if item_id in summaries]
+    page_count = max(1, (len(available) + PRICE_ITEMS_PER_PAGE - 1) // PRICE_ITEMS_PER_PAGE)
+    page = max(0, min(page, page_count - 1))
+    start = page * PRICE_ITEMS_PER_PAGE
+    rows = [[InlineKeyboardButton(
+        text=price_item_label(item.name), callback_data=f"price:i:{item.callback_id}"
+    )] for item in available[start : start + PRICE_ITEMS_PER_PAGE]]
+    navigation = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"price:ir:{page - 1}"))
+    if page + 1 < page_count:
+        navigation.append(InlineKeyboardButton(text="Далее ➡️", callback_data=f"price:ir:{page + 1}"))
+    if navigation:
+        rows.append(navigation)
+    rows.extend([
+        [InlineKeyboardButton(text="🔎 Новый поиск", callback_data="main:prices")],
+        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")],
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def price_item_search_text(total: int, page: int) -> str:
+    page_count = max(1, (total + PRICE_ITEMS_PER_PAGE - 1) // PRICE_ITEMS_PER_PAGE)
+    page = max(0, min(page, page_count - 1))
+    text = f"🔎 <b>Подходящих позиций: {total}</b>"
+    if page_count > 1:
+        text += f"\nСтраница <b>{page + 1}</b> из <b>{page_count}</b>"
+    return f"{text}\n\nВыберите товар, чтобы увидеть цены и наличие:"
+
+
 def format_price_group(details: GroupDetails) -> str:
     lines = [
         f"💰 <b>{html.escape(details.summary.display_name)}</b>",
@@ -528,6 +566,17 @@ def format_price_group(details: GroupDetails) -> str:
         else:
             lines.append(f"❌ {WAREHOUSES[warehouse]} — нет в прайсе")
     lines.extend(["", "💳 <b>Цены внутри группы</b>"])
+    if len(details.tiers) > 1:
+        cash_values = [tier.cash for tier in details.tiers]
+        cashless_values = [tier.cashless for tier in details.tiers]
+        lines.extend([
+            "В этой группе цены зависят от конкретной позиции.",
+            f"• Нал — <b>от {money(min(cash_values))} до {money(max(cash_values))} ₽</b>",
+            f"• Безнал — <b>от {money(min(cashless_values))} до {money(max(cashless_values))} ₽</b>",
+            "",
+            "Откройте <b>«Позиции и цены»</b>, чтобы выбрать нужную модель или характеристику.",
+        ])
+        return "\n".join(lines)
     for number, tier in enumerate(details.tiers, 1):
         if len(details.tiers) > 1:
             lines.extend([
@@ -553,20 +602,60 @@ def format_price_variants(summary, variants, page: int) -> str:
     start = page * PRICE_VARIANTS_PER_PAGE
     shown = variants[start : start + PRICE_VARIANTS_PER_PAGE]
     lines = [
-        f"🎨 <b>{html.escape(summary.display_name)}</b>",
-        f"Вкусов и цветов: <b>{len(variants)}</b>",
+        f"📋 <b>{html.escape(summary.display_name)}</b>",
+        f"Позиций: <b>{len(variants)}</b>",
     ]
     if page_count > 1:
         lines.append(f"Страница <b>{page + 1}</b> из <b>{page_count}</b>")
     for number, variant in enumerate(shown, start=start + 1):
-        warehouses = " · ".join(
-            WAREHOUSES[key] for key in ("center", "west", "ural") if key in variant.warehouses
-        )
         lines.extend([
             "",
             f"<b>{number}.</b> {html.escape(variant.name)}",
-            f"📍 {html.escape(warehouses)}",
         ])
+        unique_prices = set(variant.warehouse_prices.values())
+        if len(unique_prices) == 1:
+            warehouses = " · ".join(
+                WAREHOUSES[key] for key in ("center", "west", "ural") if key in variant.warehouses
+            )
+            cash, cashless = next(iter(unique_prices))
+            lines.extend([
+                f"📍 {html.escape(warehouses)}",
+                f"Нал <b>{money(cash)} ₽</b> · Безнал <b>{money(cashless)} ₽</b>",
+            ])
+        else:
+            for warehouse in ("center", "west", "ural"):
+                if warehouse in variant.warehouse_prices:
+                    cash, cashless = variant.warehouse_prices[warehouse]
+                    lines.append(
+                        f"📍 {WAREHOUSES[warehouse]}: нал <b>{money(cash)} ₽</b> · "
+                        f"безнал <b>{money(cashless)} ₽</b>"
+                    )
+    return "\n".join(lines)
+
+
+def format_price_item(item) -> str:
+    lines = [
+        f"💰 <b>{html.escape(item.name)}</b>",
+        f"Группа: <b>{html.escape(item.group_name)}</b>",
+        f"Категория: <b>{html.escape(item.category_name)}</b>",
+        "",
+        "🏢 <b>Цены и наличие</b>",
+    ]
+    price_warehouses = {}
+    for warehouse, prices in item.warehouse_prices.items():
+        price_warehouses.setdefault(prices, []).append(warehouse)
+    for (cash, cashless), warehouses in price_warehouses.items():
+        names = " · ".join(WAREHOUSES[key] for key in ("center", "west", "ural") if key in warehouses)
+        lines.extend(["", f"📍 <b>{html.escape(names)}</b>"])
+        for percent in (0, 5, 10, 15):
+            label = "Базовая" if percent == 0 else f"−{percent}%"
+            lines.append(
+                f"{label}: нал <b>{money(discounted(cash, percent))} ₽</b> · "
+                f"безнал <b>{money(discounted(cashless, percent))} ₽</b>"
+            )
+    missing = [WAREHOUSES[key] for key in ("center", "west", "ural") if key not in item.warehouse_prices]
+    if missing:
+        lines.extend(["", f"❌ Нет в прайсе: {html.escape(' · '.join(missing))}"])
     return "\n".join(lines)
 
 
@@ -1225,6 +1314,25 @@ async def search_prices(message: Message, state: FSMContext) -> None:
     if len(query) > 200:
         await message.answer("⚠️ Запрос слишком длинный. Укажите только товарную группу.", reply_markup=back_main())
         return
+    normalized_query = normalize_price_text(query)
+    has_specification = any(char.isdigit() for char in normalized_query)
+    item_results = prices_db.search_items(query) if has_specification else []
+    # Числа в запросе обычно означают сопротивление, объём или модель. В таком
+    # случае показываем конкретные позиции, но не используем товарный код в поиске.
+    specific_item_search = has_specification and 1 <= len(item_results) <= 20
+    if specific_item_search:
+        item_ids = [item.callback_id for item in item_results]
+        await state.update_data(
+            price_item_result_ids=item_ids,
+            price_item_result_page=0,
+            price_result_kind="items",
+        )
+        await message.answer(
+            price_item_search_text(len(item_ids), 0),
+            reply_markup=price_item_search_keyboard(item_ids, 0),
+        )
+        return
+
     groups = prices_db.search_groups(query)
     if not groups:
         await message.answer(
@@ -1234,7 +1342,7 @@ async def search_prices(message: Message, state: FSMContext) -> None:
         )
         return
     group_ids = [group.callback_id for group in groups]
-    await state.update_data(price_result_ids=group_ids, price_result_page=0)
+    await state.update_data(price_result_ids=group_ids, price_result_page=0, price_result_kind="groups")
     await message.answer(
         price_search_text(len(groups), 0),
         reply_markup=price_search_keyboard(group_ids, 0),
@@ -1256,6 +1364,25 @@ async def change_price_results_page(callback: CallbackQuery, state: FSMContext) 
     await callback.message.edit_text(
         price_search_text(len(group_ids), page),
         reply_markup=price_search_keyboard(group_ids, page),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("price:ir:"))
+async def change_price_item_results_page(callback: CallbackQuery, state: FSMContext) -> None:
+    try:
+        page = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректная страница.", show_alert=True)
+        return
+    item_ids = (await state.get_data()).get("price_item_result_ids", [])
+    if not item_ids:
+        await callback.answer("Выполните поиск ещё раз.", show_alert=True)
+        return
+    await state.update_data(price_item_result_page=page)
+    await callback.message.edit_text(
+        price_item_search_text(len(item_ids), page),
+        reply_markup=price_item_search_keyboard(item_ids, page),
     )
     await callback.answer()
 
@@ -1285,7 +1412,7 @@ async def render_price_group(message: Message, callback_id: int, state: FSMConte
     selected_ids = set((await state.get_data()).get("price_selected_ids", []))
     selected = callback_id in selected_ids
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎨 Вкусы и цвета", callback_data=f"price:v:{callback_id}:0")],
+        [InlineKeyboardButton(text="📋 Позиции и цены", callback_data=f"price:v:{callback_id}:0")],
         [InlineKeyboardButton(
             text="✅ В подборке" if selected else "➕ Добавить в подборку",
             callback_data=f"price:remove:{callback_id}" if selected else f"price:add:{callback_id}",
@@ -1319,6 +1446,41 @@ async def back_to_price_results(callback: CallbackQuery, state: FSMContext) -> N
         price_search_text(len(group_ids), page),
         reply_markup=price_search_keyboard(group_ids, page),
     )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "price:item_back")
+async def back_to_price_item_results(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    item_ids = data.get("price_item_result_ids", [])
+    page = data.get("price_item_result_page", 0)
+    if not item_ids:
+        await callback.answer("Результаты поиска уже недоступны. Выполните поиск ещё раз.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        price_item_search_text(len(item_ids), page),
+        reply_markup=price_item_search_keyboard(item_ids, page),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("price:i:"))
+async def show_price_item(callback: CallbackQuery) -> None:
+    try:
+        callback_id = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректный товар.", show_alert=True)
+        return
+    item = prices_db.item_details(callback_id)
+    if not item:
+        await callback.answer("Прайс обновился. Выполните поиск ещё раз.", show_alert=True)
+        return
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ К найденным позициям", callback_data="price:item_back")],
+        [InlineKeyboardButton(text="🔎 Новый поиск", callback_data="main:prices")],
+        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")],
+    ])
+    await callback.message.edit_text(format_price_item(item), reply_markup=keyboard)
     await callback.answer()
 
 
