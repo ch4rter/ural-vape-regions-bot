@@ -274,15 +274,21 @@ class MaterialsDB:
             raise ValueError("Название товара слишком короткое.")
         with self._connect() as connection:
             active_rows = connection.execute(
-                """SELECT id, query FROM wait_entries
+                """SELECT id, query, client_title FROM wait_entries
                    WHERE chat_id = ? AND manager_id = ? AND status = 'active'""",
                 (chat_id, manager_id),
             ).fetchall()
             normalized_query = " ".join(query.casefold().replace("ё", "е").split())
+            normalized_client = " ".join(client_title.casefold().replace("ё", "е").split())
             existing = next(
                 (
                     row for row in active_rows
                     if " ".join(row["query"].casefold().replace("ё", "е").split()) == normalized_query
+                    and (
+                        chat_id != 0
+                        or " ".join(row["client_title"].casefold().replace("ё", "е").split())
+                        == normalized_client
+                    )
                 ),
                 None,
             )

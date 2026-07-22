@@ -91,6 +91,9 @@ class BroadcastState(StatesGroup):
 
 
 class WaitState(StatesGroup):
+    new_client = State()
+    new_query = State()
+    new_comment = State()
     edit_query = State()
     edit_comment = State()
 
@@ -856,7 +859,7 @@ async def notify_waitlist_matches(bot: Bot, reports: dict[str, dict] | None) -> 
         buttons = []
         chat_url = wait_chat_url(updated_entry)
         if chat_url:
-            buttons.append([InlineKeyboardButton(text="💬 Связаться с клиентом", url=chat_url)])
+            buttons.append([InlineKeyboardButton(text="➡️ Перейти в чат клиента", url=chat_url)])
         buttons.extend([
             [
                 InlineKeyboardButton(text="📋 Подробнее", callback_data=f"wait:arrival:{entry.id}"),
@@ -900,10 +903,11 @@ async def notify_waitlist_matches(bot: Bot, reports: dict[str, dict] | None) -> 
 
 def waitlist_keyboard(user_id: int) -> InlineKeyboardMarkup:
     entries = materials_db.list_wait_entries(manager_id=user_id, active_only=True)
-    rows = [[InlineKeyboardButton(
+    rows = [[InlineKeyboardButton(text="➕ Добавить ожидание", callback_data="wait:new")]]
+    rows.extend([[InlineKeyboardButton(
         text=f"🔔 {clean_client_title(entry.client_title)[:22]} · {entry.query[:28]}",
         callback_data=f"wait:open:{entry.id}",
-    )] for entry in entries[:20]]
+    )] for entry in entries[:20]])
     rows.append(compact_nav())
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -915,7 +919,7 @@ def waitlist_text(user_id: int) -> str:
             "🔔 <b>Лист ожидания пока пуст</b>\n\n"
             "Чтобы зафиксировать запрос, напишите непосредственно в клиентском чате:\n\n"
             "<code>/wait картридж Vaporesso XROS 0.6 2мл</code>\n\n"
-            "Клиента выбирать не потребуется — бот определит чат автоматически."
+            "Либо нажмите <b>«Добавить ожидание»</b>, если клиентского чата нет."
         )
     shown = entries[:20]
     blocks = ["🔔 <b>Мой лист ожидания</b>"]
@@ -965,7 +969,7 @@ def wait_entry_keyboard(entry) -> InlineKeyboardMarkup:
     rows = []
     chat_url = wait_chat_url(entry)
     if chat_url:
-        rows.append([InlineKeyboardButton(text="💬 Связаться с клиентом", url=chat_url)])
+        rows.append([InlineKeyboardButton(text="➡️ Перейти в чат клиента", url=chat_url)])
     if entry.last_match:
         rows.append([InlineKeyboardButton(
             text="✉️ Сформировать сообщение клиенту", callback_data=f"wait:message:{entry.id}"
@@ -975,7 +979,7 @@ def wait_entry_keyboard(entry) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="✏️ Товар", callback_data=f"wait:edit_query:{entry.id}"),
             InlineKeyboardButton(text="💬 Комментарий", callback_data=f"wait:edit_comment:{entry.id}"),
         ],
-        [InlineKeyboardButton(text="✅ Закрыть ожидание", callback_data=f"wait:confirm_close:{entry.id}")],
+        [InlineKeyboardButton(text="✅ Закрыть ожидание", callback_data=f"wait:done:{entry.id}")],
         compact_nav("main:waitlist"),
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -987,6 +991,71 @@ async def open_waitlist(callback: CallbackQuery) -> None:
         waitlist_text(callback.from_user.id), reply_markup=waitlist_keyboard(callback.from_user.id)
     )
     await callback.answer()
+
+
+@router.callback_query(F.data == "wait:new")
+async def start_manual_wait(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(WaitState.new_client)
+    await callback.message.edit_text(
+        "➕ <b>Новое ожидание</b>\n\n"
+        "Введите название клиента или компании.\n\n"
+        "Например: <code>Vape Shop 24</code>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[compact_nav("main:waitlist")]),
+    )
+    await callback.answer()
+
+
+@router.message(WaitState.new_client, F.text)
+async def save_manual_wait_client(message: Message, state: FSMContext) -> None:
+    client = clean_client_title(message.text[:150])
+    await state.update_data(wait_new_client=client)
+    await state.set_state(WaitState.new_query)
+    await message.answer(
+        f"Клиент: <b>{html.escape(client)}</b>\n\n"
+        "Что ожидает клиент?\n\n"
+        "Например: <code>жидкости OGGO</code> или <code>картридж XROS 0.6 2мл</code>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[compact_nav("main:waitlist")]),
+    )
+
+
+@router.message(WaitState.new_query, F.text)
+async def save_manual_wait_query(message: Message, state: FSMContext) -> None:
+    query = message.text.strip()[:200]
+    if len(query) < 2:
+        await message.answer("Укажите более понятное название товара.")
+        return
+    await state.update_data(wait_new_query=query)
+    await state.set_state(WaitState.new_comment)
+    await message.answer(
+        "💬 Добавьте комментарий, если он нужен.\n\n"
+        "Например: <code>клиенту нужно 20 коробок</code>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Без комментария", callback_data="wait:new_finish")],
+            compact_nav("main:waitlist"),
+        ]),
+    )
+
+
+async def finish_manual_wait(message: Message, state: FSMContext, manager, comment: str = "") -> None:
+    data = await state.get_data()
+    entry = materials_db.add_wait_entry(
+        0, data["wait_new_client"], manager.id, manager.full_name,
+        data["wait_new_query"], comment=comment[:500],
+    )
+    await state.clear()
+    await message.answer("✅ <b>Ожидание создано</b>")
+    await message.answer(wait_entry_text(entry), reply_markup=wait_entry_keyboard(entry))
+
+
+@router.message(WaitState.new_comment, F.text)
+async def save_manual_wait_comment(message: Message, state: FSMContext) -> None:
+    await finish_manual_wait(message, state, message.from_user, message.text)
+
+
+@router.callback_query(F.data == "wait:new_finish")
+async def finish_manual_wait_without_comment(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await finish_manual_wait(callback.message, state, callback.from_user)
 
 
 @router.callback_query(F.data.startswith("wait:open:"))
@@ -1060,16 +1129,6 @@ async def save_wait_comment_edit(message: Message, state: FSMContext) -> None:
     await message.answer(wait_entry_text(entry), reply_markup=wait_entry_keyboard(entry))
 
 
-@router.callback_query(F.data.startswith("wait:confirm_close:"))
-async def confirm_wait_close(callback: CallbackQuery) -> None:
-    wait_id = int(callback.data.rsplit(":", 1)[1])
-    await callback.message.edit_text(
-        "Закрыть это ожидание?",
-        reply_markup=confirm_keyboard(f"wait:done:{wait_id}", f"wait:open:{wait_id}"),
-    )
-    await callback.answer()
-
-
 @router.callback_query(F.data.startswith("wait:arrival:"))
 async def show_wait_arrival(callback: CallbackQuery) -> None:
     wait_id = int(callback.data.rsplit(":", 1)[1])
@@ -1128,7 +1187,7 @@ async def prepare_client_wait_message(callback: CallbackQuery) -> None:
     rows = []
     chat_url = wait_chat_url(entry)
     if chat_url:
-        rows.append([InlineKeyboardButton(text="💬 Связаться с клиентом", url=chat_url)])
+        rows.append([InlineKeyboardButton(text="➡️ Перейти в чат клиента", url=chat_url)])
     rows.append(compact_nav(f"wait:open:{entry.id}"))
     await callback.message.answer(
         "✉️ <b>Готовое сообщение клиенту</b>\n\n"

@@ -90,14 +90,20 @@ def test_waitlist_is_scoped_to_manager_and_remembers_matches(tmp_path):
         -100123, "Vape Shop", 101, "Андрей", "XROS 0.6 2мл", 777, "Нужно 10 упаковок"
     )
     second = db.add_wait_entry(-100456, "Другой клиент", 202, "Матвей", "OGGO VLIQ")
+    manual_one = db.add_wait_entry(0, "Клиент без чата", 101, "Андрей", "OGGO VLIQ")
+    manual_two = db.add_wait_entry(0, "Ещё один клиент", 101, "Андрей", "OGGO VLIQ")
 
-    assert db.list_wait_entries(manager_id=101) == [first]
+    assert {entry.id for entry in db.list_wait_entries(manager_id=101)} == {
+        first.id, manual_one.id, manual_two.id,
+    }
     assert first.comment == "Нужно 10 упаковок"
     assert first.source_message_id == 777
     duplicate = db.add_wait_entry(-100123, "Vape Shop", 101, "Андрей", "xros 0.6 2МЛ")
     assert duplicate.id == first.id
-    assert len(db.list_wait_entries(manager_id=101)) == 1
-    assert {entry.id for entry in db.list_wait_entries()} == {first.id, second.id}
+    assert len(db.list_wait_entries(manager_id=101)) == 3
+    assert {entry.id for entry in db.list_wait_entries()} == {
+        first.id, second.id, manual_one.id, manual_two.id,
+    }
     assert db.wait_match_seen(first.id, "xros 0 6 2мл") is False
     db.record_wait_match(first.id, "xros 0 6 2мл")
     assert db.wait_match_seen(first.id, "xros 0 6 2мл") is True
@@ -110,7 +116,9 @@ def test_waitlist_is_scoped_to_manager_and_remembers_matches(tmp_path):
     assert db.wait_match_seen(first.id, "xros 0 6 2мл") is False
     assert db.close_wait_entry(first.id, manager_id=202) is False
     assert db.close_wait_entry(first.id, manager_id=101) is True
-    assert db.list_wait_entries(manager_id=101) == []
+    assert {entry.id for entry in db.list_wait_entries(manager_id=101)} == {
+        manual_one.id, manual_two.id,
+    }
 
     db.set_setting("service_chat_id", "-100123")
     assert db.get_setting("service_chat_id") == "-100123"
