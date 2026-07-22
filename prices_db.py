@@ -355,10 +355,6 @@ class PricesDB:
                     report_signature TEXT NOT NULL,
                     sent_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
-                CREATE TABLE IF NOT EXISTS wait_price_batch (
-                    warehouse TEXT PRIMARY KEY,
-                    report_created_at TEXT NOT NULL
-                );
                 """
             )
 
@@ -512,25 +508,6 @@ class PricesDB:
                        report_signature=excluded.report_signature, sent_at=CURRENT_TIMESTAMP""",
                 (signature,),
             )
-
-    def mark_wait_batch_warehouse(self, warehouse: str, report: dict | None) -> None:
-        if not report:
-            return
-        with closing(self._connect()) as connection, connection:
-            connection.execute(
-                """INSERT INTO wait_price_batch(warehouse, report_created_at) VALUES (?, ?)
-                   ON CONFLICT(warehouse) DO UPDATE SET report_created_at=excluded.report_created_at""",
-                (warehouse, str(report.get("created_at", ""))),
-            )
-
-    def wait_batch_ready(self) -> bool:
-        with closing(self._connect()) as connection:
-            count = connection.execute("SELECT COUNT(*) FROM wait_price_batch").fetchone()[0]
-        return count == len(WAREHOUSES)
-
-    def clear_wait_batch(self) -> None:
-        with closing(self._connect()) as connection, connection:
-            connection.execute("DELETE FROM wait_price_batch")
 
     def group_summaries(self) -> list[GroupSummary]:
         with closing(self._connect()) as connection, connection:

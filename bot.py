@@ -802,12 +802,14 @@ def wait_match_score(query: str, group_name: str, item_name: str) -> float:
 
 
 async def notify_waitlist_matches(bot: Bot, reports: dict[str, dict] | None) -> int:
-    """Send one combined waitlist notification after all three daily price updates."""
+    """Notify managers immediately for the warehouse price that has just been applied."""
     if not reports:
         return 0
     arrivals = []
-    for warehouse in ("center", "west", "ural"):
-        for item in reports[warehouse].get("added", []):
+    for warehouse, report in reports.items():
+        if warehouse not in WAREHOUSES:
+            continue
+        for item in report.get("added", []):
             arrivals.append((warehouse, item))
     if not arrivals:
         return 0
@@ -819,15 +821,17 @@ async def notify_waitlist_matches(bot: Bot, reports: dict[str, dict] | None) -> 
             score = wait_match_score(entry.query, search_group, item["name"])
             if not score:
                 continue
-            signature = normalize_price_text(item["name"])
-            if materials_db.wait_match_seen(entry.id, signature):
+            item_key = normalize_price_text(item["name"])
+            warehouse_signature = f"{warehouse}|{item_key}"
+            if materials_db.wait_match_seen(entry.id, warehouse_signature):
                 continue
-            match = matches.setdefault(signature, {
+            match = matches.setdefault(item_key, {
                 "name": item["name"], "group": item["group"], "score": score,
-                "warehouses": {},
+                "warehouses": {}, "signatures": set(),
             })
             match["score"] = max(match["score"], score)
             match["warehouses"][warehouse] = (Decimal(item["cash"]), Decimal(item["cashless"]))
+            match["signatures"].add(warehouse_signature)
         if not matches:
             continue
         group_wait = not any(char.isdigit() for char in normalize_price_text(entry.query))
@@ -887,8 +891,9 @@ async def notify_waitlist_matches(bot: Bot, reports: dict[str, dict] | None) -> 
         except Exception:
             logging.exception("Не удалось уведомить менеджера %s об ожидании %s", entry.manager_id, entry.id)
             continue
-        for signature, _ in selected:
-            materials_db.record_wait_match(entry.id, signature)
+        for _, item in selected:
+            for signature in item["signatures"]:
+                materials_db.record_wait_match(entry.id, signature)
         sent += 1
     return sent
 
@@ -2640,12 +2645,7 @@ async def apply_price(callback: CallbackQuery, state: FSMContext, bot: Bot) -> N
         price_updates_in_progress.discard(warehouse)
     await state.clear()
     try:
-        prices_db.mark_wait_batch_warehouse(warehouse, report)
-        if prices_db.wait_batch_ready():
-            wait_matches = await notify_waitlist_matches(bot, prices_db.latest_reports())
-            prices_db.clear_wait_batch()
-        else:
-            wait_matches = 0
+        wait_matches = await notify_waitlist_matches(bot, {warehouse: report}) if report else 0
     except Exception:
         logging.exception("Не удалось проверить лист ожидания после обновления прайса")
         wait_matches = 0
