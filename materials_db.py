@@ -1,5 +1,6 @@
 import sqlite3
 import re
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -56,6 +57,7 @@ class WaitEntry:
     status: str
     source_message_id: int | None
     comment: str
+    last_match: dict | None
 
 
 class MaterialsDB:
@@ -127,6 +129,7 @@ class MaterialsDB:
                     query TEXT NOT NULL,
                     source_message_id INTEGER,
                     comment TEXT NOT NULL DEFAULT '',
+                    last_match_json TEXT,
                     status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'closed')),
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     closed_at TEXT
@@ -151,6 +154,8 @@ class MaterialsDB:
                 connection.execute("ALTER TABLE wait_entries ADD COLUMN source_message_id INTEGER")
             if "comment" not in wait_columns:
                 connection.execute("ALTER TABLE wait_entries ADD COLUMN comment TEXT NOT NULL DEFAULT ''")
+            if "last_match_json" not in wait_columns:
+                connection.execute("ALTER TABLE wait_entries ADD COLUMN last_match_json TEXT")
 
     def add_access_user(self, value: str) -> AccessUser:
         value = value.strip()
@@ -311,7 +316,7 @@ class MaterialsDB:
         with self._connect() as connection:
             row = connection.execute(
                 """SELECT id, chat_id, client_title, manager_id, manager_name, query, status,
-                          source_message_id, comment
+                          source_message_id, comment, last_match_json
                    FROM wait_entries WHERE id = ?""",
                 (wait_id,),
             ).fetchone()
@@ -328,11 +333,45 @@ class MaterialsDB:
         with self._connect() as connection:
             rows = connection.execute(
                 f"""SELECT id, chat_id, client_title, manager_id, manager_name, query, status,
-                           source_message_id, comment
+                           source_message_id, comment, last_match_json
                     FROM wait_entries {where} ORDER BY created_at DESC, id DESC""",
                 values,
             ).fetchall()
         return [self._wait_entry(row) for row in rows]
+
+    def update_wait_entry(
+        self, wait_id: int, manager_id: int, *, query: str | None = None, comment: str | None = None
+    ) -> WaitEntry | None:
+        fields, values = [], []
+        query_changed = query is not None
+        if query is not None:
+            query = query.strip()
+            if len(query) < 2:
+                raise ValueError("Название товара слишком короткое.")
+            fields.append("query = ?")
+            values.append(query)
+            fields.append("last_match_json = NULL")
+        if comment is not None:
+            fields.append("comment = ?")
+            values.append(comment.strip())
+        if not fields:
+            return self.get_wait_entry(wait_id)
+        values.extend([wait_id, manager_id])
+        with self._connect() as connection:
+            connection.execute(
+                f"UPDATE wait_entries SET {', '.join(fields)} WHERE id = ? AND manager_id = ? AND status = 'active'",
+                values,
+            )
+            if query_changed:
+                connection.execute("DELETE FROM wait_notifications WHERE wait_id = ?", (wait_id,))
+        return self.get_wait_entry(wait_id)
+
+    def set_wait_last_match(self, wait_id: int, payload: dict) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE wait_entries SET last_match_json = ? WHERE id = ?",
+                (json.dumps(payload, ensure_ascii=False), wait_id),
+            )
 
     def close_wait_entry(self, wait_id: int, manager_id: int | None = None) -> bool:
         condition = "id = ?" if manager_id is None else "id = ? AND manager_id = ?"
@@ -391,7 +430,7 @@ class MaterialsDB:
         return WaitEntry(
             row["id"], row["chat_id"], row["client_title"], row["manager_id"],
             row["manager_name"], row["query"], row["status"], row["source_message_id"],
-            row["comment"],
+            row["comment"], json.loads(row["last_match_json"]) if row["last_match_json"] else None,
         )
 
     def backup_to(self, destination: Path) -> None:

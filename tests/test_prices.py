@@ -4,6 +4,7 @@ from decimal import Decimal
 from openpyxl import Workbook, load_workbook
 
 from bot import (
+    client_wait_message,
     discounted,
     format_combined_report_notification,
     format_price_item,
@@ -175,6 +176,9 @@ def test_specific_position_search_uses_name_not_product_code(tmp_path):
         "west": (Decimal("532"), Decimal("549")),
     }
     assert db.search_items("027881") == []
+    group_results = db.search_groups("картриджи xros")
+    assert group_results
+    assert group_results[0].display_name == "Vaporesso Расходники"
 
     card = format_price_item(results[0])
     assert "Москва · Санкт-Петербург" in card
@@ -192,6 +196,10 @@ def test_waitlist_matching_requires_exact_numeric_characteristics():
     assert wait_match_score("xros 0.8 2мл", "Vaporesso Расходники", name) == 0
     assert wait_match_score("xros 0.6 3мл", "Vaporesso Расходники", name) == 0
     assert wait_match_score("картриджи xros", "Vaporesso Расходники", name) > 0.8
+    assert wait_match_score(
+        "картриджи xros", "Электронные системы Vaporesso XROS",
+        "Набор Vaporesso XROS 5",
+    ) == 0
     assert wait_match_score("жидкости OGGO", "Жидкости OGGO VLIQ", "OGGO VLIQ Манго") > 0.8
 
 
@@ -221,15 +229,31 @@ def test_group_wait_sends_one_combined_notification(tmp_path):
     try:
         assert asyncio.run(bot_module.notify_waitlist_matches(fake, reports)) == 1
         assert len(fake.messages) == 1
-        assert "Новых подходящих позиций: <b>2</b>" in fake.messages[0][1]
-        assert "Москва · Санкт-Петербург" in fake.messages[0][1]
+        assert "Подходящих новых позиций: <b>2</b>" in fake.messages[0][1]
+        assert "• Москва: <b>2</b>" in fake.messages[0][1]
+        assert "• Санкт-Петербург: <b>1</b>" in fake.messages[0][1]
         assert "Нужна коробка" in fake.messages[0][1]
+        stored = database.list_wait_entries(manager_id=101)[0]
+        assert stored.last_match["count"] == 2
+        assert "Сейчас доступно 2 позиции" in client_wait_message(stored)
         assert asyncio.run(bot_module.notify_waitlist_matches(fake, reports)) == 0
     finally:
         if previous is None:
             del bot_module.materials_db
         else:
             bot_module.materials_db = previous
+
+
+def test_wait_notification_batch_requires_all_warehouses(tmp_path):
+    db = PricesDB(tmp_path / "prices.sqlite3")
+    report = {"created_at": "2026-07-22T12:00:00"}
+    db.mark_wait_batch_warehouse("center", report)
+    db.mark_wait_batch_warehouse("west", report)
+    assert db.wait_batch_ready() is False
+    db.mark_wait_batch_warehouse("ural", report)
+    assert db.wait_batch_ready() is True
+    db.clear_wait_batch()
+    assert db.wait_batch_ready() is False
 
 
 def test_selected_price_contains_only_chosen_groups_and_discount(tmp_path):

@@ -355,6 +355,10 @@ class PricesDB:
                     report_signature TEXT NOT NULL,
                     sent_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS wait_price_batch (
+                    warehouse TEXT PRIMARY KEY,
+                    report_created_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -509,11 +513,31 @@ class PricesDB:
                 (signature,),
             )
 
+    def mark_wait_batch_warehouse(self, warehouse: str, report: dict | None) -> None:
+        if not report:
+            return
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """INSERT INTO wait_price_batch(warehouse, report_created_at) VALUES (?, ?)
+                   ON CONFLICT(warehouse) DO UPDATE SET report_created_at=excluded.report_created_at""",
+                (warehouse, str(report.get("created_at", ""))),
+            )
+
+    def wait_batch_ready(self) -> bool:
+        with closing(self._connect()) as connection:
+            count = connection.execute("SELECT COUNT(*) FROM wait_price_batch").fetchone()[0]
+        return count == len(WAREHOUSES)
+
+    def clear_wait_batch(self) -> None:
+        with closing(self._connect()) as connection, connection:
+            connection.execute("DELETE FROM wait_price_batch")
+
     def group_summaries(self) -> list[GroupSummary]:
         with closing(self._connect()) as connection, connection:
             groups = connection.execute(
                 """SELECT g.id, g.merge_key, g.display_name, g.category_name, g.full_path,
-                          g.warehouse, COUNT(i.id) AS item_count
+                          g.warehouse, COUNT(i.id) AS item_count,
+                          GROUP_CONCAT(i.name, ' ') AS item_names
                    FROM price_groups g JOIN price_items i ON i.group_id = g.id
                    GROUP BY g.id ORDER BY g.position"""
             ).fetchall()
@@ -526,7 +550,7 @@ class PricesDB:
                     "display": row["display_name"], "category": row["category_name"],
                     "search": [], "counts": {},
                 }
-            merged[key]["search"].append(row["full_path"])
+            merged[key]["search"].append(f"{row['full_path']} {row['item_names'] or ''}")
             merged[key]["counts"][row["warehouse"]] = row["item_count"]
         return [
             GroupSummary(value["id"], key, value["display"], value["category"], " ".join(value["search"]), value["counts"])
@@ -552,8 +576,6 @@ class PricesDB:
                 break
         ranked = []
         for group in self.group_summaries():
-            if category_intent and group.category_name != category_intent:
-                continue
             candidate = normalize_price_text(
                 f"{group.display_name} {group.category_name} {group.search_text}"
             )
@@ -575,7 +597,8 @@ class PricesDB:
             )
             if token_matches and score >= 0.68:
                 exact_bonus = 0.15 if query_norm in normalize_price_text(group.display_name) else 0
-                ranked.append((score + exact_bonus, sum(group.warehouse_counts.values()), group))
+                category_bonus = 0.08 if category_intent == group.category_name else 0
+                ranked.append((score + exact_bonus + category_bonus, sum(group.warehouse_counts.values()), group))
         ranked.sort(key=lambda value: (value[0], value[1]), reverse=True)
         buckets = defaultdict(list)
         for score, item_count, group in ranked:

@@ -90,6 +90,11 @@ class BroadcastState(StatesGroup):
     ready = State()
 
 
+class WaitState(StatesGroup):
+    edit_query = State()
+    edit_comment = State()
+
+
 class AccessMiddleware(BaseMiddleware):
     async def __call__(
         self,
@@ -127,6 +132,13 @@ def normalize(value: str) -> str:
     value = value.casefold().replace("ё", "е")
     value = re.sub(r"[\s\-–—_,.;:()]+", " ", value)
     return value.strip()
+
+
+def clean_client_title(value: str) -> str:
+    value = re.sub(r"\bURAL\s*VAPE\b", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\s*[|/\\·•—–-]+\s*", " · ", value)
+    value = re.sub(r"(?:\s*·\s*){2,}", " · ", value).strip(" ·|/\\—–-")
+    return re.sub(r"\s+", " ", value).strip() or "Клиентский чат"
 
 
 @dataclass(frozen=True)
@@ -322,6 +334,18 @@ async def show_main(target: Message, user_id: int | None, *, edit: bool = False)
 async def command_menu(message: Message, state: FSMContext) -> None:
     await cleanup_pending_excel(state)
     await state.clear()
+    payload = (message.text or "").split(maxsplit=1)
+    if len(payload) > 1 and payload[1].startswith("wait_"):
+        try:
+            wait_id = int(payload[1].removeprefix("wait_"))
+        except ValueError:
+            wait_id = 0
+        entry = materials_db.get_wait_entry(wait_id)
+        if entry and message.from_user and (
+            entry.manager_id == message.from_user.id or is_admin(message.from_user.id)
+        ):
+            await message.answer(wait_entry_text(entry), reply_markup=wait_entry_keyboard(entry))
+            return
     await show_main(message, message.from_user.id if message.from_user else None)
 
 
@@ -334,7 +358,7 @@ async def cancel(message: Message, state: FSMContext) -> None:
 
 
 @router.message(Command("wait"))
-async def add_wait_from_client_chat(message: Message) -> None:
+async def add_wait_from_client_chat(message: Message, bot: Bot) -> None:
     if message.chat.type not in {"group", "supergroup"} or not message.from_user:
         await message.answer(
             "Команда <code>/wait</code> используется непосредственно в клиентском чате.\n\n"
@@ -359,17 +383,30 @@ async def add_wait_from_client_chat(message: Message) -> None:
     if len(query) > 200:
         await message.reply("Описание слишком длинное. Оставьте бренд, модель и важные характеристики.")
         return
-    title = message.chat.title or str(message.chat.id)
+    title = clean_client_title(message.chat.title or str(message.chat.id))
     materials_db.upsert_client_chat(message.chat.id, title, message.chat.type, True)
     entry = materials_db.add_wait_entry(
         message.chat.id, title, message.from_user.id, message.from_user.full_name, query,
         message.message_id, comment[:500],
     )
+    me = await bot.get_me()
+    private_url = f"https://t.me/{me.username}?start=wait_{entry.id}"
+    try:
+        await bot.send_message(
+            entry.manager_id,
+            wait_entry_text(entry)
+            + "\n\nПроверьте запрос и при необходимости добавьте комментарий.",
+            reply_markup=wait_entry_keyboard(entry),
+        )
+        private_note = "Карточка отправлена менеджеру в личный диалог."
+    except Exception:
+        logging.exception("Не удалось открыть ожидание %s в личном диалоге", entry.id)
+        private_note = "Нажмите кнопку ниже и запустите личный диалог с ботом."
     await message.reply(
-        "🔔 <b>Запрос зафиксирован</b>\n\n"
-        f"Ожидаем: <b>{html.escape(entry.query)}</b>\n"
-        + (f"Комментарий: {html.escape(entry.comment)}\n" if entry.comment else "")
-        + "Когда подходящая позиция появится в новом прайсе, я сообщу ответственному менеджеру лично."
+        "🔔 <b>Запрос сохранён</b>\n\n" + private_note,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Дооформить в личном чате", url=private_url)]
+        ]),
     )
 
 
@@ -535,6 +572,14 @@ def variant_word(count: int) -> str:
     if count % 10 in (2, 3, 4) and count % 100 not in (12, 13, 14):
         return "варианта"
     return "вариантов"
+
+
+def position_word(count: int) -> str:
+    if count % 10 == 1 and count % 100 != 11:
+        return "позиция"
+    if count % 10 in (2, 3, 4) and count % 100 not in (12, 13, 14):
+        return "позиции"
+    return "позиций"
 
 
 def price_group_label(display_name: str, category_name: str) -> str:
@@ -725,6 +770,19 @@ def wait_match_score(query: str, group_name: str, item_name: str) -> float:
     candidate_tokens = candidate.split()
     if not query_tokens or not candidate_tokens:
         return 0.0
+    # Категория — обязательное условие. Это не даёт запросу «картриджи XROS»
+    # совпасть с устройствами XROS, а жидкостям OGGO — с ароматизаторами OGGO.
+    category_rules = (
+        (("жидкост",), ("жидкост",)),
+        (("картридж",), ("картридж",)),
+        (("ароматизатор", "аромамикс", "конструктор"), ("ароматизатор", "конструктор")),
+        (("однораз",), ("однораз",)),
+    )
+    for query_markers, candidate_markers in category_rules:
+        if any(token.startswith(query_markers) for token in query_tokens):
+            if not any(token.startswith(candidate_markers) for token in candidate_tokens):
+                return 0.0
+            break
     scores = []
     for token in query_tokens:
         if token in candidate_tokens:
@@ -776,17 +834,34 @@ async def notify_waitlist_matches(bot: Bot, reports: dict[str, dict] | None) -> 
         selected = sorted(matches.items(), key=lambda value: (-value[1]["score"], value[1]["name"]))
         if not group_wait:
             selected = selected[:1]
+        warehouse_counts = {}
+        payload_items = []
+        for _, item in selected:
+            warehouses = [WAREHOUSES[key] for key in ("center", "west", "ural") if key in item["warehouses"]]
+            payload_items.append({"name": item["name"], "warehouses": warehouses})
+            for warehouse in warehouses:
+                warehouse_counts[warehouse] = warehouse_counts.get(warehouse, 0) + 1
+        payload = {
+            "count": len(selected),
+            "warehouses": list(warehouse_counts),
+            "warehouse_counts": warehouse_counts,
+            "items": payload_items,
+        }
+        materials_db.set_wait_last_match(entry.id, payload)
+        updated_entry = materials_db.get_wait_entry(entry.id)
         buttons = []
-        chat_id_text = str(entry.chat_id)
-        if chat_id_text.startswith("-100") and entry.source_message_id:
-            internal_id = chat_id_text[4:]
-            buttons.append([InlineKeyboardButton(
-                text="💬 Открыть чат клиента",
-                url=f"https://t.me/c/{internal_id}/{entry.source_message_id}",
-            )])
-        buttons.append([
-            InlineKeyboardButton(text="✅ Сообщили", callback_data=f"wait:done:{entry.id}"),
-            InlineKeyboardButton(text="⏳ Оставить", callback_data=f"wait:keep:{entry.id}"),
+        chat_url = wait_chat_url(updated_entry)
+        if chat_url:
+            buttons.append([InlineKeyboardButton(text="💬 Связаться с клиентом", url=chat_url)])
+        buttons.extend([
+            [
+                InlineKeyboardButton(text="📋 Подробнее", callback_data=f"wait:arrival:{entry.id}"),
+                InlineKeyboardButton(text="✉️ Сообщение", callback_data=f"wait:message:{entry.id}"),
+            ],
+            [
+                InlineKeyboardButton(text="✅ Сообщили", callback_data=f"wait:done:{entry.id}"),
+                InlineKeyboardButton(text="⏳ Оставить", callback_data=f"wait:keep:{entry.id}"),
+            ],
         ])
         keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
         heading = (
@@ -794,34 +869,15 @@ async def notify_waitlist_matches(bot: Bot, reports: dict[str, dict] | None) -> 
             if group_wait else "🔔 <b>Возможно, приехал ожидаемый товар</b>"
         )
         lines = [
-            heading, "", f"Клиент: <b>{html.escape(entry.client_title)}</b>",
+            heading, "", f"Клиент: <b>{html.escape(clean_client_title(entry.client_title))}</b>",
             f"Ожидали: <b>{html.escape(entry.query)}</b>",
         ]
         if entry.comment:
             lines.append(f"Комментарий: {html.escape(entry.comment)}")
-        lines.extend(["", f"Новых подходящих позиций: <b>{len(selected)}</b>"])
-        for number, (_, item) in enumerate(selected[:10], 1):
-            warehouses = " · ".join(
-                WAREHOUSES[key] for key in ("center", "west", "ural") if key in item["warehouses"]
-            )
-            price_pairs = set(item["warehouses"].values())
-            price = ""
-            if len(price_pairs) == 1:
-                cash, cashless = next(iter(price_pairs))
-                price = f"\nНал {money(cash)} ₽ · безнал {money(cashless)} ₽"
-            else:
-                price = "".join(
-                    f"\n{WAREHOUSES[key]}: нал {money(values[0])} ₽ · безнал {money(values[1])} ₽"
-                    for key, values in item["warehouses"].items()
-                )
-            lines.extend([
-                "",
-                f"<b>{number}.</b> {html.escape(item['name'])}",
-                f"📍 {html.escape(warehouses)}{price}",
-            ])
-        if len(selected) > 10:
-            lines.extend(["", f"И ещё позиций: <b>{len(selected) - 10}</b>"])
-        lines.extend(["", "Проверьте поступление и свяжитесь с клиентом."])
+        lines.extend(["", f"Подходящих новых позиций: <b>{len(selected)}</b>"])
+        for warehouse, count in warehouse_counts.items():
+            lines.append(f"• {warehouse}: <b>{count}</b>")
+        lines.extend(["", "Откройте подробности или подготовьте сообщение клиенту."])
         try:
             await bot.send_message(
                 entry.manager_id,
@@ -840,8 +896,8 @@ async def notify_waitlist_matches(bot: Bot, reports: dict[str, dict] | None) -> 
 def waitlist_keyboard(user_id: int) -> InlineKeyboardMarkup:
     entries = materials_db.list_wait_entries(manager_id=user_id, active_only=True)
     rows = [[InlineKeyboardButton(
-        text=f"✅ Закрыть · {entry.client_title[:20]} · {entry.query[:25]}",
-        callback_data=f"wait:done:{entry.id}",
+        text=f"🔔 {clean_client_title(entry.client_title)[:22]} · {entry.query[:28]}",
+        callback_data=f"wait:open:{entry.id}",
     )] for entry in entries[:20]]
     rows.append(compact_nav())
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -862,7 +918,8 @@ def waitlist_text(user_id: int) -> str:
         query = f"{entry.query[:100]}{'…' if len(entry.query) > 100 else ''}"
         comment = f"\n💬 {html.escape(entry.comment[:100])}" if entry.comment else ""
         blocks.append(
-            f"<b>{number}. {html.escape(entry.client_title)}</b>\n{html.escape(query)}{comment}"
+            f"<b>{number}. {html.escape(clean_client_title(entry.client_title))}</b>\n"
+            f"{html.escape(query)}{comment}"
         )
     if len(entries) > len(shown):
         blocks.append(f"Показаны последние {len(shown)} из {len(entries)} запросов.")
@@ -874,10 +931,205 @@ def waitlist_text(user_id: int) -> str:
     return "\n\n".join(blocks)
 
 
+def wait_chat_url(entry) -> str | None:
+    chat_id = str(entry.chat_id)
+    if chat_id.startswith("-100") and entry.source_message_id:
+        return f"https://t.me/c/{chat_id[4:]}/{entry.source_message_id}"
+    return None
+
+
+def wait_entry_text(entry) -> str:
+    mode = "Группа товаров" if not any(char.isdigit() for char in normalize_price_text(entry.query)) else "Конкретная позиция"
+    lines = [
+        "🔔 <b>Ожидание</b>", "",
+        f"Клиент: <b>{html.escape(clean_client_title(entry.client_title))}</b>",
+        f"Что ожидает: <b>{html.escape(entry.query)}</b>",
+        f"Режим: <b>{mode}</b>",
+        f"Комментарий: {html.escape(entry.comment) if entry.comment else '<i>не добавлен</i>'}",
+    ]
+    if entry.last_match:
+        lines.extend([
+            "", "✅ <b>Последнее найденное поступление</b>",
+            f"Подходящих позиций: <b>{entry.last_match.get('count', 0)}</b>",
+            f"Склады: {html.escape(' · '.join(entry.last_match.get('warehouses', [])))}",
+        ])
+    return "\n".join(lines)
+
+
+def wait_entry_keyboard(entry) -> InlineKeyboardMarkup:
+    rows = []
+    chat_url = wait_chat_url(entry)
+    if chat_url:
+        rows.append([InlineKeyboardButton(text="💬 Связаться с клиентом", url=chat_url)])
+    if entry.last_match:
+        rows.append([InlineKeyboardButton(
+            text="✉️ Сформировать сообщение клиенту", callback_data=f"wait:message:{entry.id}"
+        )])
+    rows.extend([
+        [
+            InlineKeyboardButton(text="✏️ Товар", callback_data=f"wait:edit_query:{entry.id}"),
+            InlineKeyboardButton(text="💬 Комментарий", callback_data=f"wait:edit_comment:{entry.id}"),
+        ],
+        [InlineKeyboardButton(text="✅ Закрыть ожидание", callback_data=f"wait:confirm_close:{entry.id}")],
+        compact_nav("main:waitlist"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 @router.callback_query(F.data == "main:waitlist")
 async def open_waitlist(callback: CallbackQuery) -> None:
     await callback.message.edit_text(
         waitlist_text(callback.from_user.id), reply_markup=waitlist_keyboard(callback.from_user.id)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("wait:open:"))
+async def open_wait_entry(callback: CallbackQuery) -> None:
+    wait_id = int(callback.data.rsplit(":", 1)[1])
+    entry = materials_db.get_wait_entry(wait_id)
+    if not entry or (entry.manager_id != callback.from_user.id and not is_admin(callback.from_user.id)):
+        await callback.answer("Ожидание недоступно.", show_alert=True)
+        return
+    await callback.message.edit_text(wait_entry_text(entry), reply_markup=wait_entry_keyboard(entry))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("wait:edit_query:"))
+async def start_wait_query_edit(callback: CallbackQuery, state: FSMContext) -> None:
+    wait_id = int(callback.data.rsplit(":", 1)[1])
+    entry = materials_db.get_wait_entry(wait_id)
+    if not entry or entry.manager_id != callback.from_user.id:
+        await callback.answer("Ожидание недоступно.", show_alert=True)
+        return
+    await state.set_state(WaitState.edit_query)
+    await state.update_data(wait_edit_id=wait_id)
+    await callback.message.edit_text(
+        "✏️ <b>Что ожидает клиент?</b>\n\n"
+        f"Сейчас: <b>{html.escape(entry.query)}</b>\n\n"
+        "Отправьте новое описание. Например: <code>картриджи XROS</code>.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[compact_nav(f"wait:open:{wait_id}")]),
+    )
+    await callback.answer()
+
+
+@router.message(WaitState.edit_query, F.text)
+async def save_wait_query_edit(message: Message, state: FSMContext) -> None:
+    wait_id = (await state.get_data()).get("wait_edit_id")
+    entry = materials_db.update_wait_entry(wait_id, message.from_user.id, query=message.text[:200])
+    await state.clear()
+    if not entry:
+        await message.answer("Ожидание уже недоступно.", reply_markup=back_main())
+        return
+    await message.answer("✅ Описание обновлено.")
+    await message.answer(wait_entry_text(entry), reply_markup=wait_entry_keyboard(entry))
+
+
+@router.callback_query(F.data.startswith("wait:edit_comment:"))
+async def start_wait_comment_edit(callback: CallbackQuery, state: FSMContext) -> None:
+    wait_id = int(callback.data.rsplit(":", 1)[1])
+    entry = materials_db.get_wait_entry(wait_id)
+    if not entry or entry.manager_id != callback.from_user.id:
+        await callback.answer("Ожидание недоступно.", show_alert=True)
+        return
+    await state.set_state(WaitState.edit_comment)
+    await state.update_data(wait_edit_id=wait_id)
+    await callback.message.edit_text(
+        "💬 <b>Комментарий к ожиданию</b>\n\n"
+        "Отправьте новый комментарий. Чтобы удалить его, отправьте <code>-</code>.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[compact_nav(f"wait:open:{wait_id}")]),
+    )
+    await callback.answer()
+
+
+@router.message(WaitState.edit_comment, F.text)
+async def save_wait_comment_edit(message: Message, state: FSMContext) -> None:
+    wait_id = (await state.get_data()).get("wait_edit_id")
+    comment = "" if message.text.strip() == "-" else message.text[:500]
+    entry = materials_db.update_wait_entry(wait_id, message.from_user.id, comment=comment)
+    await state.clear()
+    if not entry:
+        await message.answer("Ожидание уже недоступно.", reply_markup=back_main())
+        return
+    await message.answer("✅ Комментарий обновлён.")
+    await message.answer(wait_entry_text(entry), reply_markup=wait_entry_keyboard(entry))
+
+
+@router.callback_query(F.data.startswith("wait:confirm_close:"))
+async def confirm_wait_close(callback: CallbackQuery) -> None:
+    wait_id = int(callback.data.rsplit(":", 1)[1])
+    await callback.message.edit_text(
+        "Закрыть это ожидание?",
+        reply_markup=confirm_keyboard(f"wait:done:{wait_id}", f"wait:open:{wait_id}"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("wait:arrival:"))
+async def show_wait_arrival(callback: CallbackQuery) -> None:
+    wait_id = int(callback.data.rsplit(":", 1)[1])
+    entry = materials_db.get_wait_entry(wait_id)
+    if not entry or not entry.last_match or (
+        entry.manager_id != callback.from_user.id and not is_admin(callback.from_user.id)
+    ):
+        await callback.answer("Подробности поступления недоступны.", show_alert=True)
+        return
+    lines = [
+        "📋 <b>Поступление по ожиданию</b>", "",
+        f"Клиент: <b>{html.escape(clean_client_title(entry.client_title))}</b>",
+        f"Запрос: <b>{html.escape(entry.query)}</b>", "",
+    ]
+    items = entry.last_match.get("items", [])
+    for number, item in enumerate(items[:25], 1):
+        lines.append(
+            f"<b>{number}.</b> {html.escape(item['name'])}\n"
+            f"📍 {html.escape(' · '.join(item.get('warehouses', [])))}"
+        )
+    if len(items) > 25:
+        lines.extend(["", f"И ещё позиций: <b>{len(items) - 25}</b>"])
+    await callback.message.edit_text("\n\n".join(lines), reply_markup=wait_entry_keyboard(entry))
+    await callback.answer()
+
+
+def client_wait_message(entry) -> str:
+    match = entry.last_match or {}
+    count = match.get("count", 0)
+    group_wait = not any(char.isdigit() for char in normalize_price_text(entry.query))
+    if group_wait:
+        text = (
+            f"Добрый день! Поступили {entry.query}. "
+            f"Сейчас доступно {count} {position_word(count)}. Можем подготовить ассортимент и собрать заказ. "
+            "Подскажите, предложение ещё актуально?"
+        )
+    else:
+        item_name = (match.get("items") or [{"name": entry.query}])[0]["name"]
+        text = (
+            f"Добрый день! Поступила ожидаемая позиция: {item_name}. "
+            "Подскажите, заказ ещё актуален?"
+        )
+    return text
+
+
+@router.callback_query(F.data.startswith("wait:message:"))
+async def prepare_client_wait_message(callback: CallbackQuery) -> None:
+    wait_id = int(callback.data.rsplit(":", 1)[1])
+    entry = materials_db.get_wait_entry(wait_id)
+    if not entry or not entry.last_match or (
+        entry.manager_id != callback.from_user.id and not is_admin(callback.from_user.id)
+    ):
+        await callback.answer("Сначала должно быть найдено поступление.", show_alert=True)
+        return
+    text = client_wait_message(entry)
+    rows = []
+    chat_url = wait_chat_url(entry)
+    if chat_url:
+        rows.append([InlineKeyboardButton(text="💬 Связаться с клиентом", url=chat_url)])
+    rows.append(compact_nav(f"wait:open:{entry.id}"))
+    await callback.message.answer(
+        "✉️ <b>Готовое сообщение клиенту</b>\n\n"
+        "Нажмите на текст, чтобы скопировать его:\n\n"
+        f"<pre>{html.escape(text)}</pre>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
     await callback.answer()
 
@@ -899,7 +1151,10 @@ async def close_wait_entry(callback: CallbackQuery) -> None:
             waitlist_text(callback.from_user.id), reply_markup=waitlist_keyboard(callback.from_user.id)
         )
     else:
-        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.edit_text(
+            "✅ <b>Ожидание закрыто</b>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[compact_nav("main:waitlist")]),
+        )
 
 
 @router.callback_query(F.data.startswith("wait:keep:"))
@@ -945,7 +1200,7 @@ async def track_client_chat(event: ChatMemberUpdated) -> None:
         return
     active = event.new_chat_member.status in {"member", "administrator", "creator"}
     materials_db.upsert_client_chat(
-        event.chat.id, event.chat.title or str(event.chat.id), event.chat.type, active
+        event.chat.id, clean_client_title(event.chat.title or str(event.chat.id)), event.chat.type, active
     )
 
 
@@ -2385,8 +2640,12 @@ async def apply_price(callback: CallbackQuery, state: FSMContext, bot: Bot) -> N
         price_updates_in_progress.discard(warehouse)
     await state.clear()
     try:
-        combined_reports, _ = combined_report_bundle()
-        wait_matches = await notify_waitlist_matches(bot, combined_reports)
+        prices_db.mark_wait_batch_warehouse(warehouse, report)
+        if prices_db.wait_batch_ready():
+            wait_matches = await notify_waitlist_matches(bot, prices_db.latest_reports())
+            prices_db.clear_wait_batch()
+        else:
+            wait_matches = 0
     except Exception:
         logging.exception("Не удалось проверить лист ожидания после обновления прайса")
         wait_matches = 0
@@ -2932,6 +3191,12 @@ async def main() -> None:
     active_excel_path = managed_excel_path if managed_excel_path.exists() else excel_path
     catalog = Catalog(active_excel_path)
     materials_db = MaterialsDB(db_path)
+    for registered_chat in materials_db.list_client_chats():
+        cleaned_title = clean_client_title(registered_chat.title)
+        if cleaned_title != registered_chat.title:
+            materials_db.upsert_client_chat(
+                registered_chat.chat_id, cleaned_title, registered_chat.chat_type, registered_chat.is_active
+            )
     prices_db = PricesDB(prices_db_path)
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dispatcher = Dispatcher()

@@ -101,6 +101,13 @@ def test_waitlist_is_scoped_to_manager_and_remembers_matches(tmp_path):
     assert db.wait_match_seen(first.id, "xros 0 6 2мл") is False
     db.record_wait_match(first.id, "xros 0 6 2мл")
     assert db.wait_match_seen(first.id, "xros 0 6 2мл") is True
+    db.set_wait_last_match(first.id, {"count": 2, "warehouses": ["Москва"], "items": []})
+    assert db.get_wait_entry(first.id).last_match["count"] == 2
+    updated = db.update_wait_entry(first.id, 101, query="картриджи XROS", comment="Любые варианты")
+    assert updated.query == "картриджи XROS"
+    assert updated.comment == "Любые варианты"
+    assert updated.last_match is None
+    assert db.wait_match_seen(first.id, "xros 0 6 2мл") is False
     assert db.close_wait_entry(first.id, manager_id=202) is False
     assert db.close_wait_entry(first.id, manager_id=101) is True
     assert db.list_wait_entries(manager_id=101) == []
