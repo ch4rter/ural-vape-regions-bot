@@ -45,6 +45,18 @@ class ClientChat:
     is_active: bool
 
 
+@dataclass(frozen=True)
+class WaitEntry:
+    id: int
+    chat_id: int
+    client_title: str
+    manager_id: int
+    manager_name: str
+    query: str
+    status: str
+    source_message_id: int | None
+
+
 class MaterialsDB:
     def __init__(self, path: Path):
         self.path = path
@@ -105,11 +117,36 @@ class MaterialsDB:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS wait_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    client_title TEXT NOT NULL,
+                    manager_id INTEGER NOT NULL,
+                    manager_name TEXT NOT NULL,
+                    query TEXT NOT NULL,
+                    source_message_id INTEGER,
+                    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'closed')),
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    closed_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_wait_entries_manager
+                    ON wait_entries(manager_id, status);
+                CREATE TABLE IF NOT EXISTS wait_notifications (
+                    wait_id INTEGER NOT NULL REFERENCES wait_entries(id) ON DELETE CASCADE,
+                    item_signature TEXT NOT NULL,
+                    decision TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(decision IN ('pending', 'confirmed', 'rejected')),
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY(wait_id, item_signature)
+                );
                 """
             )
             columns = {row[1] for row in connection.execute("PRAGMA table_info(access_users)")}
             if "role" not in columns:
                 connection.execute("ALTER TABLE access_users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
+            wait_columns = {row[1] for row in connection.execute("PRAGMA table_info(wait_entries)")}
+            if "source_message_id" not in wait_columns:
+                connection.execute("ALTER TABLE wait_entries ADD COLUMN source_message_id INTEGER")
 
     def add_access_user(self, value: str) -> AccessUser:
         value = value.strip()
@@ -219,6 +256,85 @@ class MaterialsDB:
             ).fetchone()
         return ClientChat(row["chat_id"], row["title"], row["chat_type"], bool(row["is_active"])) if row else None
 
+    def add_wait_entry(
+        self, chat_id: int, client_title: str, manager_id: int, manager_name: str, query: str,
+        source_message_id: int | None = None,
+    ) -> WaitEntry:
+        query = query.strip()
+        if len(query) < 2:
+            raise ValueError("Название товара слишком короткое.")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """INSERT INTO wait_entries(
+                       chat_id, client_title, manager_id, manager_name, query, source_message_id
+                   ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (chat_id, client_title.strip() or str(chat_id), manager_id, manager_name, query, source_message_id),
+            )
+            wait_id = cursor.lastrowid
+            connection.commit()
+        return self.get_wait_entry(wait_id)
+
+    def get_wait_entry(self, wait_id: int) -> WaitEntry | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT id, chat_id, client_title, manager_id, manager_name, query, status, source_message_id
+                   FROM wait_entries WHERE id = ?""",
+                (wait_id,),
+            ).fetchone()
+        return self._wait_entry(row) if row else None
+
+    def list_wait_entries(self, manager_id: int | None = None, active_only: bool = True) -> list[WaitEntry]:
+        conditions, values = [], []
+        if manager_id is not None:
+            conditions.append("manager_id = ?")
+            values.append(manager_id)
+        if active_only:
+            conditions.append("status = 'active'")
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""SELECT id, chat_id, client_title, manager_id, manager_name, query, status, source_message_id
+                    FROM wait_entries {where} ORDER BY created_at DESC, id DESC""",
+                values,
+            ).fetchall()
+        return [self._wait_entry(row) for row in rows]
+
+    def close_wait_entry(self, wait_id: int, manager_id: int | None = None) -> bool:
+        condition = "id = ?" if manager_id is None else "id = ? AND manager_id = ?"
+        values = (wait_id,) if manager_id is None else (wait_id, manager_id)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                f"UPDATE wait_entries SET status = 'closed', closed_at = CURRENT_TIMESTAMP WHERE {condition}",
+                values,
+            )
+        return cursor.rowcount > 0
+
+    def wait_match_seen(self, wait_id: int, item_signature: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM wait_notifications WHERE wait_id = ? AND item_signature = ?",
+                (wait_id, item_signature),
+            ).fetchone()
+        return bool(row)
+
+    def record_wait_match(self, wait_id: int, item_signature: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT OR IGNORE INTO wait_notifications(wait_id, item_signature)
+                   VALUES (?, ?)""",
+                (wait_id, item_signature),
+            )
+
+    def reject_wait_match(self, wait_id: int, item_signature: str, manager_id: int) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """UPDATE wait_notifications SET decision = 'rejected'
+                   WHERE wait_id = ? AND item_signature = ?
+                     AND EXISTS(SELECT 1 FROM wait_entries WHERE id = ? AND manager_id = ?)""",
+                (wait_id, item_signature, wait_id, manager_id),
+            )
+        return cursor.rowcount > 0
+
     def set_setting(self, key: str, value: str) -> None:
         with self._connect() as connection:
             connection.execute(
@@ -234,6 +350,13 @@ class MaterialsDB:
     @staticmethod
     def _access_user(row: sqlite3.Row) -> AccessUser:
         return AccessUser(row["id"], row["telegram_id"], row["username"], row["role"])
+
+    @staticmethod
+    def _wait_entry(row: sqlite3.Row) -> WaitEntry:
+        return WaitEntry(
+            row["id"], row["chat_id"], row["client_title"], row["manager_id"],
+            row["manager_name"], row["query"], row["status"], row["source_message_id"],
+        )
 
     def backup_to(self, destination: Path) -> None:
         """Create a consistent SQLite backup, including pending WAL changes."""

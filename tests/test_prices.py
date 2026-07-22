@@ -10,6 +10,7 @@ from bot import (
     manager_html,
     money,
     variant_word,
+    wait_match_score,
 )
 from prices_db import (
     ParsedGroup,
@@ -180,6 +181,13 @@ def test_specific_position_search_uses_name_not_product_code(tmp_path):
     _, variants = db.group_variants(db.search_groups("vaporesso")[0].callback_id)
     two_ml = next(item for item in variants if "2мл" in item.name)
     assert two_ml.warehouse_prices["center"] == (Decimal("532"), Decimal("549"))
+
+
+def test_waitlist_matching_requires_exact_numeric_characteristics():
+    name = "Картридж Vaporesso XROS (2мл) - 0.6 ohm COREX 3.0"
+    assert wait_match_score("картридж xros 0.6 2мл", "Vaporesso Расходники", name) > 0.8
+    assert wait_match_score("xros 0.8 2мл", "Vaporesso Расходники", name) == 0
+    assert wait_match_score("xros 0.6 3мл", "Vaporesso Расходники", name) == 0
 
 
 def test_selected_price_contains_only_chosen_groups_and_discount(tmp_path):

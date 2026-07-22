@@ -83,6 +83,21 @@ def test_roles_chat_registry_and_settings(tmp_path):
     assert db.list_client_chats(active_only=True) == []
     assert db.get_client_chat(-100123).is_active is False
 
+
+def test_waitlist_is_scoped_to_manager_and_remembers_matches(tmp_path):
+    db = MaterialsDB(tmp_path / "materials.sqlite3")
+    first = db.add_wait_entry(-100123, "Vape Shop", 101, "Андрей", "XROS 0.6 2мл")
+    second = db.add_wait_entry(-100456, "Другой клиент", 202, "Матвей", "OGGO VLIQ")
+
+    assert db.list_wait_entries(manager_id=101) == [first]
+    assert {entry.id for entry in db.list_wait_entries()} == {first.id, second.id}
+    assert db.wait_match_seen(first.id, "xros 0 6 2мл") is False
+    db.record_wait_match(first.id, "xros 0 6 2мл")
+    assert db.wait_match_seen(first.id, "xros 0 6 2мл") is True
+    assert db.close_wait_entry(first.id, manager_id=202) is False
+    assert db.close_wait_entry(first.id, manager_id=101) is True
+    assert db.list_wait_entries(manager_id=101) == []
+
     db.set_setting("service_chat_id", "-100123")
     assert db.get_setting("service_chat_id") == "-100123"
 
