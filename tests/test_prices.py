@@ -231,7 +231,11 @@ def test_group_wait_notifies_after_each_warehouse_without_same_warehouse_duplica
         assert "Нужна коробка" in fake.messages[0][1]
         stored = database.list_wait_entries(manager_id=101)[0]
         assert stored.last_match["count"] == 2
-        assert "Сейчас доступно 2 позиции" in client_wait_message(stored)
+        client_text = client_wait_message(stored)
+        assert "К нам поступили жидкости OGGO" in client_text
+        assert "разные линейки и вкусы" in client_text
+        assert "товар ещё нужен" in client_text
+        assert "позиций" not in client_text
         assert asyncio.run(bot_module.notify_waitlist_matches(fake, center_report)) == 0
         assert asyncio.run(bot_module.notify_waitlist_matches(fake, west_report)) == 1
         assert len(fake.messages) == 2
@@ -241,6 +245,25 @@ def test_group_wait_notifies_after_each_warehouse_without_same_warehouse_duplica
             del bot_module.materials_db
         else:
             bot_module.materials_db = previous
+
+
+def test_client_wait_message_adapts_to_product_category(tmp_path):
+    db = MaterialsDB(tmp_path / "materials.sqlite3")
+    entry = db.add_wait_entry(0, "Клиент", 101, "Андрей", "картриджи XROS")
+    db.set_wait_last_match(entry.id, {
+        "count": 3, "warehouses": ["Москва"], "categories": ["Расходники"],
+        "items": [{"name": "Картридж XROS 0.6", "warehouses": ["Москва"]}],
+    })
+    text = client_wait_message(db.get_wait_entry(entry.id))
+    assert "картриджи XROS" in text
+    assert "разным сопротивлением и объёмом" in text
+
+    device = db.add_wait_entry(0, "Клиент", 101, "Андрей", "устройства XROS")
+    db.set_wait_last_match(device.id, {
+        "count": 2, "warehouses": ["Москва"], "categories": ["Электронные системы"],
+        "items": [],
+    })
+    assert "разные модели и цвета" in client_wait_message(db.get_wait_entry(device.id))
 
 
 def test_selected_price_contains_only_chosen_groups_and_discount(tmp_path):

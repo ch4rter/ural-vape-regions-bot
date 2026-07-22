@@ -577,14 +577,6 @@ def variant_word(count: int) -> str:
     return "вариантов"
 
 
-def position_word(count: int) -> str:
-    if count % 10 == 1 and count % 100 != 11:
-        return "позиция"
-    if count % 10 in (2, 3, 4) and count % 100 not in (12, 13, 14):
-        return "позиции"
-    return "позиций"
-
-
 def price_group_label(display_name: str, category_name: str) -> str:
     label = f"{display_name} · {category_name}"
     return label if len(label) <= 64 else f"{label[:61]}..."
@@ -829,7 +821,8 @@ async def notify_waitlist_matches(bot: Bot, reports: dict[str, dict] | None) -> 
             if materials_db.wait_match_seen(entry.id, warehouse_signature):
                 continue
             match = matches.setdefault(item_key, {
-                "name": item["name"], "group": item["group"], "score": score,
+                "name": item["name"], "group": item["group"],
+                "category": item.get("category", ""), "score": score,
                 "warehouses": {}, "signatures": set(),
             })
             match["score"] = max(match["score"], score)
@@ -853,6 +846,7 @@ async def notify_waitlist_matches(bot: Bot, reports: dict[str, dict] | None) -> 
             "warehouses": list(warehouse_counts),
             "warehouse_counts": warehouse_counts,
             "items": payload_items,
+            "categories": sorted({item.get("category", "") for _, item in selected if item.get("category")}),
         }
         materials_db.set_wait_last_match(entry.id, payload)
         updated_entry = materials_db.get_wait_entry(entry.id)
@@ -1157,19 +1151,42 @@ async def show_wait_arrival(callback: CallbackQuery) -> None:
 
 def client_wait_message(entry) -> str:
     match = entry.last_match or {}
-    count = match.get("count", 0)
     group_wait = not any(char.isdigit() for char in normalize_price_text(entry.query))
     if group_wait:
+        categories = match.get("categories", [])
+        category = categories[0] if len(categories) == 1 else ""
+        query = entry.query.strip()
+        if category == "Жидкости":
+            tail = re.sub(r"^жидкост(?:ь|и)\s*", "", query, flags=re.IGNORECASE).strip()
+            subject = f"жидкости {tail}".strip()
+            assortment = "разные линейки и вкусы"
+        elif category == "Одноразовые системы":
+            tail = re.sub(r"^(?:одноразовые\s+системы|одноразки)\s*", "", query, flags=re.IGNORECASE).strip()
+            subject = f"одноразовые системы {tail}".strip()
+            assortment = "разные модели и вкусы"
+        elif category == "Электронные системы":
+            tail = re.sub(r"^(?:устройства|электронные\s+системы)\s*", "", query, flags=re.IGNORECASE).strip()
+            subject = f"устройства {tail}".strip()
+            assortment = "разные модели и цвета"
+        elif category in {"Картриджи", "Расходники"} and "картридж" in normalize_price_text(query):
+            tail = re.sub(r"^картридж(?:и)?\s*", "", query, flags=re.IGNORECASE).strip()
+            subject = f"картриджи {tail}".strip()
+            assortment = "варианты с разным сопротивлением и объёмом"
+        elif len(categories) > 1:
+            subject = f"продукция {query}"
+            assortment = "разные линейки и варианты"
+        else:
+            subject = query
+            assortment = "разные варианты"
         text = (
-            f"Добрый день! Поступили {entry.query}. "
-            f"Сейчас доступно {count} {position_word(count)}. Можем подготовить ассортимент и собрать заказ. "
-            "Подскажите, предложение ещё актуально?"
+            f"Добрый день! К нам поступили {subject} — в наличии {assortment}. "
+            "Подскажите, товар ещё нужен? Если да, отправим цены и покажем, что сейчас есть в наличии."
         )
     else:
-        item_name = (match.get("items") or [{"name": entry.query}])[0]["name"]
+        item_name = entry.query[:1].upper() + entry.query[1:]
         text = (
-            f"Добрый день! Поступила ожидаемая позиция: {item_name}. "
-            "Подскажите, заказ ещё актуален?"
+            f"Добрый день! {item_name} снова в наличии. "
+            "Подскажите, товар ещё нужен? Если да, отправим цены."
         )
     return text
 
