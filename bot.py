@@ -406,7 +406,6 @@ async def send_all_current_prices(message: Message, state: FSMContext) -> None:
         source = price_storage_path / f"{warehouse}.xlsx"
         await message.answer_document(
             FSInputFile(source, filename=f"прайс {warehouse_name} — {city}.xlsx"),
-            caption=f"📄 <b>{warehouse_name} — {city}</b>\nАктуальный базовый прайс.",
         )
 
     missing = [
