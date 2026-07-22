@@ -248,26 +248,50 @@ def can_broadcast(user_id: int | None, username: str | None = None) -> bool:
     return is_admin(user_id) or is_junior_admin(user_id, username)
 
 
+def button_grid(buttons: list[InlineKeyboardButton], columns: int = 2) -> list[list[InlineKeyboardButton]]:
+    return [buttons[index : index + columns] for index in range(0, len(buttons), columns)]
+
+
+def compact_nav(
+    back_data: str | None = None,
+    *,
+    forward_data: str | None = None,
+    search_data: str | None = None,
+    home: bool = True,
+) -> list[InlineKeyboardButton]:
+    buttons = []
+    if back_data:
+        buttons.append(InlineKeyboardButton(text="⬅️", callback_data=back_data))
+    if forward_data:
+        buttons.append(InlineKeyboardButton(text="➡️", callback_data=forward_data))
+    if search_data:
+        buttons.append(InlineKeyboardButton(text="🔎", callback_data=search_data))
+    if home:
+        buttons.append(InlineKeyboardButton(text="🏠", callback_data="main:menu"))
+    return buttons
+
+
 def main_menu(user_id: int | None) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text="🔎 Поиск менеджера", callback_data="main:region")],
-        [InlineKeyboardButton(text="💰 Цены и наличие", callback_data="main:prices")],
-        [InlineKeyboardButton(text="📄 Прайсы", callback_data="main:price_files")],
-        [InlineKeyboardButton(text="📊 Изменения прайсов", callback_data="main:price_reports")],
-        [InlineKeyboardButton(text="🗃 База данных", callback_data="main:database")],
-        [InlineKeyboardButton(text="🔔 Лист ожидания", callback_data="main:waitlist")],
+    buttons = [
+        InlineKeyboardButton(text="🔎 Менеджеры", callback_data="main:region"),
+        InlineKeyboardButton(text="💰 Цены", callback_data="main:prices"),
+        InlineKeyboardButton(text="📄 Прайсы", callback_data="main:price_files"),
+        InlineKeyboardButton(text="📊 Изменения", callback_data="main:price_reports"),
+        InlineKeyboardButton(text="🗃 База данных", callback_data="main:database"),
+        InlineKeyboardButton(text="🔔 Ожидания", callback_data="main:waitlist"),
     ]
+    rows = button_grid(buttons)
+    extra = []
     if can_broadcast(user_id):
-        rows.append([InlineKeyboardButton(text="📣 Рассылки клиентам", callback_data="main:broadcasts")])
+        extra.append(InlineKeyboardButton(text="📣 Рассылки", callback_data="main:broadcasts"))
     if is_admin(user_id):
-        rows.append([InlineKeyboardButton(text="⚙️ Управление базой", callback_data="main:admin")])
+        extra.append(InlineKeyboardButton(text="⚙️ Управление", callback_data="main:admin"))
+    rows.extend(button_grid(extra))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def back_main() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")]]
-    )
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏠", callback_data="main:menu")]])
 
 
 async def edit_or_answer(
@@ -419,13 +443,9 @@ def suggestion_label(entry: Entry, variant_count: int = 1) -> str:
 def pagination_keyboard(entry_index: int, entries: list[Entry], page: int) -> InlineKeyboardMarkup:
     total = len(unique_results(entries))
     page_count = (total + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE
-    buttons = []
-    if page > 0:
-        buttons.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"page:{entry_index}:{page - 1}"))
-    if page + 1 < page_count:
-        buttons.append(InlineKeyboardButton(text="Далее ➡️", callback_data=f"page:{entry_index}:{page + 1}"))
-    rows = [buttons] if buttons else []
-    rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")])
+    back = f"page:{entry_index}:{page - 1}" if page > 0 else None
+    forward = f"page:{entry_index}:{page + 1}" if page + 1 < page_count else None
+    rows = [compact_nav(back, forward_data=forward)]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -456,7 +476,7 @@ async def search_region(message: Message) -> None:
         entry = catalog.entries[index]
         count = len(catalog.by_name[normalize(entry.name)])
         rows.append([InlineKeyboardButton(text=suggestion_label(entry, count), callback_data=f"place:{index}")])
-    rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")])
+    rows.append(compact_nav())
     await message.answer(
         "Точного совпадения не найдено. Возможно, вы имели в виду один из вариантов:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
@@ -537,18 +557,16 @@ def price_search_keyboard(group_ids: list[int], page: int) -> InlineKeyboardMark
         ]
         for group in available[start : start + PRICE_GROUPS_PER_PAGE]
     ]
-    navigation = []
-    if page > 0:
-        navigation.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"price:r:{page - 1}"))
-    if page + 1 < page_count:
-        navigation.append(InlineKeyboardButton(text="Далее ➡️", callback_data=f"price:r:{page + 1}"))
-    if navigation:
-        rows.append(navigation)
+    back = f"price:r:{page - 1}" if page > 0 else None
+    forward = f"price:r:{page + 1}" if page + 1 < page_count else None
+    if back or forward:
+        rows.append(compact_nav(back, forward_data=forward, home=False))
     rows.extend([
-        [InlineKeyboardButton(text="➕ Добавить все результаты", callback_data="price:add_all")],
-        [InlineKeyboardButton(text="🧺 Моя подборка", callback_data="price:cart")],
-        [InlineKeyboardButton(text="🔎 Новый поиск", callback_data="main:prices")],
-        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")],
+        [
+            InlineKeyboardButton(text="➕ Добавить все", callback_data="price:add_all"),
+            InlineKeyboardButton(text="🧺 Подборка", callback_data="price:cart"),
+        ],
+        compact_nav(search_data="main:prices"),
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -575,17 +593,11 @@ def price_item_search_keyboard(item_ids: list[int], page: int) -> InlineKeyboard
     rows = [[InlineKeyboardButton(
         text=price_item_label(item.name), callback_data=f"price:i:{item.callback_id}"
     )] for item in available[start : start + PRICE_ITEMS_PER_PAGE]]
-    navigation = []
-    if page > 0:
-        navigation.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"price:ir:{page - 1}"))
-    if page + 1 < page_count:
-        navigation.append(InlineKeyboardButton(text="Далее ➡️", callback_data=f"price:ir:{page + 1}"))
-    if navigation:
-        rows.append(navigation)
-    rows.extend([
-        [InlineKeyboardButton(text="🔎 Новый поиск", callback_data="main:prices")],
-        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")],
-    ])
+    back = f"price:ir:{page - 1}" if page > 0 else None
+    forward = f"price:ir:{page + 1}" if page + 1 < page_count else None
+    if back or forward:
+        rows.append(compact_nav(back, forward_data=forward, home=False))
+    rows.append(compact_nav(search_data="main:prices"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -772,9 +784,9 @@ async def notify_waitlist_matches(bot: Bot, reports: dict[str, dict] | None) -> 
                 text="💬 Открыть чат клиента",
                 url=f"https://t.me/c/{internal_id}/{entry.source_message_id}",
             )])
-        buttons.extend([
-            [InlineKeyboardButton(text="✅ Клиенту сообщили", callback_data=f"wait:done:{entry.id}")],
-            [InlineKeyboardButton(text="⏳ Оставить в ожидании", callback_data=f"wait:keep:{entry.id}")],
+        buttons.append([
+            InlineKeyboardButton(text="✅ Сообщили", callback_data=f"wait:done:{entry.id}"),
+            InlineKeyboardButton(text="⏳ Оставить", callback_data=f"wait:keep:{entry.id}"),
         ])
         keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
         heading = (
@@ -831,7 +843,7 @@ def waitlist_keyboard(user_id: int) -> InlineKeyboardMarkup:
         text=f"✅ Закрыть · {entry.client_title[:20]} · {entry.query[:25]}",
         callback_data=f"wait:done:{entry.id}",
     )] for entry in entries[:20]]
-    rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")])
+    rows.append(compact_nav())
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -902,37 +914,28 @@ async def keep_wait_entry(callback: CallbackQuery) -> None:
 
 def price_variants_keyboard(callback_id: int, page: int, total: int) -> InlineKeyboardMarkup:
     page_count = max(1, (total + PRICE_VARIANTS_PER_PAGE - 1) // PRICE_VARIANTS_PER_PAGE)
-    navigation = []
-    if page > 0:
-        navigation.append(
-            InlineKeyboardButton(text="⬅️ Назад", callback_data=f"price:v:{callback_id}:{page - 1}")
-        )
-    if page + 1 < page_count:
-        navigation.append(
-            InlineKeyboardButton(text="Далее ➡️", callback_data=f"price:v:{callback_id}:{page + 1}")
-        )
-    rows = [navigation] if navigation else []
+    back = f"price:v:{callback_id}:{page - 1}" if page > 0 else None
+    forward = f"price:v:{callback_id}:{page + 1}" if page + 1 < page_count else None
+    rows = [compact_nav(back, forward_data=forward, home=False)] if back or forward else []
     rows.extend([
         [InlineKeyboardButton(text="💰 Вернуться к ценам", callback_data=f"price:g:{callback_id}")],
-        [InlineKeyboardButton(text="⬅️ К результатам поиска", callback_data="price:back")],
-        [InlineKeyboardButton(text="🔎 Новый поиск", callback_data="main:prices")],
+        compact_nav("price:back", search_data="main:prices"),
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def downloadable_prices_keyboard() -> InlineKeyboardMarkup:
     statuses = prices_db.import_statuses()
-    rows = [
-        [
+    buttons = [
             InlineKeyboardButton(
                 text=f"🏢 {WAREHOUSES[warehouse]}",
                 callback_data=f"files:w:{warehouse}",
             )
-        ]
         for warehouse in ("center", "west", "ural")
         if warehouse in statuses
     ]
-    rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")])
+    rows = button_grid(buttons)
+    rows.append(compact_nav())
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -947,11 +950,10 @@ async def track_client_chat(event: ChatMemberUpdated) -> None:
 
 
 def broadcast_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text="➕ Создать рассылку", callback_data="broadcast:new")],
-        [InlineKeyboardButton(text="📥 Выгрузить список чатов", callback_data="broadcast:export_chats")],
-    ]
-    rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")])
+    rows = [[
+        InlineKeyboardButton(text="➕ Создать", callback_data="broadcast:new"),
+        InlineKeyboardButton(text="📥 Список чатов", callback_data="broadcast:export_chats"),
+    ], compact_nav()]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1091,8 +1093,10 @@ async def receive_broadcast_content(message: Message, state: FSMContext) -> None
     await message.answer(
         "🧪 <b>Шаг 3 из 3</b>\n\nСначала отправьте тест в служебную группу.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🧪 Отправить тест", callback_data="broadcast:test")],
-            [InlineKeyboardButton(text="✏️ Заменить пост", callback_data="broadcast:replace_content")],
+            [
+                InlineKeyboardButton(text="🧪 Тест", callback_data="broadcast:test"),
+                InlineKeyboardButton(text="✏️ Заменить", callback_data="broadcast:replace_content"),
+            ],
             [InlineKeyboardButton(text="❌ Отменить", callback_data="main:broadcasts")],
         ]),
     )
@@ -1121,8 +1125,10 @@ async def test_broadcast(callback: CallbackQuery, state: FSMContext, bot: Bot) -
         "Проверьте сообщение в группе и подтвердите массовую рассылку.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🚀 Начать рассылку", callback_data="broadcast:confirm_send")],
-            [InlineKeyboardButton(text="✏️ Заменить пост", callback_data="broadcast:replace_content")],
-            [InlineKeyboardButton(text="❌ Отменить", callback_data="main:broadcasts")],
+            [
+                InlineKeyboardButton(text="✏️ Заменить", callback_data="broadcast:replace_content"),
+                InlineKeyboardButton(text="❌ Отменить", callback_data="main:broadcasts"),
+            ],
         ]),
     )
     await callback.answer()
@@ -1238,12 +1244,12 @@ def combined_report_signature(reports: dict[str, dict]) -> str:
 
 def price_reports_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
     reports = prices_db.latest_reports()
-    rows = [
-        [InlineKeyboardButton(
+    buttons = [InlineKeyboardButton(
             text=f"📊 {WAREHOUSES[warehouse]}", callback_data=f"reports:show:{warehouse}"
-        )]
+        )
         for warehouse in ("center", "west", "ural") if warehouse in reports
     ]
+    rows = button_grid(buttons)
     combined, _ = combined_report_bundle()
     if is_admin(user_id) and combined:
         signature = combined_report_signature(combined)
@@ -1251,7 +1257,7 @@ def price_reports_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
             rows.append([InlineKeyboardButton(
                 text="📣 Отправить общий отчёт", callback_data="reports:broadcast_all"
             )])
-    rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")])
+    rows.append(compact_nav())
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1286,7 +1292,7 @@ def report_actions_keyboard(warehouse: str) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(
         text="📥 Скачать подробный Excel", callback_data=f"reports:file:{warehouse}"
     )]]
-    rows.append([InlineKeyboardButton(text="⬅️ К складам", callback_data="main:price_reports")])
+    rows.append(compact_nav("main:price_reports"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1371,8 +1377,10 @@ async def confirm_report_broadcast(callback: CallbackQuery) -> None:
         + (f"\nБез Telegram ID: <b>{waiting}</b> — будут пропущены" if waiting else "")
         + "\n\nОтправить это уведомление пользователям белого списка?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Отправить", callback_data="reports:send_all")],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="main:price_reports")],
+            [
+                InlineKeyboardButton(text="✅ Отправить", callback_data="reports:send_all"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data="main:price_reports"),
+            ],
         ]),
     )
     await callback.answer()
@@ -1428,7 +1436,7 @@ async def send_report_broadcast(callback: CallbackQuery, bot: Bot) -> None:
         f"Не удалось отправить: <b>{failed}</b>\n"
         f"Без привязанного Telegram ID: <b>{missing_ids}</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Вернуться к отчётам", callback_data="main:price_reports")]
+            compact_nav("main:price_reports")
         ]),
     )
 
@@ -1484,9 +1492,11 @@ async def select_price_warehouse(callback: CallbackQuery) -> None:
         f"Товарных позиций: <b>{status['item_count']}</b>\n\n"
         "Выберите нужный вариант:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Базовые цены", callback_data=f"files:get:{warehouse}:base")],
-            [InlineKeyboardButton(text="Цены со скидкой 10%", callback_data=f"files:get:{warehouse}:10")],
-            [InlineKeyboardButton(text="⬅️ К складам", callback_data="main:price_files")],
+            [
+                InlineKeyboardButton(text="Базовые", callback_data=f"files:get:{warehouse}:base"),
+                InlineKeyboardButton(text="Скидка −10%", callback_data=f"files:get:{warehouse}:10"),
+            ],
+            compact_nav("main:price_files"),
         ]),
     )
     await callback.answer()
@@ -1653,14 +1663,14 @@ async def render_price_group(message: Message, callback_id: int, state: FSMConte
     selected_ids = set((await state.get_data()).get("price_selected_ids", []))
     selected = callback_id in selected_ids
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 Позиции и цены", callback_data=f"price:v:{callback_id}:0")],
-        [InlineKeyboardButton(
-            text="✅ В подборке" if selected else "➕ Добавить в подборку",
-            callback_data=f"price:remove:{callback_id}" if selected else f"price:add:{callback_id}",
-        )],
-        [InlineKeyboardButton(text="⬅️ К результатам поиска", callback_data="price:back")],
-        [InlineKeyboardButton(text="🔎 Новый поиск", callback_data="main:prices")],
-        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")],
+        [
+            InlineKeyboardButton(text="📋 Позиции", callback_data=f"price:v:{callback_id}:0"),
+            InlineKeyboardButton(
+                text="✅ В подборке" if selected else "➕ В подборку",
+                callback_data=f"price:remove:{callback_id}" if selected else f"price:add:{callback_id}",
+            ),
+        ],
+        compact_nav("price:back", search_data="main:prices"),
     ])
     text = format_price_group(details)
     if len(text) <= 4000:
@@ -1717,9 +1727,7 @@ async def show_price_item(callback: CallbackQuery) -> None:
         await callback.answer("Прайс обновился. Выполните поиск ещё раз.", show_alert=True)
         return
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ К найденным позициям", callback_data="price:item_back")],
-        [InlineKeyboardButton(text="🔎 Новый поиск", callback_data="main:prices")],
-        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")],
+        compact_nav("price:item_back", search_data="main:prices"),
     ])
     await callback.message.edit_text(format_price_item(item), reply_markup=keyboard)
     await callback.answer()
@@ -1781,14 +1789,13 @@ def price_cart_keyboard(selected_ids: list[int]) -> InlineKeyboardMarkup:
     ]
     if rows:
         rows.extend([
-            [InlineKeyboardButton(text="📄 Сформировать базовый прайс", callback_data="price:export:0")],
-            [InlineKeyboardButton(text="📄 Сформировать прайс −10%", callback_data="price:export:10")],
+            [
+                InlineKeyboardButton(text="📄 Базовый", callback_data="price:export:0"),
+                InlineKeyboardButton(text="📄 Скидка −10%", callback_data="price:export:10"),
+            ],
             [InlineKeyboardButton(text="🗑 Очистить подборку", callback_data="price:cart_clear")],
         ])
-    rows.extend([
-        [InlineKeyboardButton(text="⬅️ К результатам поиска", callback_data="price:back")],
-        [InlineKeyboardButton(text="🔎 Новый поиск", callback_data="main:prices")],
-    ])
+    rows.append(compact_nav("price:back", search_data="main:prices"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1905,12 +1912,14 @@ def products_keyboard(admin: bool = False) -> InlineKeyboardMarkup:
         prefix = "adm:p" if admin else "db:p"
         rows.append([InlineKeyboardButton(text=text, callback_data=f"{prefix}:{product.id}")])
     if admin:
-        rows.append([InlineKeyboardButton(text="➕ Добавить товар", callback_data="adm:add_product")])
-        rows.append([InlineKeyboardButton(text="💰 Обновить прайсы", callback_data="adm:prices")])
-        rows.append([InlineKeyboardButton(text="👥 Белый список", callback_data="adm:access")])
-        rows.append([InlineKeyboardButton(text="📊 Обновить Excel", callback_data="adm:excel")])
+        rows.extend(button_grid([
+            InlineKeyboardButton(text="➕ Товар", callback_data="adm:add_product"),
+            InlineKeyboardButton(text="💰 Прайсы", callback_data="adm:prices"),
+            InlineKeyboardButton(text="👥 Доступ", callback_data="adm:access"),
+            InlineKeyboardButton(text="📊 Excel", callback_data="adm:excel"),
+        ]))
         rows.append([InlineKeyboardButton(text="💾 Скачать резервную копию", callback_data="adm:backup")])
-    rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")])
+    rows.append(compact_nav())
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1935,7 +1944,7 @@ async def open_product(callback: CallbackQuery) -> None:
         return
     sections = materials_db.list_sections(product.id)
     rows = [[InlineKeyboardButton(text=s.name, callback_data=f"db:s:{s.id}")] for s in sections]
-    rows.append([InlineKeyboardButton(text="⬅️ К товарам", callback_data="main:database")])
+    rows.append(compact_nav("main:database"))
     text = (
         f"📦 <b>{html.escape(product.name)}</b>\n\nВыберите нужный раздел:"
         if sections
@@ -2131,8 +2140,10 @@ async def receive_excel(message: Message, state: FSMContext, bot: Bot) -> None:
         "Применить эту таблицу? Текущая версия будет сохранена в резервную копию.",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Применить", callback_data="adm:apply_excel")],
-                [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:cancel_excel")],
+                [
+                    InlineKeyboardButton(text="✅ Применить", callback_data="adm:apply_excel"),
+                    InlineKeyboardButton(text="❌ Отмена", callback_data="adm:cancel_excel"),
+                ],
             ]
         ),
     )
@@ -2199,16 +2210,15 @@ async def cancel_excel(callback: CallbackQuery, state: FSMContext) -> None:
 
 def price_admin_keyboard() -> InlineKeyboardMarkup:
     statuses = prices_db.import_statuses()
-    rows = []
+    buttons = []
     for warehouse in ("center", "west", "ural"):
         marker = "✅" if warehouse in statuses else "➕"
-        rows.append([
-            InlineKeyboardButton(
+        buttons.append(InlineKeyboardButton(
                 text=f"{marker} {WAREHOUSES[warehouse]}",
                 callback_data=f"adm:price_wh:{warehouse}",
-            )
-        ])
-    rows.append([InlineKeyboardButton(text="⬅️ К управлению", callback_data="main:admin")])
+            ))
+    rows = button_grid(buttons)
+    rows.append(compact_nav("main:admin"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -2312,8 +2322,10 @@ async def receive_price_file(message: Message, state: FSMContext, bot: Bot) -> N
         f"Позиций с пометкой «АКЦИЯ»: <b>{parsed.action_count}</b>\n\n"
         "Применить этот прайс? Предыдущая версия выбранного склада будет сохранена.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Применить", callback_data="adm:apply_price")],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:cancel_price")],
+            [
+                InlineKeyboardButton(text="✅ Применить", callback_data="adm:apply_price"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data="adm:cancel_price"),
+            ],
         ]),
     )
 
@@ -2388,8 +2400,11 @@ async def apply_price(callback: CallbackQuery, state: FSMContext, bot: Bot) -> N
             "✅ <b>Прайс обновлён</b>\n\n" + format_price_report(report) + wait_note,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="📥 Скачать подробный Excel", callback_data=f"reports:file:{warehouse}")],
-                [InlineKeyboardButton(text="📊 К изменениям прайсов", callback_data="main:price_reports")],
-                [InlineKeyboardButton(text="💰 К управлению прайсами", callback_data="adm:prices")],
+                [
+                    InlineKeyboardButton(text="📊 Изменения", callback_data="main:price_reports"),
+                    InlineKeyboardButton(text="💰 Прайсы", callback_data="adm:prices"),
+                ],
+                compact_nav(),
             ]),
         )
     else:
@@ -2453,7 +2468,7 @@ def access_keyboard() -> InlineKeyboardMarkup:
     ]
     rows.extend([
         [InlineKeyboardButton(text="➕ Добавить пользователя", callback_data="adm:add_access")],
-        [InlineKeyboardButton(text="⬅️ К управлению", callback_data="main:admin")],
+        compact_nav("main:admin"),
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -2489,7 +2504,7 @@ async def manage_access_user(callback: CallbackQuery) -> None:
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=f"🔑 {role_text}", callback_data=f"adm:set_role:{access_id}:{next_role}")],
             [InlineKeyboardButton(text="🗑 Закрыть доступ", callback_data=f"adm:confirm_access:{access_id}")],
-            [InlineKeyboardButton(text="⬅️ К белому списку", callback_data="adm:access")],
+            compact_nav("adm:access"),
         ]),
     )
     await callback.answer()
@@ -2606,11 +2621,15 @@ def admin_product_keyboard(product_id: int) -> InlineKeyboardMarkup:
     sections = materials_db.list_sections(product_id)
     rows = [[InlineKeyboardButton(text=f"📁 {s.name}", callback_data=f"adm:s:{s.id}")] for s in sections]
     rows.extend([
-        [InlineKeyboardButton(text="➕ Добавить раздел", callback_data=f"adm:add_section:{product_id}")],
-        [InlineKeyboardButton(text="✏️ Переименовать", callback_data=f"adm:rename_product:{product_id}")],
-        [InlineKeyboardButton(text="🙈 Скрыть" if product and product.is_visible else "👁 Показать", callback_data=f"adm:toggle_product:{product_id}")],
-        [InlineKeyboardButton(text="🗑 Удалить товар", callback_data=f"adm:confirm_product:{product_id}")],
-        [InlineKeyboardButton(text="⬅️ К управлению", callback_data="main:admin")],
+        [
+            InlineKeyboardButton(text="➕ Раздел", callback_data=f"adm:add_section:{product_id}"),
+            InlineKeyboardButton(text="✏️ Название", callback_data=f"adm:rename_product:{product_id}"),
+        ],
+        [
+            InlineKeyboardButton(text="🙈 Скрыть" if product and product.is_visible else "👁 Показать", callback_data=f"adm:toggle_product:{product_id}"),
+            InlineKeyboardButton(text="🗑 Удалить", callback_data=f"adm:confirm_product:{product_id}"),
+        ],
+        compact_nav("main:admin"),
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -2674,11 +2693,15 @@ def admin_section_keyboard(section_id: int) -> InlineKeyboardMarkup:
     items = materials_db.list_materials(section_id)
     rows = [[InlineKeyboardButton(text=material_title(m, i), callback_data=f"adm:confirm_material:{m.id}")] for i, m in enumerate(items, 1)]
     rows.extend([
-        [InlineKeyboardButton(text="➕ Добавить материалы", callback_data=f"adm:add_material:{section_id}")],
-        [InlineKeyboardButton(text="👁 Просмотреть", callback_data=f"adm:preview:{section_id}")],
-        [InlineKeyboardButton(text="✏️ Переименовать", callback_data=f"adm:rename_section:{section_id}")],
-        [InlineKeyboardButton(text="🗑 Удалить раздел", callback_data=f"adm:confirm_section:{section_id}")],
-        [InlineKeyboardButton(text="⬅️ К товару", callback_data=f"adm:p:{section.product_id}")],
+        [
+            InlineKeyboardButton(text="➕ Материалы", callback_data=f"adm:add_material:{section_id}"),
+            InlineKeyboardButton(text="👁 Просмотреть", callback_data=f"adm:preview:{section_id}"),
+        ],
+        [
+            InlineKeyboardButton(text="✏️ Название", callback_data=f"adm:rename_section:{section_id}"),
+            InlineKeyboardButton(text="🗑 Удалить", callback_data=f"adm:confirm_section:{section_id}"),
+        ],
+        compact_nav(f"adm:p:{section.product_id}"),
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -2701,8 +2724,10 @@ async def admin_section(callback: CallbackQuery) -> None:
 
 def upload_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Завершить", callback_data="adm:finish_upload")],
-        [InlineKeyboardButton(text="❌ Отменить", callback_data="main:admin")],
+        [
+            InlineKeyboardButton(text="✅ Завершить", callback_data="adm:finish_upload"),
+            InlineKeyboardButton(text="❌ Отменить", callback_data="main:admin"),
+        ],
     ])
 
 
@@ -2818,8 +2843,10 @@ async def toggle_product(callback: CallbackQuery) -> None:
 
 def confirm_keyboard(yes_data: str, back_data: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Да, удалить", callback_data=yes_data)],
-        [InlineKeyboardButton(text="Отмена", callback_data=back_data)],
+        [
+            InlineKeyboardButton(text="✅ Да", callback_data=yes_data),
+            InlineKeyboardButton(text="❌ Нет", callback_data=back_data),
+        ],
     ])
 
 
