@@ -407,7 +407,8 @@ class PricesDB:
             return None
         with closing(self._connect()) as connection:
             rows = connection.execute(
-                """SELECT g.merge_key, g.display_name, i.code, i.name, i.cash, i.cashless
+                """SELECT g.merge_key, g.display_name, g.category_name,
+                          i.code, i.name, i.cash, i.cashless
                    FROM price_items i JOIN price_groups g ON g.id = i.group_id
                    WHERE g.warehouse = ?""",
                 (warehouse,),
@@ -421,7 +422,8 @@ class PricesDB:
             key = identity(row["code"] or "", row["name"], row["merge_key"])
             old_items[key] = {
                 "code": row["code"] or "", "name": row["name"],
-                "group": row["display_name"], "merge_key": row["merge_key"],
+                "group": row["display_name"], "category": row["category_name"],
+                "merge_key": row["merge_key"],
                 "cash": row["cash"], "cashless": row["cashless"],
             }
         new_items = {}
@@ -430,7 +432,8 @@ class PricesDB:
                 key = identity(item.code, item.name, group.merge_key)
                 new_items[key] = {
                     "code": item.code, "name": item.name,
-                    "group": group.display_name, "merge_key": group.merge_key,
+                    "group": group.display_name, "category": group.category_name,
+                    "merge_key": group.merge_key,
                     "cash": str(item.cash), "cashless": str(item.cashless),
                 }
 
@@ -443,7 +446,7 @@ class PricesDB:
                 continue
             price_changes.append({
                 "code": new["code"] or old["code"], "name": new["name"],
-                "group": new["group"],
+                "group": new["group"], "category": new.get("category", ""),
                 "old_cash": old["cash"], "new_cash": new["cash"],
                 "old_cashless": old["cashless"], "new_cashless": new["cashless"],
             })

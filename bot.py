@@ -324,7 +324,14 @@ async def add_wait_from_client_chat(message: Message) -> None:
             "<code>/wait картридж Vaporesso XROS 0.6 2мл</code>"
         )
         return
-    query = parts[1].strip()
+    query, separator, explicit_comment = parts[1].partition("|")
+    query = query.strip()
+    comment = explicit_comment.strip() if separator else ""
+    if not comment and message.reply_to_message:
+        comment = (message.reply_to_message.text or message.reply_to_message.caption or "").strip()
+    if len(query) < 2:
+        await message.reply("После команды укажите название ожидаемого товара.")
+        return
     if len(query) > 200:
         await message.reply("Описание слишком длинное. Оставьте бренд, модель и важные характеристики.")
         return
@@ -332,12 +339,13 @@ async def add_wait_from_client_chat(message: Message) -> None:
     materials_db.upsert_client_chat(message.chat.id, title, message.chat.type, True)
     entry = materials_db.add_wait_entry(
         message.chat.id, title, message.from_user.id, message.from_user.full_name, query,
-        message.message_id,
+        message.message_id, comment[:500],
     )
     await message.reply(
         "🔔 <b>Запрос зафиксирован</b>\n\n"
         f"Ожидаем: <b>{html.escape(entry.query)}</b>\n"
-        "Когда подходящая позиция появится в новом прайсе, я сообщу ответственному менеджеру лично."
+        + (f"Комментарий: {html.escape(entry.comment)}\n" if entry.comment else "")
+        + "Когда подходящая позиция появится в новом прайсе, я сообщу ответственному менеджеру лично."
     )
 
 
@@ -723,23 +731,39 @@ def wait_match_score(query: str, group_name: str, item_name: str) -> float:
     return sum(scores) / len(scores)
 
 
-async def notify_waitlist_matches(bot: Bot, report: dict | None) -> int:
-    if not report or not report.get("added"):
+async def notify_waitlist_matches(bot: Bot, reports: dict[str, dict] | None) -> int:
+    """Send one combined waitlist notification after all three daily price updates."""
+    if not reports:
+        return 0
+    arrivals = []
+    for warehouse in ("center", "west", "ural"):
+        for item in reports[warehouse].get("added", []):
+            arrivals.append((warehouse, item))
+    if not arrivals:
         return 0
     sent = 0
-    warehouse = report["warehouse"]
     for entry in materials_db.list_wait_entries(active_only=True):
-        candidates = []
-        for item in report["added"]:
-            score = wait_match_score(entry.query, item["group"], item["name"])
-            if score:
-                candidates.append((score, item))
-        if not candidates:
+        matches = {}
+        for warehouse, item in arrivals:
+            search_group = f"{item.get('category', '')} {item['group']}"
+            score = wait_match_score(entry.query, search_group, item["name"])
+            if not score:
+                continue
+            signature = normalize_price_text(item["name"])
+            if materials_db.wait_match_seen(entry.id, signature):
+                continue
+            match = matches.setdefault(signature, {
+                "name": item["name"], "group": item["group"], "score": score,
+                "warehouses": {},
+            })
+            match["score"] = max(match["score"], score)
+            match["warehouses"][warehouse] = (Decimal(item["cash"]), Decimal(item["cashless"]))
+        if not matches:
             continue
-        _, item = max(candidates, key=lambda value: value[0])
-        signature = normalize_price_text(item["name"])
-        if materials_db.wait_match_seen(entry.id, signature):
-            continue
+        group_wait = not any(char.isdigit() for char in normalize_price_text(entry.query))
+        selected = sorted(matches.items(), key=lambda value: (-value[1]["score"], value[1]["name"]))
+        if not group_wait:
+            selected = selected[:1]
         buttons = []
         chat_id_text = str(entry.chat_id)
         if chat_id_text.startswith("-100") and entry.source_message_id:
@@ -753,24 +777,50 @@ async def notify_waitlist_matches(bot: Bot, report: dict | None) -> int:
             [InlineKeyboardButton(text="⏳ Оставить в ожидании", callback_data=f"wait:keep:{entry.id}")],
         ])
         keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+        heading = (
+            "🔔 <b>Поступила ожидаемая группа товаров</b>"
+            if group_wait else "🔔 <b>Возможно, приехал ожидаемый товар</b>"
+        )
+        lines = [
+            heading, "", f"Клиент: <b>{html.escape(entry.client_title)}</b>",
+            f"Ожидали: <b>{html.escape(entry.query)}</b>",
+        ]
+        if entry.comment:
+            lines.append(f"Комментарий: {html.escape(entry.comment)}")
+        lines.extend(["", f"Новых подходящих позиций: <b>{len(selected)}</b>"])
+        for number, (_, item) in enumerate(selected[:10], 1):
+            warehouses = " · ".join(
+                WAREHOUSES[key] for key in ("center", "west", "ural") if key in item["warehouses"]
+            )
+            price_pairs = set(item["warehouses"].values())
+            price = ""
+            if len(price_pairs) == 1:
+                cash, cashless = next(iter(price_pairs))
+                price = f"\nНал {money(cash)} ₽ · безнал {money(cashless)} ₽"
+            else:
+                price = "".join(
+                    f"\n{WAREHOUSES[key]}: нал {money(values[0])} ₽ · безнал {money(values[1])} ₽"
+                    for key, values in item["warehouses"].items()
+                )
+            lines.extend([
+                "",
+                f"<b>{number}.</b> {html.escape(item['name'])}",
+                f"📍 {html.escape(warehouses)}{price}",
+            ])
+        if len(selected) > 10:
+            lines.extend(["", f"И ещё позиций: <b>{len(selected) - 10}</b>"])
+        lines.extend(["", "Проверьте поступление и свяжитесь с клиентом."])
         try:
             await bot.send_message(
                 entry.manager_id,
-                "🔔 <b>Возможно, приехал ожидаемый товар</b>\n\n"
-                f"Клиент: <b>{html.escape(entry.client_title)}</b>\n"
-                f"Ожидали: <b>{html.escape(entry.query)}</b>\n\n"
-                f"Найдено: <b>{html.escape(item['name'])}</b>\n"
-                f"Группа: {html.escape(item['group'])}\n"
-                f"Склад: <b>{WAREHOUSES[warehouse]}</b>\n"
-                f"Нал: <b>{money(Decimal(item['cash']))} ₽</b> · "
-                f"безнал: <b>{money(Decimal(item['cashless']))} ₽</b>\n\n"
-                "Проверьте позицию и свяжитесь с клиентом.",
+                "\n".join(lines),
                 reply_markup=keyboard,
             )
         except Exception:
             logging.exception("Не удалось уведомить менеджера %s об ожидании %s", entry.manager_id, entry.id)
             continue
-        materials_db.record_wait_match(entry.id, signature)
+        for signature, _ in selected:
+            materials_db.record_wait_match(entry.id, signature)
         sent += 1
     return sent
 
@@ -798,12 +848,16 @@ def waitlist_text(user_id: int) -> str:
     blocks = ["🔔 <b>Мой лист ожидания</b>"]
     for number, entry in enumerate(shown, 1):
         query = f"{entry.query[:100]}{'…' if len(entry.query) > 100 else ''}"
-        blocks.append(f"<b>{number}. {html.escape(entry.client_title)}</b>\n{html.escape(query)}")
+        comment = f"\n💬 {html.escape(entry.comment[:100])}" if entry.comment else ""
+        blocks.append(
+            f"<b>{number}. {html.escape(entry.client_title)}</b>\n{html.escape(query)}{comment}"
+        )
     if len(entries) > len(shown):
         blocks.append(f"Показаны последние {len(shown)} из {len(entries)} запросов.")
     blocks.append(
         "Чтобы добавить запрос, напишите в нужном клиентском чате:\n"
-        "<code>/wait название товара</code>"
+        "<code>/wait название товара</code>\n\n"
+        "Комментарий можно добавить после символа <code>|</code> или ответить командой на сообщение клиента."
     )
     return "\n\n".join(blocks)
 
@@ -2319,7 +2373,8 @@ async def apply_price(callback: CallbackQuery, state: FSMContext, bot: Bot) -> N
         price_updates_in_progress.discard(warehouse)
     await state.clear()
     try:
-        wait_matches = await notify_waitlist_matches(bot, report)
+        combined_reports, _ = combined_report_bundle()
+        wait_matches = await notify_waitlist_matches(bot, combined_reports)
     except Exception:
         logging.exception("Не удалось проверить лист ожидания после обновления прайса")
         wait_matches = 0

@@ -1,3 +1,4 @@
+import asyncio
 from decimal import Decimal
 
 from openpyxl import Workbook, load_workbook
@@ -23,6 +24,8 @@ from prices_db import (
     generate_selected_price,
     parse_price_file,
 )
+from materials_db import MaterialsDB
+import bot as bot_module
 
 
 def make_price(path, suffix="", include_action=True):
@@ -188,6 +191,45 @@ def test_waitlist_matching_requires_exact_numeric_characteristics():
     assert wait_match_score("картридж xros 0.6 2мл", "Vaporesso Расходники", name) > 0.8
     assert wait_match_score("xros 0.8 2мл", "Vaporesso Расходники", name) == 0
     assert wait_match_score("xros 0.6 3мл", "Vaporesso Расходники", name) == 0
+    assert wait_match_score("картриджи xros", "Vaporesso Расходники", name) > 0.8
+    assert wait_match_score("жидкости OGGO", "Жидкости OGGO VLIQ", "OGGO VLIQ Манго") > 0.8
+
+
+def test_group_wait_sends_one_combined_notification(tmp_path):
+    database = MaterialsDB(tmp_path / "materials.sqlite3")
+    database.add_wait_entry(-100123, "Клиент", 101, "Андрей", "жидкости OGGO", 55, "Нужна коробка")
+    previous = getattr(bot_module, "materials_db", None)
+    bot_module.materials_db = database
+
+    class FakeBot:
+        def __init__(self):
+            self.messages = []
+
+        async def send_message(self, chat_id, text, reply_markup=None):
+            self.messages.append((chat_id, text, reply_markup))
+
+    item = lambda name: {
+        "name": name, "group": "OGGO VLIQ", "category": "Жидкости",
+        "cash": "235", "cashless": "259",
+    }
+    reports = {
+        "center": {"added": [item("OGGO VLIQ Манго"), item("OGGO VLIQ Арбуз")]},
+        "west": {"added": [item("OGGO VLIQ Манго")]},
+        "ural": {"added": []},
+    }
+    fake = FakeBot()
+    try:
+        assert asyncio.run(bot_module.notify_waitlist_matches(fake, reports)) == 1
+        assert len(fake.messages) == 1
+        assert "Новых подходящих позиций: <b>2</b>" in fake.messages[0][1]
+        assert "Москва · Санкт-Петербург" in fake.messages[0][1]
+        assert "Нужна коробка" in fake.messages[0][1]
+        assert asyncio.run(bot_module.notify_waitlist_matches(fake, reports)) == 0
+    finally:
+        if previous is None:
+            del bot_module.materials_db
+        else:
+            bot_module.materials_db = previous
 
 
 def test_selected_price_contains_only_chosen_groups_and_discount(tmp_path):

@@ -55,6 +55,7 @@ class WaitEntry:
     query: str
     status: str
     source_message_id: int | None
+    comment: str
 
 
 class MaterialsDB:
@@ -125,6 +126,7 @@ class MaterialsDB:
                     manager_name TEXT NOT NULL,
                     query TEXT NOT NULL,
                     source_message_id INTEGER,
+                    comment TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'closed')),
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     closed_at TEXT
@@ -147,6 +149,8 @@ class MaterialsDB:
             wait_columns = {row[1] for row in connection.execute("PRAGMA table_info(wait_entries)")}
             if "source_message_id" not in wait_columns:
                 connection.execute("ALTER TABLE wait_entries ADD COLUMN source_message_id INTEGER")
+            if "comment" not in wait_columns:
+                connection.execute("ALTER TABLE wait_entries ADD COLUMN comment TEXT NOT NULL DEFAULT ''")
 
     def add_access_user(self, value: str) -> AccessUser:
         value = value.strip()
@@ -258,26 +262,56 @@ class MaterialsDB:
 
     def add_wait_entry(
         self, chat_id: int, client_title: str, manager_id: int, manager_name: str, query: str,
-        source_message_id: int | None = None,
+        source_message_id: int | None = None, comment: str = "",
     ) -> WaitEntry:
         query = query.strip()
         if len(query) < 2:
             raise ValueError("Название товара слишком короткое.")
         with self._connect() as connection:
-            cursor = connection.execute(
-                """INSERT INTO wait_entries(
-                       chat_id, client_title, manager_id, manager_name, query, source_message_id
-                   ) VALUES (?, ?, ?, ?, ?, ?)""",
-                (chat_id, client_title.strip() or str(chat_id), manager_id, manager_name, query, source_message_id),
+            active_rows = connection.execute(
+                """SELECT id, query FROM wait_entries
+                   WHERE chat_id = ? AND manager_id = ? AND status = 'active'""",
+                (chat_id, manager_id),
+            ).fetchall()
+            normalized_query = " ".join(query.casefold().replace("ё", "е").split())
+            existing = next(
+                (
+                    row for row in active_rows
+                    if " ".join(row["query"].casefold().replace("ё", "е").split()) == normalized_query
+                ),
+                None,
             )
-            wait_id = cursor.lastrowid
+            if existing:
+                wait_id = existing["id"]
+                connection.execute(
+                    """UPDATE wait_entries SET client_title = ?, manager_name = ?,
+                           source_message_id = COALESCE(?, source_message_id),
+                           comment = CASE WHEN ? <> '' THEN ? ELSE comment END
+                       WHERE id = ?""",
+                    (
+                        client_title.strip() or str(chat_id), manager_name, source_message_id,
+                        comment.strip(), comment.strip(), wait_id,
+                    ),
+                )
+            else:
+                cursor = connection.execute(
+                    """INSERT INTO wait_entries(
+                           chat_id, client_title, manager_id, manager_name, query, source_message_id, comment
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        chat_id, client_title.strip() or str(chat_id), manager_id, manager_name,
+                        query, source_message_id, comment.strip(),
+                    ),
+                )
+                wait_id = cursor.lastrowid
             connection.commit()
         return self.get_wait_entry(wait_id)
 
     def get_wait_entry(self, wait_id: int) -> WaitEntry | None:
         with self._connect() as connection:
             row = connection.execute(
-                """SELECT id, chat_id, client_title, manager_id, manager_name, query, status, source_message_id
+                """SELECT id, chat_id, client_title, manager_id, manager_name, query, status,
+                          source_message_id, comment
                    FROM wait_entries WHERE id = ?""",
                 (wait_id,),
             ).fetchone()
@@ -293,7 +327,8 @@ class MaterialsDB:
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         with self._connect() as connection:
             rows = connection.execute(
-                f"""SELECT id, chat_id, client_title, manager_id, manager_name, query, status, source_message_id
+                f"""SELECT id, chat_id, client_title, manager_id, manager_name, query, status,
+                           source_message_id, comment
                     FROM wait_entries {where} ORDER BY created_at DESC, id DESC""",
                 values,
             ).fetchall()
@@ -356,6 +391,7 @@ class MaterialsDB:
         return WaitEntry(
             row["id"], row["chat_id"], row["client_title"], row["manager_id"],
             row["manager_name"], row["query"], row["status"], row["source_message_id"],
+            row["comment"],
         )
 
     def backup_to(self, destination: Path) -> None:
