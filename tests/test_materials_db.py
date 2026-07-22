@@ -67,3 +67,41 @@ def test_access_by_id_and_username_binding(tmp_path):
 
     db.delete_access_user(by_id.id)
     assert db.authorize_user(123456789, None) is False
+
+
+def test_roles_chat_registry_and_settings(tmp_path):
+    db = MaterialsDB(tmp_path / "materials.sqlite3")
+    user = db.add_access_user("123456789")
+    assert db.user_role(123456789) == "user"
+    db.set_access_role(user.id, "junior_admin")
+    assert db.user_role(123456789) == "junior_admin"
+
+    db.upsert_client_chat(-100123, "Клиентский чат", "supergroup", True)
+    assert db.get_client_chat(-100123).title == "Клиентский чат"
+    assert db.list_client_chats(active_only=True)[0].chat_id == -100123
+    db.upsert_client_chat(-100123, "Новое название", "supergroup", False)
+    assert db.list_client_chats(active_only=True) == []
+    assert db.get_client_chat(-100123).is_active is False
+
+    db.set_setting("service_chat_id", "-100123")
+    assert db.get_setting("service_chat_id") == "-100123"
+
+
+def test_existing_access_table_gets_role_migration(tmp_path):
+    path = tmp_path / "old.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """CREATE TABLE access_users (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               telegram_id INTEGER UNIQUE,
+               username TEXT UNIQUE,
+               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+               CHECK(telegram_id IS NOT NULL OR username IS NOT NULL)
+           )"""
+    )
+    connection.execute("INSERT INTO access_users(telegram_id) VALUES (123456789)")
+    connection.commit()
+    connection.close()
+
+    db = MaterialsDB(path)
+    assert db.user_role(123456789) == "user"

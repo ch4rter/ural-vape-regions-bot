@@ -34,6 +34,15 @@ class AccessUser:
     id: int
     telegram_id: int | None
     username: str | None
+    role: str = "user"
+
+
+@dataclass(frozen=True)
+class ClientChat:
+    chat_id: int
+    title: str
+    chat_type: str
+    is_active: bool
 
 
 class MaterialsDB:
@@ -85,8 +94,22 @@ class MaterialsDB:
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     CHECK(telegram_id IS NOT NULL OR username IS NOT NULL)
                 );
+                CREATE TABLE IF NOT EXISTS client_chats (
+                    chat_id INTEGER PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    chat_type TEXT NOT NULL,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
                 """
             )
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(access_users)")}
+            if "role" not in columns:
+                connection.execute("ALTER TABLE access_users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
 
     def add_access_user(self, value: str) -> AccessUser:
         value = value.strip()
@@ -112,14 +135,14 @@ class MaterialsDB:
     def get_access_user(self, access_id: int) -> AccessUser | None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT id, telegram_id, username FROM access_users WHERE id = ?", (access_id,)
+                "SELECT id, telegram_id, username, role FROM access_users WHERE id = ?", (access_id,)
             ).fetchone()
         return self._access_user(row) if row else None
 
     def list_access_users(self) -> list[AccessUser]:
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT id, telegram_id, username FROM access_users ORDER BY created_at, id"
+                "SELECT id, telegram_id, username, role FROM access_users ORDER BY created_at, id"
             ).fetchall()
         return [self._access_user(row) for row in rows]
 
@@ -155,9 +178,62 @@ class MaterialsDB:
                 return False
             return True
 
+    def user_role(self, telegram_id: int, username: str | None = None) -> str | None:
+        if not self.authorize_user(telegram_id, username):
+            return None
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT role FROM access_users WHERE telegram_id = ?", (telegram_id,)
+            ).fetchone()
+        return row["role"] if row else None
+
+    def set_access_role(self, access_id: int, role: str) -> None:
+        if role not in {"user", "junior_admin"}:
+            raise ValueError("Неизвестная роль пользователя.")
+        with self._connect() as connection:
+            connection.execute("UPDATE access_users SET role = ? WHERE id = ?", (role, access_id))
+
+    def upsert_client_chat(self, chat_id: int, title: str, chat_type: str, is_active: bool = True) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO client_chats(chat_id, title, chat_type, is_active, updated_at)
+                   VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,
+                       chat_type=excluded.chat_type, is_active=excluded.is_active,
+                       updated_at=CURRENT_TIMESTAMP""",
+                (chat_id, title.strip() or str(chat_id), chat_type, int(is_active)),
+            )
+
+    def list_client_chats(self, active_only: bool = False) -> list[ClientChat]:
+        where = "WHERE is_active = 1" if active_only else ""
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT chat_id, title, chat_type, is_active FROM client_chats {where} ORDER BY title"
+            ).fetchall()
+        return [ClientChat(row["chat_id"], row["title"], row["chat_type"], bool(row["is_active"])) for row in rows]
+
+    def get_client_chat(self, chat_id: int) -> ClientChat | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT chat_id, title, chat_type, is_active FROM client_chats WHERE chat_id = ?", (chat_id,)
+            ).fetchone()
+        return ClientChat(row["chat_id"], row["title"], row["chat_type"], bool(row["is_active"])) if row else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO settings(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
+
+    def get_setting(self, key: str) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+
     @staticmethod
     def _access_user(row: sqlite3.Row) -> AccessUser:
-        return AccessUser(row["id"], row["telegram_id"], row["username"])
+        return AccessUser(row["id"], row["telegram_id"], row["username"], row["role"])
 
     def backup_to(self, destination: Path) -> None:
         """Create a consistent SQLite backup, including pending WAL changes."""

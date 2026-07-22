@@ -22,9 +22,9 @@ from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, ChatMemberUpdated, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dotenv import load_dotenv
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 
 from materials_db import Material, MaterialsDB
 from prices_db import (
@@ -53,6 +53,7 @@ active_excel_path: Path
 managed_excel_path: Path
 price_storage_path: Path
 price_updates_in_progress: set[str] = set()
+broadcasts_in_progress: set[int] = set()
 
 MANAGER_LINKS = {
     "валера": "uvvalera",
@@ -80,6 +81,12 @@ class AdminState(StatesGroup):
     access_user = State()
 
 
+class BroadcastState(StatesGroup):
+    audience_upload = State()
+    content_upload = State()
+    ready = State()
+
+
 class AccessMiddleware(BaseMiddleware):
     async def __call__(
         self,
@@ -88,6 +95,10 @@ class AccessMiddleware(BaseMiddleware):
         data: dict[str, Any],
     ) -> Any:
         user = event.from_user
+        if getattr(event, "chat", None) and event.chat.type != "private":
+            return None
+        if isinstance(event, CallbackQuery) and event.message and event.message.chat.type != "private":
+            return None
         if not user or is_admin(user.id) or materials_db.authorize_user(user.id, user.username):
             return await handler(event, data)
         if isinstance(event, CallbackQuery):
@@ -220,6 +231,14 @@ def is_admin(user_id: int | None) -> bool:
     return user_id is not None and user_id in admin_ids
 
 
+def is_junior_admin(user_id: int | None, username: str | None = None) -> bool:
+    return bool(user_id and materials_db.user_role(user_id, username) == "junior_admin")
+
+
+def can_broadcast(user_id: int | None, username: str | None = None) -> bool:
+    return is_admin(user_id) or is_junior_admin(user_id, username)
+
+
 def main_menu(user_id: int | None) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="🔎 Поиск менеджера", callback_data="main:region")],
@@ -228,6 +247,8 @@ def main_menu(user_id: int | None) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📊 Изменения прайсов", callback_data="main:price_reports")],
         [InlineKeyboardButton(text="🗃 База данных", callback_data="main:database")],
     ]
+    if can_broadcast(user_id):
+        rows.append([InlineKeyboardButton(text="📣 Рассылки клиентам", callback_data="main:broadcasts")])
     if is_admin(user_id):
         rows.append([InlineKeyboardButton(text="⚙️ Управление базой", callback_data="main:admin")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -582,6 +603,325 @@ def downloadable_prices_keyboard() -> InlineKeyboardMarkup:
     ]
     rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.my_chat_member()
+async def track_client_chat(event: ChatMemberUpdated) -> None:
+    if event.chat.type not in {"group", "supergroup"}:
+        return
+    active = event.new_chat_member.status in {"member", "administrator", "creator"}
+    materials_db.upsert_client_chat(
+        event.chat.id, event.chat.title or str(event.chat.id), event.chat.type, active
+    )
+
+
+def broadcast_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="➕ Создать рассылку", callback_data="broadcast:new")],
+        [InlineKeyboardButton(text="📥 Выгрузить список чатов", callback_data="broadcast:export_chats")],
+    ]
+    if is_admin(user_id):
+        rows.append([InlineKeyboardButton(text="🧪 Выбрать служебный чат", callback_data="broadcast:service")])
+    rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def service_chat_text() -> str:
+    raw_id = materials_db.get_setting("service_chat_id")
+    chat = materials_db.get_client_chat(int(raw_id)) if raw_id else None
+    return chat.title if chat else "не выбран"
+
+
+@router.callback_query(F.data == "main:broadcasts")
+async def open_broadcasts(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_broadcaster(callback): return
+    await state.clear()
+    await callback.message.edit_text(
+        "📣 <b>Рассылки клиентам</b>\n\n"
+        f"Зарегистрировано чатов: <b>{len(materials_db.list_client_chats())}</b>\n"
+        f"Служебный чат: <b>{html.escape(service_chat_text())}</b>\n\n"
+        "Аудитория каждой рассылки определяется новым Excel-файлом с колонкой Chat ID.",
+        reply_markup=broadcast_menu_keyboard(callback.from_user.id),
+    )
+    await callback.answer()
+
+
+def build_chats_excel(destination: Path) -> None:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Чаты"
+    sheet.append(["Название чата", "Chat ID", "Статус"])
+    for chat in materials_db.list_client_chats():
+        sheet.append([chat.title, chat.chat_id, "Активен" if chat.is_active else "Бот удалён"])
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = sheet.dimensions
+    sheet.column_dimensions["A"].width = 55
+    sheet.column_dimensions["B"].width = 24
+    sheet.column_dimensions["C"].width = 18
+    workbook.save(destination)
+    workbook.close()
+
+
+@router.callback_query(F.data == "broadcast:export_chats")
+async def export_client_chats(callback: CallbackQuery) -> None:
+    if not await require_broadcaster(callback): return
+    await callback.answer("Готовлю список…")
+    with tempfile.TemporaryDirectory() as temp_name:
+        destination = Path(temp_name) / "список клиентских чатов.xlsx"
+        await asyncio.to_thread(build_chats_excel, destination)
+        await callback.message.answer_document(
+            FSInputFile(destination, filename=destination.name),
+            caption=f"📥 Чатов в реестре: <b>{len(materials_db.list_client_chats())}</b>",
+        )
+
+
+@router.callback_query(F.data == "broadcast:service")
+async def select_service_chat(callback: CallbackQuery) -> None:
+    if not await require_admin(callback): return
+    chats = materials_db.list_client_chats(active_only=True)
+    rows = [[InlineKeyboardButton(
+        text=(chat.title[:55] + "…") if len(chat.title) > 56 else chat.title,
+        callback_data=f"broadcast:set_service:{chat.chat_id}",
+    )] for chat in chats[:90]]
+    rows.append([InlineKeyboardButton(text="⬅️ К рассылкам", callback_data="main:broadcasts")])
+    await callback.message.edit_text(
+        "🧪 <b>Служебный чат</b>\n\nВыберите группу для тестовой отправки:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("broadcast:set_service:"))
+async def save_service_chat(callback: CallbackQuery) -> None:
+    if not await require_admin(callback): return
+    chat_id = int(callback.data.rsplit(":", 1)[1])
+    chat = materials_db.get_client_chat(chat_id)
+    if not chat or not chat.is_active:
+        await callback.answer("Чат недоступен.", show_alert=True); return
+    materials_db.set_setting("service_chat_id", str(chat_id))
+    await callback.message.edit_text(
+        f"✅ Служебный чат выбран: <b>{html.escape(chat.title)}</b>",
+        reply_markup=broadcast_menu_keyboard(callback.from_user.id),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "broadcast:new")
+async def new_broadcast(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_broadcaster(callback): return
+    await state.clear()
+    await state.set_state(BroadcastState.audience_upload)
+    await callback.message.edit_text(
+        "📄 <b>Шаг 1 из 3 · Получатели</b>\n\n"
+        "Отправьте Excel-файл <code>.xlsx</code>. Бот найдёт колонку <b>Chat ID</b>, "
+        "удалит дубли и подготовит список получателей.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отменить", callback_data="main:broadcasts")]
+        ]),
+    )
+    await callback.answer()
+
+
+def parse_audience_excel(path: Path) -> tuple[list[int], int, int]:
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    sheet = workbook.active
+    rows = sheet.iter_rows(values_only=True)
+    header = next(rows, None)
+    if not header:
+        workbook.close(); raise ValueError("Excel-файл пуст.")
+    normalized = [normalize(str(value or "")) for value in header]
+    column = next((i for i, value in enumerate(normalized) if value in {"chat id", "чат id", "id чата"}), None)
+    if column is None:
+        workbook.close(); raise ValueError("Не найдена колонка Chat ID.")
+    values = []
+    invalid = 0
+    for row in rows:
+        raw = row[column] if len(row) > column else None
+        if raw is None or str(raw).strip() == "": continue
+        try:
+            chat_id = int(float(raw)) if isinstance(raw, float) else int(str(raw).strip())
+            if chat_id >= 0: raise ValueError
+            values.append(chat_id)
+        except (ValueError, TypeError):
+            invalid += 1
+    workbook.close()
+    unique = list(dict.fromkeys(values))
+    return unique, len(values) - len(unique), invalid
+
+
+@router.message(BroadcastState.audience_upload)
+async def receive_broadcast_audience(message: Message, state: FSMContext, bot: Bot) -> None:
+    if not can_broadcast(message.from_user.id, message.from_user.username): return
+    if not message.document or not (message.document.file_name or "").lower().endswith(".xlsx"):
+        await message.answer("⚠️ Отправьте документ в формате <code>.xlsx</code> с колонкой Chat ID."); return
+    with tempfile.TemporaryDirectory() as temp_name:
+        path = Path(temp_name) / "audience.xlsx"
+        await bot.download(message.document.file_id, destination=path)
+        try:
+            chat_ids, duplicates, invalid = await asyncio.to_thread(parse_audience_excel, path)
+        except Exception as error:
+            await message.answer(f"❌ Не удалось прочитать список: {html.escape(str(error))}"); return
+    if not chat_ids:
+        await message.answer("❌ В файле нет корректных отрицательных Chat ID групп."); return
+    registry = {chat.chat_id: chat for chat in materials_db.list_client_chats()}
+    inactive = sum(chat_id in registry and not registry[chat_id].is_active for chat_id in chat_ids)
+    unknown = sum(chat_id not in registry for chat_id in chat_ids)
+    await state.update_data(broadcast_chat_ids=chat_ids)
+    await state.set_state(BroadcastState.content_upload)
+    await message.answer(
+        "✅ <b>Список получателей подготовлен</b>\n\n"
+        f"Уникальных Chat ID: <b>{len(chat_ids)}</b>\n"
+        f"Удалено дублей: <b>{duplicates}</b>\n"
+        f"Некорректных строк: <b>{invalid}</b>\n"
+        f"Неизвестных боту чатов: <b>{unknown}</b>\n"
+        f"Отмечены недоступными: <b>{inactive}</b>\n\n"
+        "📨 <b>Шаг 2 из 3</b>\nОтправьте готовый пост: текст, фото, видео или документ с подписью.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отменить", callback_data="main:broadcasts")]
+        ]),
+    )
+
+
+@router.message(BroadcastState.content_upload)
+async def receive_broadcast_content(message: Message, state: FSMContext) -> None:
+    if not can_broadcast(message.from_user.id, message.from_user.username): return
+    if not (message.text or message.photo or message.video or message.document or message.animation):
+        await message.answer("⚠️ Поддерживаются текст, фото, видео, анимация или документ."); return
+    await state.update_data(source_chat_id=message.chat.id, source_message_id=message.message_id)
+    await state.set_state(BroadcastState.ready)
+    await message.answer("👁 <b>Предпросмотр поста:</b>")
+    await message.copy_to(message.chat.id)
+    await message.answer(
+        "🧪 <b>Шаг 3 из 3</b>\n\nСначала отправьте тест в служебную группу.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🧪 Отправить тест", callback_data="broadcast:test")],
+            [InlineKeyboardButton(text="✏️ Заменить пост", callback_data="broadcast:replace_content")],
+            [InlineKeyboardButton(text="❌ Отменить", callback_data="main:broadcasts")],
+        ]),
+    )
+
+
+@router.callback_query(F.data == "broadcast:replace_content")
+async def replace_broadcast_content(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_broadcaster(callback): return
+    await state.set_state(BroadcastState.content_upload)
+    await callback.message.edit_text("✏️ Отправьте новый вариант поста.")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "broadcast:test")
+async def test_broadcast(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    if not await require_broadcaster(callback): return
+    data = await state.get_data()
+    service_id = materials_db.get_setting("service_chat_id")
+    if not service_id:
+        await callback.answer("Главный администратор ещё не выбрал служебный чат.", show_alert=True); return
+    try:
+        await bot.copy_message(int(service_id), data["source_chat_id"], data["source_message_id"])
+    except Exception:
+        logging.exception("Не удалось отправить тест рассылки")
+        await callback.answer("Не удалось отправить тест. Проверьте доступ бота к служебной группе.", show_alert=True); return
+    await callback.message.edit_text(
+        "✅ <b>Тест отправлен в служебную группу</b>\n\n"
+        f"Получателей в Excel: <b>{len(data.get('broadcast_chat_ids', []))}</b>\n\n"
+        "Проверьте сообщение в группе и подтвердите массовую рассылку.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🚀 Начать рассылку", callback_data="broadcast:confirm_send")],
+            [InlineKeyboardButton(text="✏️ Заменить пост", callback_data="broadcast:replace_content")],
+            [InlineKeyboardButton(text="❌ Отменить", callback_data="main:broadcasts")],
+        ]),
+    )
+    await callback.answer()
+
+
+def build_broadcast_report(destination: Path, results: list[dict]) -> None:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Результат"
+    sheet.append(["Название чата", "Chat ID", "Результат", "Ошибка"])
+    for item in results:
+        sheet.append([item["title"], item["chat_id"], item["status"], item["error"]])
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = sheet.dimensions
+    for column, width in zip(("A", "B", "C", "D"), (55, 24, 18, 70)):
+        sheet.column_dimensions[column].width = width
+    workbook.save(destination)
+    workbook.close()
+
+
+@router.callback_query(F.data == "broadcast:confirm_send")
+async def run_client_broadcast(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    if not await require_broadcaster(callback): return
+    operator_id = callback.from_user.id
+    if operator_id in broadcasts_in_progress:
+        await callback.answer("Рассылка уже выполняется.", show_alert=True); return
+    data = await state.get_data()
+    chat_ids = data.get("broadcast_chat_ids", [])
+    source_chat_id = data.get("source_chat_id")
+    source_message_id = data.get("source_message_id")
+    if not chat_ids or not source_chat_id or not source_message_id:
+        await state.clear()
+        await callback.answer("Черновик рассылки устарел. Создайте его заново.", show_alert=True); return
+    broadcasts_in_progress.add(operator_id)
+    await callback.answer()
+    await callback.message.edit_text(
+        "⏳ <b>Рассылка запущена</b>\n\n"
+        f"Обработано: <b>0 из {len(chat_ids)}</b>\n"
+        "Не запускайте вторую рассылку до завершения этой."
+    )
+    registry = {chat.chat_id: chat for chat in materials_db.list_client_chats()}
+    results = []
+    sent = failed = 0
+    try:
+        for number, chat_id in enumerate(chat_ids, 1):
+            chat = registry.get(chat_id)
+            title = chat.title if chat else "Неизвестный чат"
+            if chat and not chat.is_active:
+                results.append({"title": title, "chat_id": chat_id, "status": "Пропущен", "error": "Бот удалён из чата"})
+                failed += 1
+            else:
+                try:
+                    await bot.copy_message(chat_id, source_chat_id, source_message_id)
+                    results.append({"title": title, "chat_id": chat_id, "status": "Отправлено", "error": ""})
+                    sent += 1
+                except TelegramRetryAfter as error:
+                    await asyncio.sleep(error.retry_after)
+                    try:
+                        await bot.copy_message(chat_id, source_chat_id, source_message_id)
+                        results.append({"title": title, "chat_id": chat_id, "status": "Отправлено", "error": ""})
+                        sent += 1
+                    except Exception as retry_error:
+                        results.append({"title": title, "chat_id": chat_id, "status": "Ошибка", "error": str(retry_error)[:500]})
+                        failed += 1
+                except Exception as error:
+                    results.append({"title": title, "chat_id": chat_id, "status": "Ошибка", "error": str(error)[:500]})
+                    failed += 1
+            if number % 20 == 0 and number < len(chat_ids):
+                await edit_or_answer(
+                    callback.message,
+                    "⏳ <b>Рассылка выполняется</b>\n\n"
+                    f"Обработано: <b>{number} из {len(chat_ids)}</b>\n"
+                    f"Успешно: <b>{sent}</b> · Ошибок: <b>{failed}</b>"
+                )
+            await asyncio.sleep(0.05)
+    finally:
+        broadcasts_in_progress.discard(operator_id)
+    await state.clear()
+    await edit_or_answer(
+        callback.message,
+        "✅ <b>Рассылка завершена</b>\n\n"
+        f"Всего чатов: <b>{len(chat_ids)}</b>\n"
+        f"Успешно отправлено: <b>{sent}</b>\n"
+        f"Ошибок и пропусков: <b>{failed}</b>\n\n"
+        "Подробности находятся в Excel-отчёте.",
+        reply_markup=broadcast_menu_keyboard(callback.from_user.id),
+    )
+    with tempfile.TemporaryDirectory() as temp_name:
+        destination = Path(temp_name) / f"отчёт рассылки {datetime.now().strftime('%Y-%m-%d_%H-%M')}.xlsx"
+        await asyncio.to_thread(build_broadcast_report, destination, results)
+        await callback.message.answer_document(
+            FSInputFile(destination, filename=destination.name), caption="📊 Подробный отчёт по рассылке"
+        )
 
 
 def combined_report_bundle() -> tuple[dict[str, dict] | None, str | None]:
@@ -1284,6 +1624,13 @@ async def require_admin(callback: CallbackQuery) -> bool:
     return False
 
 
+async def require_broadcaster(callback: CallbackQuery) -> bool:
+    if can_broadcast(callback.from_user.id, callback.from_user.username) and callback.message.chat.type == "private":
+        return True
+    await callback.answer("Раздел доступен администраторам рассылок.", show_alert=True)
+    return False
+
+
 async def cleanup_pending_excel(state: FSMContext) -> None:
     data = await state.get_data()
     for key in ("pending_excel", "pending_price"):
@@ -1713,15 +2060,16 @@ def access_user_label(user) -> str:
         parts.append(f"@{user.username}")
     if user.telegram_id:
         parts.append(f"ID {user.telegram_id}")
-    return " · ".join(parts)
+    role = "младший администратор" if user.role == "junior_admin" else "пользователь"
+    return f"{' · '.join(parts)} · {role}"
 
 
 def access_keyboard() -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton(
-                text=f"🗑 {access_user_label(user)}",
-                callback_data=f"adm:confirm_access:{user.id}",
+                text=f"👤 {access_user_label(user)}",
+                callback_data=f"adm:access_user:{user.id}",
             )
         ]
         for user in materials_db.list_access_users()
@@ -1744,9 +2092,38 @@ async def manage_access(callback: CallbackQuery, state: FSMContext) -> None:
         f"Пользователей с доступом: <b>{len(users)}</b>\n\n"
         "Добавьте Telegram ID или @username. Username будет привязан к постоянному ID "
         "при первом обращении пользователя к боту.\n\n"
-        "Чтобы удалить доступ, нажмите строку пользователя с символом 🗑.",
+        "Нажмите пользователя, чтобы изменить его роль или закрыть доступ.",
         reply_markup=access_keyboard(),
     )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:access_user:"))
+async def manage_access_user(callback: CallbackQuery) -> None:
+    if not await require_admin(callback): return
+    access_id = int(callback.data.rsplit(":", 1)[1])
+    user = materials_db.get_access_user(access_id)
+    if not user:
+        await callback.answer("Пользователь не найден.", show_alert=True); return
+    next_role = "user" if user.role == "junior_admin" else "junior_admin"
+    role_text = "Сделать пользователем" if next_role == "user" else "Назначить младшим администратором"
+    await callback.message.edit_text(
+        f"👤 <b>{html.escape(access_user_label(user))}</b>\n\nВыберите действие:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"🔑 {role_text}", callback_data=f"adm:set_role:{access_id}:{next_role}")],
+            [InlineKeyboardButton(text="🗑 Закрыть доступ", callback_data=f"adm:confirm_access:{access_id}")],
+            [InlineKeyboardButton(text="⬅️ К белому списку", callback_data="adm:access")],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:set_role:"))
+async def set_access_role(callback: CallbackQuery) -> None:
+    if not await require_admin(callback): return
+    _, _, raw_id, role = callback.data.split(":", 3)
+    materials_db.set_access_role(int(raw_id), role)
+    await callback.message.edit_text("✅ Роль пользователя обновлена.", reply_markup=access_keyboard())
     await callback.answer()
 
 
