@@ -58,6 +58,9 @@ price_storage_path: Path
 price_updates_in_progress: set[str] = set()
 broadcasts_in_progress: set[int] = set()
 PRICE_MESSAGE_SETTING = "price_command_message"
+PRICE_ATTACHMENT_KIND_SETTING = "price_command_attachment_kind"
+PRICE_ATTACHMENT_ID_SETTING = "price_command_attachment_id"
+PRICE_ATTACHMENT_NAME_SETTING = "price_command_attachment_name"
 DEFAULT_PRICE_COMMAND_MESSAGE = (
     "📄 <b>Актуальные прайсы</b>\n\n"
     "<b>Центр</b> — Москва\n"
@@ -91,6 +94,7 @@ class AdminState(StatesGroup):
     price_confirmation = State()
     access_user = State()
     price_message = State()
+    price_attachment = State()
 
 
 class BroadcastState(StatesGroup):
@@ -376,6 +380,25 @@ async def cancel(message: Message, state: FSMContext) -> None:
     await show_main(message, message.from_user.id if message.from_user else None)
 
 
+async def send_price_command_intro(message: Message) -> None:
+    text = materials_db.get_setting(PRICE_MESSAGE_SETTING) or DEFAULT_PRICE_COMMAND_MESSAGE
+    await message.answer(text)
+    kind = materials_db.get_setting(PRICE_ATTACHMENT_KIND_SETTING)
+    file_id = materials_db.get_setting(PRICE_ATTACHMENT_ID_SETTING)
+    if not kind or not file_id:
+        return
+    try:
+        if kind == "photo":
+            await message.answer_photo(file_id)
+        elif kind == "video":
+            await message.answer_video(file_id)
+        elif kind == "document":
+            await message.answer_document(file_id)
+    except Exception:
+        logging.exception("Не удалось отправить вложение команды /прайс")
+        await message.answer("⚠️ Сопроводительное вложение временно недоступно.")
+
+
 @router.message(F.text.regexp(re.compile(r"^/прайс(?:@\w+)?\s*$", re.IGNORECASE)))
 async def send_all_current_prices(message: Message, state: FSMContext) -> None:
     """Send the latest base price file for every warehouse."""
@@ -399,7 +422,7 @@ async def send_all_current_prices(message: Message, state: FSMContext) -> None:
         )
         return
 
-    await message.answer(materials_db.get_setting(PRICE_MESSAGE_SETTING) or DEFAULT_PRICE_COMMAND_MESSAGE)
+    await send_price_command_intro(message)
     for warehouse in available:
         warehouse_name = WAREHOUSES[warehouse]
         city = warehouse_cities[warehouse]
@@ -2862,19 +2885,27 @@ async def admin_menu(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 def price_message_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
         [InlineKeyboardButton(text="✏️ Изменить сообщение", callback_data="adm:edit_price_message")],
-        [InlineKeyboardButton(text="↩️ Вернуть стандартное", callback_data="adm:reset_price_message")],
-        compact_nav("main:admin"),
-    ])
+        [InlineKeyboardButton(text="📎 Добавить или заменить вложение", callback_data="adm:edit_price_attachment")],
+        [InlineKeyboardButton(text="👁 Предпросмотр", callback_data="adm:preview_price_message")],
+        [InlineKeyboardButton(text="↩️ Вернуть стандартный текст", callback_data="adm:reset_price_message")],
+    ]
+    if materials_db.get_setting(PRICE_ATTACHMENT_ID_SETTING):
+        rows.append([InlineKeyboardButton(text="🗑 Удалить вложение", callback_data="adm:remove_price_attachment")])
+    rows.append(compact_nav("main:admin"))
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def show_price_message_settings(callback: CallbackQuery) -> None:
     current = materials_db.get_setting(PRICE_MESSAGE_SETTING) or DEFAULT_PRICE_COMMAND_MESSAGE
+    attachment_name = materials_db.get_setting(PRICE_ATTACHMENT_NAME_SETTING)
+    attachment_status = html.escape(attachment_name) if attachment_name else "<i>не добавлено</i>"
     await callback.message.edit_text(
         "✏️ <b>Сообщение команды /прайс</b>\n\n"
         "Сейчас перед файлами отправляется:\n\n"
-        f"{current}",
+        f"{current}\n\n"
+        f"📎 Вложение: {attachment_status}",
         reply_markup=price_message_keyboard(),
     )
 
@@ -2901,6 +2932,75 @@ async def ask_price_message(callback: CallbackQuery, state: FSMContext) -> None:
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[compact_nav("adm:price_message")]),
     )
     await callback.answer()
+
+
+@router.callback_query(F.data == "adm:edit_price_attachment")
+async def ask_price_attachment(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_price_message_admin(callback):
+        return
+    await state.set_state(AdminState.price_attachment)
+    await callback.message.edit_text(
+        "📎 <b>Сопроводительное вложение для /прайс</b>\n\n"
+        "Отправьте одно изображение, видео или файл. Оно будет отправляться после текста "
+        "и перед актуальными прайсами.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[compact_nav("adm:price_message")]),
+    )
+    await callback.answer()
+
+
+@router.message(AdminState.price_attachment)
+async def save_price_attachment(message: Message, state: FSMContext) -> None:
+    if not message.from_user or not can_manage_price_message(
+        message.from_user.id, message.from_user.username
+    ):
+        await state.clear()
+        return
+    if message.photo:
+        kind, file_id, name = "photo", message.photo[-1].file_id, "изображение"
+    elif message.video:
+        kind, file_id = "video", message.video.file_id
+        name = message.video.file_name or "видео"
+    elif message.document:
+        kind, file_id = "document", message.document.file_id
+        name = message.document.file_name or "файл"
+    else:
+        await message.answer("Отправьте изображение, видео или файл одним сообщением.")
+        return
+    materials_db.set_setting(PRICE_ATTACHMENT_KIND_SETTING, kind)
+    materials_db.set_setting(PRICE_ATTACHMENT_ID_SETTING, file_id)
+    materials_db.set_setting(PRICE_ATTACHMENT_NAME_SETTING, name)
+    await state.clear()
+    await message.answer(
+        f"✅ Вложение сохранено: <b>{html.escape(name)}</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👁 Предпросмотр", callback_data="adm:preview_price_message")],
+            [InlineKeyboardButton(text="⚙️ К настройке", callback_data="adm:price_message")],
+            compact_nav(),
+        ]),
+    )
+
+
+@router.callback_query(F.data == "adm:preview_price_message")
+async def preview_price_message(callback: CallbackQuery) -> None:
+    if not await require_price_message_admin(callback):
+        return
+    await callback.answer("Отправляю предпросмотр…")
+    await send_price_command_intro(callback.message)
+
+
+@router.callback_query(F.data == "adm:remove_price_attachment")
+async def remove_price_attachment(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_price_message_admin(callback):
+        return
+    for key in (
+        PRICE_ATTACHMENT_KIND_SETTING,
+        PRICE_ATTACHMENT_ID_SETTING,
+        PRICE_ATTACHMENT_NAME_SETTING,
+    ):
+        materials_db.set_setting(key, "")
+    await state.clear()
+    await show_price_message_settings(callback)
+    await callback.answer("Вложение удалено")
 
 
 @router.message(AdminState.price_message, F.text)
