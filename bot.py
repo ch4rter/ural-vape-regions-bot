@@ -409,6 +409,7 @@ async def send_all_current_prices(message: Message, state: FSMContext) -> None:
         "west": "Санкт-Петербург",
     }
     warehouse_order = ("center", "ural", "west")
+    import_statuses = prices_db.import_statuses()
     available = [
         warehouse
         for warehouse in warehouse_order
@@ -424,11 +425,11 @@ async def send_all_current_prices(message: Message, state: FSMContext) -> None:
 
     await send_price_command_intro(message)
     for warehouse in available:
-        warehouse_name = WAREHOUSES[warehouse]
-        city = warehouse_cities[warehouse]
         source = price_storage_path / f"{warehouse}.xlsx"
+        status = import_statuses.get(warehouse)
+        original_name = Path(str(status["file_name"])).name if status and status["file_name"] else source.name
         await message.answer_document(
-            FSInputFile(source, filename=f"прайс {warehouse_name} — {city}.xlsx"),
+            FSInputFile(source, filename=original_name),
         )
 
     missing = [
