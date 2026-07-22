@@ -117,6 +117,9 @@ class AccessMiddleware(BaseMiddleware):
         user = event.from_user
         if getattr(event, "chat", None) and event.chat.type != "private":
             text = event.text or "" if isinstance(event, Message) else ""
+            is_price_command = bool(re.match(r"^/прайс(?:@\w+)?\s*$", text, re.IGNORECASE))
+            if is_price_command:
+                return await handler(event, data)
             is_wait_command = bool(re.match(r"^/wait(?:@\w+)?(?:\s|$)", text, re.IGNORECASE))
             if is_wait_command and user and (
                 is_admin(user.id) or materials_db.authorize_user(user.id, user.username)
