@@ -57,6 +57,14 @@ managed_excel_path: Path
 price_storage_path: Path
 price_updates_in_progress: set[str] = set()
 broadcasts_in_progress: set[int] = set()
+PRICE_MESSAGE_SETTING = "price_command_message"
+DEFAULT_PRICE_COMMAND_MESSAGE = (
+    "📄 <b>Актуальные прайсы</b>\n\n"
+    "<b>Центр</b> — Москва\n"
+    "<b>Урал</b> — Челябинск\n"
+    "<b>Запад</b> — Санкт-Петербург\n\n"
+    "Ниже представлены последние загруженные версии с базовыми ценами."
+)
 
 MANAGER_LINKS = {
     "валера": "uvvalera",
@@ -82,6 +90,7 @@ class AdminState(StatesGroup):
     price_upload = State()
     price_confirmation = State()
     access_user = State()
+    price_message = State()
 
 
 class BroadcastState(StatesGroup):
@@ -263,6 +272,10 @@ def can_broadcast(user_id: int | None, username: str | None = None) -> bool:
     return is_admin(user_id) or is_junior_admin(user_id, username)
 
 
+def can_manage_price_message(user_id: int | None, username: str | None = None) -> bool:
+    return is_admin(user_id) or is_junior_admin(user_id, username)
+
+
 def button_grid(buttons: list[InlineKeyboardButton], columns: int = 2) -> list[list[InlineKeyboardButton]]:
     return [buttons[index : index + columns] for index in range(0, len(buttons), columns)]
 
@@ -299,7 +312,7 @@ def main_menu(user_id: int | None) -> InlineKeyboardMarkup:
     extra = []
     if can_broadcast(user_id):
         extra.append(InlineKeyboardButton(text="📣 Рассылки", callback_data="main:broadcasts"))
-    if is_admin(user_id):
+    if can_manage_price_message(user_id):
         extra.append(InlineKeyboardButton(text="⚙️ Управление", callback_data="main:admin"))
     rows.extend(button_grid(extra))
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -358,6 +371,50 @@ async def cancel(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer("✅ Текущее действие отменено.")
     await show_main(message, message.from_user.id if message.from_user else None)
+
+
+@router.message(F.text.regexp(re.compile(r"^/прайс(?:@\w+)?\s*$", re.IGNORECASE)))
+async def send_all_current_prices(message: Message, state: FSMContext) -> None:
+    """Send the latest base price file for every warehouse."""
+    await state.clear()
+    warehouse_cities = {
+        "center": "Москва",
+        "ural": "Челябинск",
+        "west": "Санкт-Петербург",
+    }
+    warehouse_order = ("center", "ural", "west")
+    available = [
+        warehouse
+        for warehouse in warehouse_order
+        if (price_storage_path / f"{warehouse}.xlsx").is_file()
+    ]
+
+    if not available:
+        await message.answer(
+            "📄 <b>Актуальные прайсы</b>\n\n"
+            "Прайсы пока не загружены. Обратитесь к администратору."
+        )
+        return
+
+    await message.answer(materials_db.get_setting(PRICE_MESSAGE_SETTING) or DEFAULT_PRICE_COMMAND_MESSAGE)
+    for warehouse in available:
+        warehouse_name = WAREHOUSES[warehouse]
+        city = warehouse_cities[warehouse]
+        source = price_storage_path / f"{warehouse}.xlsx"
+        await message.answer_document(
+            FSInputFile(source, filename=f"прайс {warehouse_name} — {city}.xlsx"),
+            caption=f"📄 <b>{warehouse_name} — {city}</b>\nАктуальный базовый прайс.",
+        )
+
+    missing = [
+        f"{WAREHOUSES[warehouse]} — {warehouse_cities[warehouse]}"
+        for warehouse in warehouse_order
+        if warehouse not in available
+    ]
+    if missing:
+        await message.answer(
+            "⚠️ Пока недоступны:\n" + "\n".join(f"• {html.escape(value)}" for value in missing)
+        )
 
 
 @router.message(Command("wait"))
@@ -2253,6 +2310,7 @@ def products_keyboard(admin: bool = False) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="💰 Прайсы", callback_data="adm:prices"),
             InlineKeyboardButton(text="👥 Доступ", callback_data="adm:access"),
             InlineKeyboardButton(text="📊 Excel", callback_data="adm:excel"),
+            InlineKeyboardButton(text="✏️ Текст /прайс", callback_data="adm:price_message"),
         ]))
         rows.append([InlineKeyboardButton(text="💾 Скачать резервную копию", callback_data="adm:backup")])
     rows.append(compact_nav())
@@ -2340,6 +2398,15 @@ async def require_broadcaster(callback: CallbackQuery) -> bool:
     if can_broadcast(callback.from_user.id, callback.from_user.username) and callback.message.chat.type == "private":
         return True
     await callback.answer("Раздел доступен администраторам рассылок.", show_alert=True)
+    return False
+
+
+async def require_price_message_admin(callback: CallbackQuery) -> bool:
+    if can_manage_price_message(
+        callback.from_user.id, callback.from_user.username
+    ) and callback.message.chat.type == "private":
+        return True
+    await callback.answer("Эта настройка доступна администраторам.", show_alert=True)
     return False
 
 
@@ -2769,9 +2836,20 @@ async def cancel_price(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "main:admin")
 async def admin_menu(callback: CallbackQuery, state: FSMContext) -> None:
-    if not await require_admin(callback):
+    if not await require_price_message_admin(callback):
         return
     await state.clear()
+    if not is_admin(callback.from_user.id):
+        await callback.message.edit_text(
+            "⚙️ <b>Управление</b>\n\n"
+            "Здесь можно настроить сообщение, которое бот отправляет перед актуальными прайсами.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✏️ Текст /прайс", callback_data="adm:price_message")],
+                compact_nav(),
+            ]),
+        )
+        await callback.answer()
+        return
     await callback.message.edit_text(
         "⚙️ <b>Управление базой</b>\n\n"
         "Создавайте товары, добавляйте разделы и наполняйте их материалами. "
@@ -2779,6 +2857,80 @@ async def admin_menu(callback: CallbackQuery, state: FSMContext) -> None:
         reply_markup=products_keyboard(admin=True),
     )
     await callback.answer()
+
+
+def price_message_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Изменить сообщение", callback_data="adm:edit_price_message")],
+        [InlineKeyboardButton(text="↩️ Вернуть стандартное", callback_data="adm:reset_price_message")],
+        compact_nav("main:admin"),
+    ])
+
+
+async def show_price_message_settings(callback: CallbackQuery) -> None:
+    current = materials_db.get_setting(PRICE_MESSAGE_SETTING) or DEFAULT_PRICE_COMMAND_MESSAGE
+    await callback.message.edit_text(
+        "✏️ <b>Сообщение команды /прайс</b>\n\n"
+        "Сейчас перед файлами отправляется:\n\n"
+        f"{current}",
+        reply_markup=price_message_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "adm:price_message")
+async def manage_price_message(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_price_message_admin(callback):
+        return
+    await state.clear()
+    await show_price_message_settings(callback)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adm:edit_price_message")
+async def ask_price_message(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_price_message_admin(callback):
+        return
+    await state.set_state(AdminState.price_message)
+    await callback.message.edit_text(
+        "✏️ <b>Новое сообщение для /прайс</b>\n\n"
+        "Отправьте текст одним сообщением. Можно использовать обычное форматирование Telegram: "
+        "жирный шрифт, курсив и ссылки.\n\n"
+        "После сохранения этот текст будут видеть пользователи перед файлами прайсов.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[compact_nav("adm:price_message")]),
+    )
+    await callback.answer()
+
+
+@router.message(AdminState.price_message, F.text)
+async def save_price_message(message: Message, state: FSMContext) -> None:
+    if not message.from_user or not can_manage_price_message(
+        message.from_user.id, message.from_user.username
+    ):
+        await state.clear()
+        return
+    if len(message.text.strip()) > 3500:
+        await message.answer("Сообщение слишком длинное. Сократите его до 3500 символов.")
+        return
+    materials_db.set_setting(PRICE_MESSAGE_SETTING, message.html_text.strip())
+    await state.clear()
+    await message.answer(
+        "✅ <b>Сообщение для /прайс обновлено</b>\n\n"
+        "Новый текст будет использоваться при следующем запросе.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👁 Посмотреть", callback_data="adm:price_message")],
+            compact_nav(),
+        ]),
+    )
+
+
+@router.callback_query(F.data == "adm:reset_price_message")
+async def reset_price_message(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_price_message_admin(callback):
+        return
+    materials_db.set_setting(PRICE_MESSAGE_SETTING, DEFAULT_PRICE_COMMAND_MESSAGE)
+    await state.clear()
+    await show_price_message_settings(callback)
+    await callback.answer("Стандартное сообщение восстановлено")
 
 
 def access_user_label(user) -> str:
