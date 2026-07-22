@@ -89,6 +89,10 @@ def test_warehouse_replacement_search_and_aggregation(tmp_path):
 
 def test_prices_and_group_name_formatting():
     assert clean_group_name("ЭС/Одноразовые/1. Д Vaporesso Dojo 12000") == "Vaporesso Dojo 12000"
+    assert clean_group_name("ЭС/Расходники/Vaporesso/Расходники") == "Vaporesso Расходники"
+    assert clean_group_name("ЭС/Расходники/GeekVape/Расходники") == "GeekVape Расходники"
+    assert clean_group_name("ЭС/Жидкости/Производитель OGGO X ELFLIQ/Ice 20mg") == "OGGO X ELFLIQ Ice 20mg"
+    assert clean_group_name("ЭС/Жидкости/Производитель OGGO/Oggo Acid") == "Oggo Acid"
     assert money(discounted(Decimal("235"), 5)) == "223,25"
     assert variant_word(1) == "вариант"
     assert variant_word(2) == "варианта"
@@ -115,6 +119,30 @@ def test_discounted_excel_changes_copy_but_not_original(tmp_path):
     assert discounted_book.active["D11"].value == 90
     base.close()
     discounted_book.close()
+
+
+def test_parser_keeps_brand_context_for_generic_and_short_group_names(tmp_path):
+    path = tmp_path / "brands.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    for _ in range(7):
+        sheet.append([])
+    sheet.append(["Код", "Наименование", "Ед.изм.", "от 50т.р. нал", "от 50т.р. безнал"])
+    sheet.append(["ЭС/5.Расходники/Vaporesso/Расходники"])
+    sheet.append(["V1", "Испаритель Vaporesso", "шт", 100, 110])
+    sheet.append(["ЭС/5.Расходники/GeekVape/Расходники"])
+    sheet.append(["G1", "Испаритель GeekVape", "шт", 120, 130])
+    sheet.append(["ЭС/3.Жидкости/Производитель OGGO X ELFLIQ/Ice 20mg"])
+    sheet.append(["O1", "OGGO X ELFLIQ Ice Манго", "шт", 230, 250])
+    workbook.save(path)
+
+    parsed = parse_price_file(path)
+    names = {group.display_name for group in parsed.groups}
+    keys = {group.merge_key for group in parsed.groups}
+    assert names == {"Vaporesso Расходники", "GeekVape Расходники", "OGGO X ELFLIQ Ice 20mg"}
+    assert "consumables|vaporesso расходники" in keys
+    assert "consumables|geekvape расходники" in keys
+    assert "liquids|oggo x elfliq ice 20mg" in keys
 
 
 def test_selected_price_contains_only_chosen_groups_and_discount(tmp_path):

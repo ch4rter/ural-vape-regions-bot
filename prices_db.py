@@ -43,10 +43,33 @@ def normalize_price_text(value: str) -> str:
 
 
 def clean_group_name(full_path: str) -> str:
-    name = full_path.rsplit("/", 1)[-1].strip()
-    name = re.sub(r"^\d+\s*\.\s*", "", name)
-    name = re.sub(r"^Д\s+(?=[A-ZА-ЯЁ])", "", name)
-    return re.sub(r"\s+", " ", name).strip()
+    def clean_segment(value: str) -> str:
+        value = re.sub(r"^\d+\s*\.\s*", "", value.strip())
+        value = re.sub(r"^Д\s+(?=[A-ZА-ЯЁ])", "", value)
+        return re.sub(r"\s+", " ", value).strip()
+
+    segments = [clean_segment(value) for value in full_path.split("/") if value.strip()]
+    if not segments:
+        return ""
+    leaf = segments[-1]
+    if len(segments) < 2:
+        return leaf
+    parent_raw = segments[-2]
+    parent = re.sub(r"^(?:производитель|бренд)\s+", "", parent_raw, flags=re.IGNORECASE).strip()
+    leaf_normalized = normalize_price_text(leaf)
+    parent_normalized = normalize_price_text(parent)
+    generic_names = {
+        "расходники", "расходные материалы", "аксессуары", "комплектующие", "прочее",
+    }
+    parent_is_manufacturer = bool(
+        re.match(r"^(?:производитель|бренд)\s+", parent_raw, flags=re.IGNORECASE)
+    )
+    context_needed = leaf_normalized in generic_names or parent_is_manufacturer
+    parent_tokens = [token for token in parent_normalized.split() if len(token) > 1]
+    parent_already_present = bool(parent_tokens) and all(token in leaf_normalized.split() for token in parent_tokens)
+    if context_needed and parent_normalized and parent_normalized != leaf_normalized and not parent_already_present:
+        return f"{parent} {leaf}"
+    return leaf
 
 
 def variant_display_name(name: str) -> str:
@@ -66,6 +89,7 @@ def category_from_path(full_path: str) -> tuple[str, str]:
         ("конструктор", "mixes", "Конструкторы и ароматизаторы"),
         ("однораз", "disposables", "Одноразовые системы"),
         ("картридж", "cartridges", "Картриджи"),
+        ("расходник", "consumables", "Расходники"),
         ("электронные системы", "devices", "Электронные системы"),
     )
     for marker, key, label in rules:

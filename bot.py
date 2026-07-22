@@ -44,6 +44,7 @@ RESULTS_PER_PAGE = 10
 PRICE_VARIANTS_PER_PAGE = 12
 PRICE_GROUPS_PER_PAGE = 8
 MAX_SELECTED_PRICE_GROUPS = 50
+SERVICE_CHAT_ID = -5565597780
 router = Router()
 catalog: "Catalog"
 materials_db: MaterialsDB
@@ -620,16 +621,13 @@ def broadcast_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="➕ Создать рассылку", callback_data="broadcast:new")],
         [InlineKeyboardButton(text="📥 Выгрузить список чатов", callback_data="broadcast:export_chats")],
     ]
-    if is_admin(user_id):
-        rows.append([InlineKeyboardButton(text="🧪 Выбрать служебный чат", callback_data="broadcast:service")])
     rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="main:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def service_chat_text() -> str:
-    raw_id = materials_db.get_setting("service_chat_id")
-    chat = materials_db.get_client_chat(int(raw_id)) if raw_id else None
-    return chat.title if chat else "не выбран"
+    chat = materials_db.get_client_chat(SERVICE_CHAT_ID)
+    return chat.title if chat else str(SERVICE_CHAT_ID)
 
 
 @router.callback_query(F.data == "main:broadcasts")
@@ -673,37 +671,6 @@ async def export_client_chats(callback: CallbackQuery) -> None:
             FSInputFile(destination, filename=destination.name),
             caption=f"📥 Чатов в реестре: <b>{len(materials_db.list_client_chats())}</b>",
         )
-
-
-@router.callback_query(F.data == "broadcast:service")
-async def select_service_chat(callback: CallbackQuery) -> None:
-    if not await require_admin(callback): return
-    chats = materials_db.list_client_chats(active_only=True)
-    rows = [[InlineKeyboardButton(
-        text=(chat.title[:55] + "…") if len(chat.title) > 56 else chat.title,
-        callback_data=f"broadcast:set_service:{chat.chat_id}",
-    )] for chat in chats[:90]]
-    rows.append([InlineKeyboardButton(text="⬅️ К рассылкам", callback_data="main:broadcasts")])
-    await callback.message.edit_text(
-        "🧪 <b>Служебный чат</b>\n\nВыберите группу для тестовой отправки:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("broadcast:set_service:"))
-async def save_service_chat(callback: CallbackQuery) -> None:
-    if not await require_admin(callback): return
-    chat_id = int(callback.data.rsplit(":", 1)[1])
-    chat = materials_db.get_client_chat(chat_id)
-    if not chat or not chat.is_active:
-        await callback.answer("Чат недоступен.", show_alert=True); return
-    materials_db.set_setting("service_chat_id", str(chat_id))
-    await callback.message.edit_text(
-        f"✅ Служебный чат выбран: <b>{html.escape(chat.title)}</b>",
-        reply_markup=broadcast_menu_keyboard(callback.from_user.id),
-    )
-    await callback.answer()
 
 
 @router.callback_query(F.data == "broadcast:new")
@@ -813,11 +780,8 @@ async def replace_broadcast_content(callback: CallbackQuery, state: FSMContext) 
 async def test_broadcast(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     if not await require_broadcaster(callback): return
     data = await state.get_data()
-    service_id = materials_db.get_setting("service_chat_id")
-    if not service_id:
-        await callback.answer("Главный администратор ещё не выбрал служебный чат.", show_alert=True); return
     try:
-        await bot.copy_message(int(service_id), data["source_chat_id"], data["source_message_id"])
+        await bot.copy_message(SERVICE_CHAT_ID, data["source_chat_id"], data["source_message_id"])
     except Exception:
         logging.exception("Не удалось отправить тест рассылки")
         await callback.answer("Не удалось отправить тест. Проверьте доступ бота к служебной группе.", show_alert=True); return

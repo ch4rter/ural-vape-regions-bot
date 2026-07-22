@@ -1,11 +1,12 @@
 from openpyxl import Workbook, load_workbook
 
-from bot import build_broadcast_report, build_chats_excel, parse_audience_excel
+from bot import SERVICE_CHAT_ID, build_broadcast_report, build_chats_excel, parse_audience_excel
 import bot
 from materials_db import MaterialsDB
 
 
 def test_audience_excel_parsing(tmp_path):
+    assert SERVICE_CHAT_ID == -5565597780
     path = tmp_path / "audience.xlsx"
     workbook = Workbook()
     sheet = workbook.active
