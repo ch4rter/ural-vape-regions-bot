@@ -1705,17 +1705,21 @@ async def export_broadcast_segments(callback: CallbackQuery, state: FSMContext) 
 @router.callback_query(F.data == "broadcast:new")
 async def new_broadcast(callback: CallbackQuery, state: FSMContext) -> None:
     if not await require_broadcaster(callback): return
+    await callback.answer()
     await state.clear()
     await state.set_state(BroadcastState.audience_upload)
-    await callback.message.edit_text(
+    text = (
         "📄 <b>Шаг 1 из 3 · Получатели</b>\n\n"
         "Отправьте Excel-файл <code>.xlsx</code>. Бот найдёт колонку <b>Chat ID</b>, "
-        "удалит дубли и подготовит список получателей.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отменить", callback_data="main:broadcasts")]
-        ]),
+        "удалит дубли и подготовит список получателей."
     )
-    await callback.answer()
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отменить", callback_data="main:broadcasts")]
+    ])
+    if callback.message.text:
+        await callback.message.edit_text(text, reply_markup=markup)
+    else:
+        await callback.message.answer(text, reply_markup=markup)
 
 
 def parse_audience_excel(path: Path) -> tuple[list[int], int, int]:
