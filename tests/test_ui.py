@@ -1,4 +1,6 @@
+import bot
 from bot import clean_client_title, compact_nav, main_menu
+from materials_db import MaterialsDB
 
 
 def test_public_main_menu_only_shows_public_sections():
@@ -7,6 +9,28 @@ def test_public_main_menu_only_shows_public_sections():
     assert [button.text for button in keyboard.inline_keyboard[0]] == [
         "🔎 Менеджеры", "🗃 База данных",
     ]
+
+
+def test_completed_public_profile_gets_base_price_button(tmp_path):
+    previous = getattr(bot, "materials_db", None)
+    bot.materials_db = MaterialsDB(tmp_path / "materials.sqlite3")
+    bot.materials_db.save_lead_profile(
+        123456, "client", "Иван", "Владелец", "Тамбов",
+        "Vape Shop", "2 точки", "Андрей",
+    )
+    try:
+        labels = [
+            button.text
+            for row in main_menu(123456).inline_keyboard
+            for button in row
+        ]
+        assert "📄 Получить прайсы" in labels
+        assert "💰 Цены" not in labels
+    finally:
+        if previous is not None:
+            bot.materials_db = previous
+        else:
+            delattr(bot, "materials_db")
 
 
 def test_compact_navigation_uses_icon_only_buttons():

@@ -199,7 +199,7 @@ class AccessMiddleware(BaseMiddleware):
         if isinstance(event, CallbackQuery):
             callback_data = event.data or ""
             if profile_completed and (
-                callback_data in {"main:menu", "main:region", "main:database"}
+                callback_data in {"main:menu", "main:region", "main:database", "public:prices"}
                 or callback_data.startswith("db:")
             ):
                 return await handler(event, data)
@@ -405,6 +405,8 @@ def main_menu(user_id: int | None) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📊 Изменения", callback_data="main:price_reports"),
         ]
         buttons.append(InlineKeyboardButton(text="🔔 Ожидания", callback_data="main:waitlist"))
+    elif user_id and materials_db.get_lead_profile(user_id):
+        buttons.append(InlineKeyboardButton(text="📄 Получить прайсы", callback_data="public:prices"))
     rows = button_grid(buttons)
     extra = []
     if can_broadcast(user_id):
@@ -653,6 +655,39 @@ async def notify_manager_about_lead(bot: Bot, profile) -> bool:
     return False
 
 
+async def notify_manager_about_price_request(bot: Bot, profile) -> bool:
+    recipient = manager_recipient_id(profile.manager)
+    markup = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="💬 Связаться",
+            url=contact_user_url(profile.user_id, profile.username),
+        )
+    ]])
+    text = lead_profile_text(
+        profile, heading="📄 <b>Клиент запросил актуальные прайсы</b>"
+    )
+    if recipient:
+        try:
+            await bot.send_message(recipient, text, reply_markup=markup)
+            return True
+        except Exception:
+            logging.exception(
+                "Не удалось сообщить менеджеру %s о запросе прайса", profile.manager
+            )
+    for admin_id in admin_ids:
+        try:
+            await bot.send_message(
+                admin_id,
+                text + "\n\n⚠️ Уведомление не доставлено закреплённому менеджеру.",
+                reply_markup=markup,
+            )
+        except Exception:
+            logging.exception(
+                "Не удалось сообщить администратору %s о запросе прайса", admin_id
+            )
+    return False
+
+
 @router.message(LeadState.outlets, F.text)
 async def lead_outlets(message: Message, state: FSMContext, bot: Bot) -> None:
     if not valid_lead_answer(message.text, maximum=200):
@@ -678,6 +713,9 @@ async def lead_outlets(message: Message, state: FSMContext, bot: Bot) -> None:
             text=f"💬 Связаться с менеджером {profile.manager}",
             url=f"https://t.me/{manager_username}",
         )])
+    rows.append([InlineKeyboardButton(
+        text="📄 Получить актуальные прайсы", callback_data="public:prices"
+    )])
     rows.append(compact_nav())
     await message.answer(
         "✅ <b>Спасибо! Анкета сохранена</b>\n\n"
@@ -763,10 +801,8 @@ async def send_price_command_intro(message: Message) -> None:
         await message.answer("⚠️ Сопроводительное вложение временно недоступно.")
 
 
-@router.message(F.text.regexp(re.compile(r"^/прайс(?:@\w+)?\s*$", re.IGNORECASE)))
-async def send_all_current_prices(message: Message, state: FSMContext) -> None:
-    """Send the latest base price file for every warehouse."""
-    await state.clear()
+async def send_current_base_prices(message: Message) -> bool:
+    """Send the latest original base price file for every warehouse."""
     warehouse_cities = {
         "center": "Москва",
         "ural": "Челябинск",
@@ -785,7 +821,7 @@ async def send_all_current_prices(message: Message, state: FSMContext) -> None:
             "📄 <b>Актуальные прайсы</b>\n\n"
             "Прайсы пока не загружены. Обратитесь к администратору."
         )
-        return
+        return False
 
     await send_price_command_intro(message)
     for warehouse in available:
@@ -805,6 +841,37 @@ async def send_all_current_prices(message: Message, state: FSMContext) -> None:
         await message.answer(
             "⚠️ Пока недоступны:\n" + "\n".join(f"• {html.escape(value)}" for value in missing)
         )
+    return True
+
+
+async def notify_price_request_if_external(bot: Bot, message: Message) -> None:
+    if not message.from_user:
+        return
+    profile = materials_db.get_lead_profile(message.from_user.id)
+    if profile:
+        await notify_manager_about_price_request(bot, profile)
+
+
+@router.message(F.text.regexp(re.compile(r"^/прайс(?:@\w+)?\s*$", re.IGNORECASE)))
+async def send_all_current_prices(message: Message, state: FSMContext, bot: Bot) -> None:
+    """Send the latest base price file for every warehouse."""
+    await state.clear()
+    if await send_current_base_prices(message):
+        await notify_price_request_if_external(bot, message)
+
+
+@router.callback_query(F.data == "public:prices")
+async def send_public_base_prices(
+    callback: CallbackQuery, state: FSMContext, bot: Bot
+) -> None:
+    profile = materials_db.get_lead_profile(callback.from_user.id)
+    if not profile:
+        await callback.answer("Сначала заполните анкету.", show_alert=True)
+        return
+    await callback.answer("Отправляю актуальные прайсы…")
+    await state.clear()
+    if await send_current_base_prices(callback.message):
+        await notify_manager_about_price_request(bot, profile)
 
 
 @router.message(Command("wait"))
