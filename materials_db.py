@@ -155,6 +155,12 @@ class MaterialsDB:
                     manager TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS known_telegram_users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    full_name TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
                 CREATE TABLE IF NOT EXISTS wait_entries (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     chat_id INTEGER NOT NULL,
@@ -603,6 +609,34 @@ class MaterialsDB:
                    FROM lead_profiles ORDER BY created_at DESC, user_id DESC"""
             ).fetchall()
         return [self._lead_profile(row) for row in rows]
+
+    def remember_telegram_user(
+        self, user_id: int, username: str | None, full_name: str = ""
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO known_telegram_users(user_id, username, full_name, updated_at)
+                   VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(user_id) DO UPDATE SET
+                       username=COALESCE(excluded.username, known_telegram_users.username),
+                       full_name=CASE
+                           WHEN excluded.full_name <> '' THEN excluded.full_name
+                           ELSE known_telegram_users.full_name
+                       END,
+                       updated_at=CURRENT_TIMESTAMP""",
+                (user_id, username.lower() if username else None, full_name.strip()),
+            )
+
+    def telegram_user_id_by_username(self, username: str) -> int | None:
+        normalized = username.strip().lstrip("@").lower()
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT user_id FROM known_telegram_users
+                   WHERE username = ? COLLATE NOCASE
+                   ORDER BY updated_at DESC LIMIT 1""",
+                (normalized,),
+            ).fetchone()
+        return row["user_id"] if row else None
 
     @staticmethod
     def _lead_profile(row: sqlite3.Row) -> LeadProfile:

@@ -133,6 +133,8 @@ class AccessMiddleware(BaseMiddleware):
         data: dict[str, Any],
     ) -> Any:
         user = event.from_user
+        if user:
+            materials_db.remember_telegram_user(user.id, user.username, user.full_name)
         if getattr(event, "chat", None) and event.chat.type != "private":
             text = event.text or "" if isinstance(event, Message) else ""
             is_price_command = bool(re.match(r"^/прайс(?:@\w+)?\s*$", text, re.IGNORECASE))
@@ -520,7 +522,7 @@ async def accept_lead_region(
     await state.set_state(LeadState.company)
     text = (
         f"✅ Регион: <b>{html.escape(region)}</b>\n"
-        f"Менеджер: {manager_html(entry.manager)}\n\n"
+        "Спасибо, продолжаем.\n\n"
         "<b>4 из 5 · Как называется ваш магазин или компания?</b>"
     )
     if edit:
@@ -581,10 +583,24 @@ async def lead_company(message: Message, state: FSMContext) -> None:
     )
 
 
+def manager_contact_username(manager: str) -> str | None:
+    normalized = normalize(manager)
+    direct = MANAGER_LINKS.get(normalized)
+    if direct:
+        return direct
+    return next(
+        (username for name, username in MANAGER_LINKS.items() if name in normalized.split()),
+        None,
+    )
+
+
 def manager_recipient_id(manager: str) -> int | None:
-    username = MANAGER_LINKS.get(normalize(manager))
+    username = manager_contact_username(manager)
     if not username:
         return None
+    known_user_id = materials_db.telegram_user_id_by_username(username)
+    if known_user_id:
+        return known_user_id
     for user in materials_db.list_access_users():
         if user.username and normalize(user.username) == normalize(username) and user.telegram_id:
             return user.telegram_id
@@ -655,7 +671,7 @@ async def lead_outlets(message: Message, state: FSMContext, bot: Bot) -> None:
     )
     delivered = await notify_manager_about_lead(bot, profile)
     await state.clear()
-    manager_username = MANAGER_LINKS.get(normalize(profile.manager))
+    manager_username = manager_contact_username(profile.manager)
     rows = []
     if manager_username:
         rows.append([InlineKeyboardButton(
@@ -870,7 +886,7 @@ def unique_results(entries: list[Entry]) -> list[tuple[str, str, str]]:
 
 def manager_html(manager: str) -> str:
     escaped = html.escape(manager)
-    username = MANAGER_LINKS.get(normalize(manager))
+    username = manager_contact_username(manager)
     if not username:
         return f"<b>{escaped}</b>"
     return f'<b><a href="https://t.me/{username}">{escaped}</a></b>'

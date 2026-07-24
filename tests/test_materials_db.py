@@ -141,6 +141,15 @@ def test_lead_profile_is_saved_once(tmp_path):
     assert len(db.list_lead_profiles()) == 1
 
 
+def test_known_telegram_user_resolves_manager_username(tmp_path):
+    db = MaterialsDB(tmp_path / "materials.sqlite3")
+    db.remember_telegram_user(101, "ShmidtUV", "Андрей")
+    assert db.telegram_user_id_by_username("@shmidtuv") == 101
+
+    db.remember_telegram_user(101, None, "Андрей Шмидт")
+    assert db.telegram_user_id_by_username("SHMIDTUV") == 101
+
+
 def test_waitlist_is_scoped_to_manager_and_remembers_matches(tmp_path):
     db = MaterialsDB(tmp_path / "materials.sqlite3")
     first = db.add_wait_entry(
