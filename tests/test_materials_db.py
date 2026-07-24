@@ -84,6 +84,46 @@ def test_roles_chat_registry_and_settings(tmp_path):
     assert db.get_client_chat(-100123).is_active is False
 
 
+def test_client_chat_tags_use_or_filter_and_keep_actor(tmp_path):
+    db = MaterialsDB(tmp_path / "materials.sqlite3")
+    db.upsert_client_chat(
+        -100101, "БП", "supergroup", True, added_by_id=11, added_by_username="manager"
+    )
+    db.upsert_client_chat(-100202, "Железо", "supergroup", True)
+    db.upsert_client_chat(-100303, "Оба", "supergroup", True)
+    db.upsert_client_chat(-100404, "Без тегов", "supergroup", True)
+    db.set_client_chat_tags(-100101, ["bp"])
+    db.set_client_chat_tags(-100202, ["hardware"])
+    db.set_client_chat_tags(-100303, ["bp", "hardware"])
+
+    selected = db.list_client_chats(active_only=True, tags=["bp", "hardware"])
+    assert {chat.chat_id for chat in selected} == {-100101, -100202, -100303}
+    assert db.get_client_chat(-100101).added_by_id == 11
+    assert db.get_client_chat(-100101).added_by_username == "manager"
+    assert db.get_client_chat(-100303).tags == ("bp", "hardware")
+    assert [chat.chat_id for chat in db.list_client_chats(untagged_only=True)] == [-100404]
+
+    assert db.toggle_client_chat_tag(-100202, "hardware") == ()
+    assert db.toggle_client_chat_tag(-100202, "sp") == ("sp",)
+
+
+def test_public_sections_are_opt_in(tmp_path):
+    db = MaterialsDB(tmp_path / "materials.sqlite3")
+    product = db.add_product("OGGO VLIQ")
+    declarations = db.add_section(product.id, "Декларации")
+    internal = db.add_section(product.id, "Внутреннее КП")
+    assert declarations.is_public is False
+    assert db.list_public_products() == []
+    assert db.list_sections(product.id, public_only=True) == []
+
+    assert db.toggle_section_public(declarations.id) is True
+    assert db.list_public_products() == [product]
+    assert db.list_sections(product.id, public_only=True)[0].name == "Декларации"
+    assert db.get_section(internal.id).is_public is False
+    assert db.toggle_section_public(declarations.id) is False
+    assert db.list_public_products() == []
+
+
 def test_waitlist_is_scoped_to_manager_and_remembers_matches(tmp_path):
     db = MaterialsDB(tmp_path / "materials.sqlite3")
     first = db.add_wait_entry(

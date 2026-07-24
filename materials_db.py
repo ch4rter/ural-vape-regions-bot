@@ -17,6 +17,7 @@ class Section:
     id: int
     product_id: int
     name: str
+    is_public: bool = False
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,9 @@ class ClientChat:
     title: str
     chat_type: str
     is_active: bool
+    tags: tuple[str, ...] = ()
+    added_by_id: int | None = None
+    added_by_username: str | None = None
 
 
 @dataclass(frozen=True)
@@ -114,7 +118,14 @@ class MaterialsDB:
                     title TEXT NOT NULL,
                     chat_type TEXT NOT NULL,
                     is_active INTEGER NOT NULL DEFAULT 1,
+                    added_by_id INTEGER,
+                    added_by_username TEXT,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS client_chat_tags (
+                    chat_id INTEGER NOT NULL REFERENCES client_chats(chat_id) ON DELETE CASCADE,
+                    tag TEXT NOT NULL,
+                    PRIMARY KEY(chat_id, tag)
                 );
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
@@ -156,6 +167,14 @@ class MaterialsDB:
                 connection.execute("ALTER TABLE wait_entries ADD COLUMN comment TEXT NOT NULL DEFAULT ''")
             if "last_match_json" not in wait_columns:
                 connection.execute("ALTER TABLE wait_entries ADD COLUMN last_match_json TEXT")
+            section_columns = {row[1] for row in connection.execute("PRAGMA table_info(sections)")}
+            if "is_public" not in section_columns:
+                connection.execute("ALTER TABLE sections ADD COLUMN is_public INTEGER NOT NULL DEFAULT 0")
+            chat_columns = {row[1] for row in connection.execute("PRAGMA table_info(client_chats)")}
+            if "added_by_id" not in chat_columns:
+                connection.execute("ALTER TABLE client_chats ADD COLUMN added_by_id INTEGER")
+            if "added_by_username" not in chat_columns:
+                connection.execute("ALTER TABLE client_chats ADD COLUMN added_by_username TEXT")
 
     def add_access_user(self, value: str) -> AccessUser:
         value = value.strip()
@@ -239,31 +258,114 @@ class MaterialsDB:
         with self._connect() as connection:
             connection.execute("UPDATE access_users SET role = ? WHERE id = ?", (role, access_id))
 
-    def upsert_client_chat(self, chat_id: int, title: str, chat_type: str, is_active: bool = True) -> None:
+    def upsert_client_chat(
+        self, chat_id: int, title: str, chat_type: str, is_active: bool = True,
+        added_by_id: int | None = None, added_by_username: str | None = None,
+    ) -> None:
         with self._connect() as connection:
             connection.execute(
-                """INSERT INTO client_chats(chat_id, title, chat_type, is_active, updated_at)
-                   VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """INSERT INTO client_chats(
+                       chat_id, title, chat_type, is_active, added_by_id, added_by_username, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                    ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,
                        chat_type=excluded.chat_type, is_active=excluded.is_active,
+                       added_by_id=COALESCE(excluded.added_by_id, client_chats.added_by_id),
+                       added_by_username=COALESCE(
+                           excluded.added_by_username, client_chats.added_by_username
+                       ),
                        updated_at=CURRENT_TIMESTAMP""",
-                (chat_id, title.strip() or str(chat_id), chat_type, int(is_active)),
+                (
+                    chat_id, title.strip() or str(chat_id), chat_type, int(is_active),
+                    added_by_id, added_by_username,
+                ),
             )
 
-    def list_client_chats(self, active_only: bool = False) -> list[ClientChat]:
-        where = "WHERE is_active = 1" if active_only else ""
+    def list_client_chats(
+        self, active_only: bool = False, tags: tuple[str, ...] | list[str] | None = None,
+        untagged_only: bool = False,
+    ) -> list[ClientChat]:
+        conditions, values = [], []
+        if active_only:
+            conditions.append("c.is_active = 1")
+        normalized_tags = tuple(dict.fromkeys(tag.strip().lower() for tag in (tags or ()) if tag.strip()))
+        if normalized_tags:
+            placeholders = ", ".join("?" for _ in normalized_tags)
+            conditions.append(
+                f"EXISTS(SELECT 1 FROM client_chat_tags f WHERE f.chat_id = c.chat_id "
+                f"AND f.tag IN ({placeholders}))"
+            )
+            values.extend(normalized_tags)
+        if untagged_only:
+            conditions.append("NOT EXISTS(SELECT 1 FROM client_chat_tags u WHERE u.chat_id = c.chat_id)")
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         with self._connect() as connection:
             rows = connection.execute(
-                f"SELECT chat_id, title, chat_type, is_active FROM client_chats {where} ORDER BY title"
+                f"""SELECT c.chat_id, c.title, c.chat_type, c.is_active,
+                           c.added_by_id, c.added_by_username,
+                           GROUP_CONCAT(t.tag, ',') AS tags
+                    FROM client_chats c
+                    LEFT JOIN client_chat_tags t ON t.chat_id = c.chat_id
+                    {where}
+                    GROUP BY c.chat_id
+                    ORDER BY c.title""",
+                values,
             ).fetchall()
-        return [ClientChat(row["chat_id"], row["title"], row["chat_type"], bool(row["is_active"])) for row in rows]
+        return [self._client_chat(row) for row in rows]
 
     def get_client_chat(self, chat_id: int) -> ClientChat | None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT chat_id, title, chat_type, is_active FROM client_chats WHERE chat_id = ?", (chat_id,)
+                """SELECT c.chat_id, c.title, c.chat_type, c.is_active,
+                          c.added_by_id, c.added_by_username,
+                          GROUP_CONCAT(t.tag, ',') AS tags
+                   FROM client_chats c
+                   LEFT JOIN client_chat_tags t ON t.chat_id = c.chat_id
+                   WHERE c.chat_id = ?
+                   GROUP BY c.chat_id""",
+                (chat_id,),
             ).fetchone()
-        return ClientChat(row["chat_id"], row["title"], row["chat_type"], bool(row["is_active"])) if row else None
+        return self._client_chat(row) if row else None
+
+    def set_client_chat_tags(self, chat_id: int, tags: list[str] | tuple[str, ...]) -> None:
+        normalized = tuple(dict.fromkeys(tag.strip().lower() for tag in tags if tag.strip()))
+        with self._connect() as connection:
+            if not connection.execute(
+                "SELECT 1 FROM client_chats WHERE chat_id = ?", (chat_id,)
+            ).fetchone():
+                raise ValueError("Клиентский чат не найден.")
+            connection.execute("DELETE FROM client_chat_tags WHERE chat_id = ?", (chat_id,))
+            connection.executemany(
+                "INSERT INTO client_chat_tags(chat_id, tag) VALUES (?, ?)",
+                [(chat_id, tag) for tag in normalized],
+            )
+
+    def toggle_client_chat_tag(self, chat_id: int, tag: str) -> tuple[str, ...]:
+        normalized = tag.strip().lower()
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT 1 FROM client_chat_tags WHERE chat_id = ? AND tag = ?",
+                (chat_id, normalized),
+            ).fetchone()
+            if existing:
+                connection.execute(
+                    "DELETE FROM client_chat_tags WHERE chat_id = ? AND tag = ?",
+                    (chat_id, normalized),
+                )
+            else:
+                connection.execute(
+                    "INSERT INTO client_chat_tags(chat_id, tag) VALUES (?, ?)",
+                    (chat_id, normalized),
+                )
+        chat = self.get_client_chat(chat_id)
+        return chat.tags if chat else ()
+
+    @staticmethod
+    def _client_chat(row: sqlite3.Row) -> ClientChat:
+        tags = tuple(sorted(filter(None, (row["tags"] or "").split(","))))
+        return ClientChat(
+            row["chat_id"], row["title"], row["chat_type"], bool(row["is_active"]),
+            tags, row["added_by_id"], row["added_by_username"],
+        )
 
     def add_wait_entry(
         self, chat_id: int, client_title: str, manager_id: int, manager_name: str, query: str,
@@ -507,17 +609,46 @@ class MaterialsDB:
     def get_section(self, section_id: int) -> Section | None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT id, product_id, name FROM sections WHERE id = ?", (section_id,)
+                "SELECT id, product_id, name, is_public FROM sections WHERE id = ?", (section_id,)
             ).fetchone()
-        return Section(row["id"], row["product_id"], row["name"]) if row else None
+        return Section(row["id"], row["product_id"], row["name"], bool(row["is_public"])) if row else None
 
-    def list_sections(self, product_id: int) -> list[Section]:
+    def list_sections(self, product_id: int, public_only: bool = False) -> list[Section]:
+        public_filter = "AND is_public = 1" if public_only else ""
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT id, product_id, name FROM sections WHERE product_id = ? ORDER BY position, name",
+                f"""SELECT id, product_id, name, is_public FROM sections
+                    WHERE product_id = ? {public_filter} ORDER BY position, name""",
                 (product_id,),
             ).fetchall()
-        return [Section(row["id"], row["product_id"], row["name"]) for row in rows]
+        return [
+            Section(row["id"], row["product_id"], row["name"], bool(row["is_public"]))
+            for row in rows
+        ]
+
+    def list_public_products(self) -> list[Product]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT DISTINCT p.id, p.name, p.is_visible, p.position
+                   FROM products p
+                   JOIN sections s ON s.product_id = p.id
+                   WHERE p.is_visible = 1 AND s.is_public = 1
+                   ORDER BY p.position, p.name"""
+            ).fetchall()
+        return [Product(row["id"], row["name"], bool(row["is_visible"])) for row in rows]
+
+    def toggle_section_public(self, section_id: int) -> bool:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE sections SET is_public = CASE is_public WHEN 1 THEN 0 ELSE 1 END WHERE id = ?",
+                (section_id,),
+            )
+            row = connection.execute(
+                "SELECT is_public FROM sections WHERE id = ?", (section_id,)
+            ).fetchone()
+        if not row:
+            raise ValueError("Раздел не найден.")
+        return bool(row["is_public"])
 
     def rename_section(self, section_id: int, name: str) -> None:
         with self._connect() as connection:

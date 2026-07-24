@@ -1,11 +1,12 @@
 from bot import clean_client_title, compact_nav, main_menu
 
 
-def test_main_menu_uses_two_column_grid():
+def test_public_main_menu_only_shows_public_sections():
     keyboard = main_menu(None)
-    assert [len(row) for row in keyboard.inline_keyboard] == [2, 2, 2]
-    assert keyboard.inline_keyboard[0][0].text == "🔎 Менеджеры"
-    assert keyboard.inline_keyboard[0][1].text == "💰 Цены"
+    assert [len(row) for row in keyboard.inline_keyboard] == [2]
+    assert [button.text for button in keyboard.inline_keyboard[0]] == [
+        "🔎 Менеджеры", "🗃 База данных",
+    ]
 
 
 def test_compact_navigation_uses_icon_only_buttons():

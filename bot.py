@@ -47,6 +47,12 @@ PRICE_ITEMS_PER_PAGE = 6
 PRICE_GROUPS_PER_PAGE = 8
 MAX_SELECTED_PRICE_GROUPS = 50
 SERVICE_CHAT_ID = -5565597780
+CLIENT_TAGS = {
+    "sp": "СП",
+    "bp": "БП",
+    "hardware": "Железо",
+    "constructors": "Конструкторы",
+}
 router = Router()
 catalog: "Catalog"
 materials_db: MaterialsDB
@@ -124,6 +130,16 @@ class AccessMiddleware(BaseMiddleware):
             is_price_command = bool(re.match(r"^/прайс(?:@\w+)?\s*$", text, re.IGNORECASE))
             if is_price_command:
                 return await handler(event, data)
+            is_materials_command = bool(
+                re.match(r"^/(?:material|materials|материалы)(?:@\w+)?\s*$", text, re.IGNORECASE)
+            )
+            if is_materials_command:
+                return await handler(event, data)
+            is_chat_command = bool(re.match(r"^/chat(?:@\w+)?\s*$", text, re.IGNORECASE))
+            if is_chat_command and user and (
+                is_admin(user.id) or materials_db.authorize_user(user.id, user.username)
+            ):
+                return await handler(event, data)
             is_wait_command = bool(re.match(r"^/wait(?:@\w+)?(?:\s|$)", text, re.IGNORECASE))
             if is_wait_command and user and (
                 is_admin(user.id) or materials_db.authorize_user(user.id, user.username)
@@ -131,9 +147,31 @@ class AccessMiddleware(BaseMiddleware):
                 return await handler(event, data)
             return None
         if isinstance(event, CallbackQuery) and event.message and event.message.chat.type != "private":
+            callback_data = event.data or ""
+            if callback_data.startswith("db:"):
+                return await handler(event, data)
+            if callback_data.startswith("chatcfg:") and user and (
+                is_admin(user.id) or materials_db.authorize_user(user.id, user.username)
+            ):
+                return await handler(event, data)
+            if callback_data.startswith("chatcfg:"):
+                await event.answer("Настройка доступна только сотрудникам.", show_alert=True)
             return None
         if not user or is_admin(user.id) or materials_db.authorize_user(user.id, user.username):
             return await handler(event, data)
+        if isinstance(event, Message):
+            text = (event.text or "").strip()
+            public_command = bool(re.match(
+                r"^/(?:start|menu|прайс|material|materials|материалы)(?:@\w+)?(?:\s|$)",
+                text,
+                re.IGNORECASE,
+            ))
+            if public_command or data.get("raw_state") == AppState.region_search.state:
+                return await handler(event, data)
+        if isinstance(event, CallbackQuery):
+            callback_data = event.data or ""
+            if callback_data in {"main:menu", "main:region", "main:database"} or callback_data.startswith("db:"):
+                return await handler(event, data)
         if isinstance(event, CallbackQuery):
             await event.answer("Доступ к боту не предоставлен.", show_alert=True)
         else:
@@ -283,6 +321,14 @@ def can_manage_price_message(user_id: int | None, username: str | None = None) -
     return is_admin(user_id) or is_junior_admin(user_id, username)
 
 
+def has_internal_access(user_id: int | None, username: str | None = None) -> bool:
+    return bool(
+        user_id and (
+            is_admin(user_id) or materials_db.authorize_user(user_id, username)
+        )
+    )
+
+
 def button_grid(buttons: list[InlineKeyboardButton], columns: int = 2) -> list[list[InlineKeyboardButton]]:
     return [buttons[index : index + columns] for index in range(0, len(buttons), columns)]
 
@@ -307,14 +353,18 @@ def compact_nav(
 
 
 def main_menu(user_id: int | None) -> InlineKeyboardMarkup:
+    internal = has_internal_access(user_id)
     buttons = [
         InlineKeyboardButton(text="🔎 Менеджеры", callback_data="main:region"),
-        InlineKeyboardButton(text="💰 Цены", callback_data="main:prices"),
-        InlineKeyboardButton(text="📄 Прайсы", callback_data="main:price_files"),
-        InlineKeyboardButton(text="📊 Изменения", callback_data="main:price_reports"),
         InlineKeyboardButton(text="🗃 База данных", callback_data="main:database"),
-        InlineKeyboardButton(text="🔔 Ожидания", callback_data="main:waitlist"),
     ]
+    if internal:
+        buttons[1:1] = [
+            InlineKeyboardButton(text="💰 Цены", callback_data="main:prices"),
+            InlineKeyboardButton(text="📄 Прайсы", callback_data="main:price_files"),
+            InlineKeyboardButton(text="📊 Изменения", callback_data="main:price_reports"),
+        ]
+        buttons.append(InlineKeyboardButton(text="🔔 Ожидания", callback_data="main:waitlist"))
     rows = button_grid(buttons)
     extra = []
     if can_broadcast(user_id):
@@ -1358,21 +1408,140 @@ def downloadable_prices_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-@router.my_chat_member()
-async def track_client_chat(event: ChatMemberUpdated) -> None:
-    if event.chat.type not in {"group", "supergroup"}:
-        return
-    active = event.new_chat_member.status in {"member", "administrator", "creator"}
-    materials_db.upsert_client_chat(
-        event.chat.id, clean_client_title(event.chat.title or str(event.chat.id)), event.chat.type, active
+def client_tags_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    chat = materials_db.get_client_chat(chat_id)
+    selected = set(chat.tags if chat else ())
+    buttons = [
+        InlineKeyboardButton(
+            text=f"{'✅' if key in selected else '⬜'} {label}",
+            callback_data=f"chatcfg:toggle:{chat_id}:{key}",
+        )
+        for key, label in CLIENT_TAGS.items()
+    ]
+    rows = button_grid(buttons)
+    rows.append([InlineKeyboardButton(text="✅ Готово", callback_data=f"chatcfg:done:{chat_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def client_tags_text(chat_id: int) -> str:
+    chat = materials_db.get_client_chat(chat_id)
+    if not chat:
+        return "⚠️ Клиентский чат не найден."
+    selected = [CLIENT_TAGS[tag] for tag in CLIENT_TAGS if tag in chat.tags]
+    return (
+        "🏷 <b>Характеристики клиента</b>\n\n"
+        f"Чат: <b>{html.escape(chat.title)}</b>\n"
+        f"Выбрано: <b>{html.escape(', '.join(selected) if selected else 'ничего')}</b>\n\n"
+        "Отметьте все подходящие направления:"
     )
 
 
+async def send_client_tags_setup(bot: Bot, user_id: int, chat_id: int) -> bool:
+    try:
+        await bot.send_message(
+            user_id, client_tags_text(chat_id), reply_markup=client_tags_keyboard(chat_id)
+        )
+        return True
+    except Exception:
+        logging.info("Не удалось отправить настройку чата %s пользователю %s", chat_id, user_id)
+        return False
+
+
+@router.my_chat_member()
+async def track_client_chat(event: ChatMemberUpdated, bot: Bot) -> None:
+    if event.chat.type not in {"group", "supergroup"}:
+        return
+    active = event.new_chat_member.status in {"member", "administrator", "creator"}
+    was_active = event.old_chat_member.status in {"member", "administrator", "creator"}
+    actor = event.from_user
+    materials_db.upsert_client_chat(
+        event.chat.id, clean_client_title(event.chat.title or str(event.chat.id)), event.chat.type, active,
+        actor.id if active and not was_active else None,
+        actor.username if active and not was_active else None,
+    )
+    if not active or was_active:
+        return
+    authorized = is_admin(actor.id) or materials_db.authorize_user(actor.id, actor.username)
+    if authorized and await send_client_tags_setup(bot, actor.id, event.chat.id):
+        await bot.send_message(
+            event.chat.id,
+            f"✅ Бот подключён. {actor.mention_html()}, настройка характеристик отправлена вам в личные сообщения.",
+        )
+        return
+    text = (
+        f"✅ Бот подключён. {actor.mention_html()}, нажмите кнопку, чтобы указать характеристики клиента."
+        if authorized
+        else "✅ Бот подключён. Сотрудник из белого списка может настроить характеристики командой /chat."
+    )
+    markup = client_tags_keyboard(event.chat.id) if authorized else None
+    await bot.send_message(event.chat.id, text, reply_markup=markup)
+
+
+@router.message(Command("chat"))
+async def configure_current_client_chat(message: Message, bot: Bot) -> None:
+    if message.chat.type not in {"group", "supergroup"} or not message.from_user:
+        await message.answer("Команда /chat используется в клиентской группе.")
+        return
+    materials_db.upsert_client_chat(
+        message.chat.id, clean_client_title(message.chat.title or str(message.chat.id)),
+        message.chat.type, True,
+    )
+    if await send_client_tags_setup(bot, message.from_user.id, message.chat.id):
+        await message.reply("🏷 Настройка характеристик отправлена вам в личные сообщения.")
+    else:
+        await message.reply(
+            "🏷 Отметьте характеристики клиента:",
+            reply_markup=client_tags_keyboard(message.chat.id),
+        )
+
+
+@router.callback_query(F.data.startswith("chatcfg:toggle:"))
+async def toggle_client_tag(callback: CallbackQuery) -> None:
+    try:
+        _, _, raw_chat_id, tag = callback.data.split(":", 3)
+        chat_id = int(raw_chat_id)
+    except (ValueError, AttributeError):
+        await callback.answer("Некорректная настройка.", show_alert=True)
+        return
+    if tag not in CLIENT_TAGS or not materials_db.get_client_chat(chat_id):
+        await callback.answer("Чат или характеристика не найдены.", show_alert=True)
+        return
+    materials_db.toggle_client_chat_tag(chat_id, tag)
+    await callback.message.edit_text(
+        client_tags_text(chat_id), reply_markup=client_tags_keyboard(chat_id)
+    )
+    await callback.answer("Характеристики обновлены")
+
+
+@router.callback_query(F.data.startswith("chatcfg:done:"))
+async def finish_client_tags(callback: CallbackQuery) -> None:
+    chat_id = int(callback.data.rsplit(":", 1)[1])
+    chat = materials_db.get_client_chat(chat_id)
+    if not chat:
+        await callback.answer("Чат не найден.", show_alert=True)
+        return
+    selected = [CLIENT_TAGS[tag] for tag in CLIENT_TAGS if tag in chat.tags]
+    await callback.message.edit_text(
+        "✅ <b>Характеристики сохранены</b>\n\n"
+        f"Чат: <b>{html.escape(chat.title)}</b>\n"
+        f"Направления: <b>{html.escape(', '.join(selected) if selected else 'не указаны')}</b>\n\n"
+        "Изменить их можно в любое время командой /chat в клиентской группе."
+    )
+    await callback.answer()
+
+
 def broadcast_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    rows = [[
-        InlineKeyboardButton(text="➕ Создать", callback_data="broadcast:new"),
-        InlineKeyboardButton(text="📥 Список чатов", callback_data="broadcast:export_chats"),
-    ], compact_nav()]
+    rows = [
+        [
+            InlineKeyboardButton(text="➕ Создать", callback_data="broadcast:new"),
+            InlineKeyboardButton(text="🎯 По характеристикам", callback_data="broadcast:segments"),
+        ],
+        [
+            InlineKeyboardButton(text="📥 Все чаты", callback_data="broadcast:export_chats"),
+            InlineKeyboardButton(text="⚠️ Без характеристик", callback_data="broadcast:export_untagged"),
+        ],
+        compact_nav(),
+    ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1395,18 +1564,32 @@ async def open_broadcasts(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
-def build_chats_excel(destination: Path) -> None:
+def build_chats_excel(destination: Path, chats: list | None = None) -> None:
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Чаты"
-    sheet.append(["Название чата", "Chat ID", "Статус"])
-    for chat in materials_db.list_client_chats():
-        sheet.append([chat.title, chat.chat_id, "Активен" if chat.is_active else "Бот удалён"])
+    sheet.append([
+        "Название чата", "Chat ID", "СП", "БП", "Железо", "Конструкторы", "Статус", "Включить",
+    ])
+    for chat in chats if chats is not None else materials_db.list_client_chats():
+        sheet.append([
+            chat.title,
+            chat.chat_id,
+            "✅" if "sp" in chat.tags else "",
+            "✅" if "bp" in chat.tags else "",
+            "✅" if "hardware" in chat.tags else "",
+            "✅" if "constructors" in chat.tags else "",
+            "Активен" if chat.is_active else "Бот удалён",
+            "Да" if chat.is_active else "Нет",
+        ])
     sheet.freeze_panes = "A2"
     sheet.auto_filter.ref = sheet.dimensions
     sheet.column_dimensions["A"].width = 55
     sheet.column_dimensions["B"].width = 24
-    sheet.column_dimensions["C"].width = 18
+    for column in ("C", "D", "E", "F"):
+        sheet.column_dimensions[column].width = 18
+    sheet.column_dimensions["G"].width = 18
+    sheet.column_dimensions["H"].width = 14
     workbook.save(destination)
     workbook.close()
 
@@ -1421,6 +1604,101 @@ async def export_client_chats(callback: CallbackQuery) -> None:
         await callback.message.answer_document(
             FSInputFile(destination, filename=destination.name),
             caption=f"📥 Чатов в реестре: <b>{len(materials_db.list_client_chats())}</b>",
+        )
+
+
+@router.callback_query(F.data == "broadcast:export_untagged")
+async def export_untagged_client_chats(callback: CallbackQuery) -> None:
+    if not await require_broadcaster(callback):
+        return
+    chats = materials_db.list_client_chats(untagged_only=True)
+    if not chats:
+        await callback.answer("Все чаты уже имеют характеристики.", show_alert=True)
+        return
+    await callback.answer("Готовлю список…")
+    with tempfile.TemporaryDirectory() as temp_name:
+        destination = Path(temp_name) / "чаты без характеристик.xlsx"
+        await asyncio.to_thread(build_chats_excel, destination, chats)
+        await callback.message.answer_document(
+            FSInputFile(destination, filename=destination.name),
+            caption=f"⚠️ Чатов без характеристик: <b>{len(chats)}</b>",
+        )
+
+
+def broadcast_segments_keyboard(selected: list[str] | tuple[str, ...]) -> InlineKeyboardMarkup:
+    selected_set = set(selected)
+    buttons = [
+        InlineKeyboardButton(
+            text=f"{'✅' if key in selected_set else '⬜'} {label}",
+            callback_data=f"broadcast:segment_toggle:{key}",
+        )
+        for key, label in CLIENT_TAGS.items()
+    ]
+    rows = button_grid(buttons)
+    rows.append([InlineKeyboardButton(
+        text="📥 Сформировать Excel", callback_data="broadcast:segments_export"
+    )])
+    rows.append(compact_nav("main:broadcasts"))
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == "broadcast:segments")
+async def select_broadcast_segments(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_broadcaster(callback):
+        return
+    await state.clear()
+    await state.update_data(broadcast_segments=[])
+    await callback.message.edit_text(
+        "🎯 <b>Аудитория по характеристикам</b>\n\n"
+        "Отметьте нужные направления. Чат попадёт в таблицу, если у него есть "
+        "<b>хотя бы одна</b> выбранная характеристика.",
+        reply_markup=broadcast_segments_keyboard([]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("broadcast:segment_toggle:"))
+async def toggle_broadcast_segment(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_broadcaster(callback):
+        return
+    tag = callback.data.rsplit(":", 1)[1]
+    if tag not in CLIENT_TAGS:
+        await callback.answer("Характеристика не найдена.", show_alert=True)
+        return
+    selected = list((await state.get_data()).get("broadcast_segments", []))
+    selected = [value for value in selected if value != tag] if tag in selected else [*selected, tag]
+    await state.update_data(broadcast_segments=selected)
+    await callback.message.edit_reply_markup(reply_markup=broadcast_segments_keyboard(selected))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "broadcast:segments_export")
+async def export_broadcast_segments(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_broadcaster(callback):
+        return
+    selected = list((await state.get_data()).get("broadcast_segments", []))
+    if not selected:
+        await callback.answer("Выберите хотя бы одну характеристику.", show_alert=True)
+        return
+    chats = materials_db.list_client_chats(active_only=True, tags=selected)
+    if not chats:
+        await callback.answer("Подходящих активных чатов не найдено.", show_alert=True)
+        return
+    await callback.answer("Формирую таблицу…")
+    with tempfile.TemporaryDirectory() as temp_name:
+        labels = " и ".join(CLIENT_TAGS[tag] for tag in selected)
+        destination = Path(temp_name) / f"аудитория {labels}.xlsx"
+        await asyncio.to_thread(build_chats_excel, destination, chats)
+        await callback.message.answer_document(
+            FSInputFile(destination, filename=destination.name),
+            caption=(
+                f"🎯 Выбрано по принципу <b>ИЛИ</b>: {html.escape(', '.join(CLIENT_TAGS[tag] for tag in selected))}\n"
+                f"Активных чатов: <b>{len(chats)}</b>\n\n"
+                "Проверьте таблицу, при необходимости удалите лишние строки, затем загрузите её в рассылку."
+            ),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="➕ Загрузить в рассылку", callback_data="broadcast:new")
+            ]]),
         )
 
 
@@ -1449,11 +1727,19 @@ def parse_audience_excel(path: Path) -> tuple[list[int], int, int]:
         workbook.close(); raise ValueError("Excel-файл пуст.")
     normalized = [normalize(str(value or "")) for value in header]
     column = next((i for i, value in enumerate(normalized) if value in {"chat id", "чат id", "id чата"}), None)
+    include_column = next(
+        (i for i, value in enumerate(normalized) if value in {"включить", "include", "отправлять"}),
+        None,
+    )
     if column is None:
         workbook.close(); raise ValueError("Не найдена колонка Chat ID.")
     values = []
     invalid = 0
     for row in rows:
+        if include_column is not None:
+            include_value = row[include_column] if len(row) > include_column else None
+            if normalize(str(include_value or "")) in {"нет", "no", "0", "false", "не отправлять"}:
+                continue
         raw = row[column] if len(row) > column else None
         if raw is None or str(raw).strip() == "": continue
         try:
@@ -2322,8 +2608,14 @@ async def show_price_variants(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
-def products_keyboard(admin: bool = False) -> InlineKeyboardMarkup:
-    products = materials_db.list_products(visible_only=not admin)
+def products_keyboard(
+    admin: bool = False, public_only: bool = False, include_navigation: bool = True
+) -> InlineKeyboardMarkup:
+    products = (
+        materials_db.list_public_products()
+        if public_only
+        else materials_db.list_products(visible_only=not admin)
+    )
     rows = []
     for product in products:
         marker = "🟢" if product.is_visible else "⚪️"
@@ -2339,21 +2631,75 @@ def products_keyboard(admin: bool = False) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="✏️ Текст /прайс", callback_data="adm:price_message"),
         ]))
         rows.append([InlineKeyboardButton(text="💾 Скачать резервную копию", callback_data="adm:backup")])
-    rows.append(compact_nav())
+    if include_navigation:
+        rows.append(compact_nav())
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 @router.callback_query(F.data == "main:database")
 async def open_database(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    products = materials_db.list_products(visible_only=True)
+    public_only = not has_internal_access(callback.from_user.id, callback.from_user.username)
+    products = (
+        materials_db.list_public_products()
+        if public_only else materials_db.list_products(visible_only=True)
+    )
     text = (
         "🗃 <b>База данных</b>\n\nВыберите продукцию, чтобы посмотреть доступные материалы:"
         if products
         else "🗃 <b>База данных</b>\n\nМатериалы пока не опубликованы. Загляните сюда позднее."
     )
-    await callback.message.edit_text(text, reply_markup=products_keyboard())
+    await callback.message.edit_text(text, reply_markup=products_keyboard(public_only=public_only))
     await callback.answer()
+
+
+@router.message(F.text.regexp(
+    re.compile(r"^/(?:material|materials|материалы)(?:@\w+)?\s*$", re.IGNORECASE)
+))
+async def command_public_materials(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    products = materials_db.list_public_products()
+    text = (
+        "🗃 <b>Публичные материалы</b>\n\nВыберите продукцию:"
+        if products
+        else "🗃 <b>Публичные материалы</b>\n\nПубличные материалы пока не опубликованы."
+    )
+    markup = (
+        products_keyboard(
+            public_only=True, include_navigation=message.chat.type == "private"
+        )
+        if products else None
+    )
+    await message.answer(text, reply_markup=markup)
+
+
+@router.callback_query(F.data == "db:root")
+async def return_to_materials_root(callback: CallbackQuery) -> None:
+    public_only = callback_requires_public_materials(callback)
+    products = (
+        materials_db.list_public_products()
+        if public_only else materials_db.list_products(visible_only=True)
+    )
+    text = (
+        "🗃 <b>Публичные материалы</b>\n\nВыберите продукцию:"
+        if public_only else
+        "🗃 <b>База данных</b>\n\nВыберите продукцию, чтобы посмотреть доступные материалы:"
+    )
+    await callback.message.edit_text(
+        text,
+        reply_markup=products_keyboard(
+            public_only=public_only,
+            include_navigation=callback.message.chat.type == "private",
+        ),
+    )
+    await callback.answer()
+
+
+def callback_requires_public_materials(callback: CallbackQuery) -> bool:
+    return (
+        callback.message.chat.type != "private"
+        or not has_internal_access(callback.from_user.id, callback.from_user.username)
+    )
 
 
 @router.callback_query(F.data.startswith("db:p:"))
@@ -2362,9 +2708,13 @@ async def open_product(callback: CallbackQuery) -> None:
     if not product or not product.is_visible:
         await callback.answer("Товар недоступен.", show_alert=True)
         return
-    sections = materials_db.list_sections(product.id)
+    public_only = callback_requires_public_materials(callback)
+    sections = materials_db.list_sections(product.id, public_only=public_only)
+    if public_only and not sections:
+        await callback.answer("Публичные материалы этого товара недоступны.", show_alert=True)
+        return
     rows = [[InlineKeyboardButton(text=s.name, callback_data=f"db:s:{s.id}")] for s in sections]
-    rows.append(compact_nav("main:database"))
+    rows.append(compact_nav("db:root", home=callback.message.chat.type == "private"))
     text = (
         f"📦 <b>{html.escape(product.name)}</b>\n\nВыберите нужный раздел:"
         if sections
@@ -2390,7 +2740,10 @@ async def deliver_section(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer("Раздел не найден.", show_alert=True)
         return
     product = materials_db.get_product(section.product_id)
-    if not product or not product.is_visible:
+    if (
+        not product or not product.is_visible
+        or (callback_requires_public_materials(callback) and not section.is_public)
+    ):
         await callback.answer("Материал недоступен.", show_alert=True)
         return
     items = materials_db.list_materials(section.id)
@@ -3209,7 +3562,12 @@ async def save_product(message: Message, state: FSMContext) -> None:
 def admin_product_keyboard(product_id: int) -> InlineKeyboardMarkup:
     product = materials_db.get_product(product_id)
     sections = materials_db.list_sections(product_id)
-    rows = [[InlineKeyboardButton(text=f"📁 {s.name}", callback_data=f"adm:s:{s.id}")] for s in sections]
+    rows = [[
+        InlineKeyboardButton(
+            text=f"{'🌐' if s.is_public else '🔒'} {s.name}",
+            callback_data=f"adm:s:{s.id}",
+        )
+    ] for s in sections]
     rows.extend([
         [
             InlineKeyboardButton(text="➕ Раздел", callback_data=f"adm:add_section:{product_id}"),
@@ -3287,6 +3645,10 @@ def admin_section_keyboard(section_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="➕ Материалы", callback_data=f"adm:add_material:{section_id}"),
             InlineKeyboardButton(text="👁 Просмотреть", callback_data=f"adm:preview:{section_id}"),
         ],
+        [InlineKeyboardButton(
+            text="🔒 Закрыть публичный доступ" if section and section.is_public else "🌐 Сделать публичным",
+            callback_data=f"adm:toggle_section_public:{section_id}",
+        )],
         [
             InlineKeyboardButton(text="✏️ Название", callback_data=f"adm:rename_section:{section_id}"),
             InlineKeyboardButton(text="🗑 Удалить", callback_data=f"adm:confirm_section:{section_id}"),
@@ -3304,12 +3666,34 @@ async def admin_section(callback: CallbackQuery) -> None:
     if not section:
         await callback.answer("Раздел не найден.", show_alert=True); return
     count = len(materials_db.list_materials(section_id))
+    access_status = "🌐 доступен всем" if section.is_public else "🔒 только сотрудникам"
     await callback.message.edit_text(
         f"📁 <b>{html.escape(section.name)}</b>\n\nМатериалов внутри: <b>{count}</b>\n"
+        f"Доступ: <b>{access_status}</b>\n\n"
         "Нажмите на материал с символом 🗑, чтобы удалить его.",
         reply_markup=admin_section_keyboard(section_id),
     )
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:toggle_section_public:"))
+async def toggle_section_public(callback: CallbackQuery) -> None:
+    if not await require_admin(callback):
+        return
+    section_id = int(callback.data.rsplit(":", 1)[1])
+    try:
+        is_public = materials_db.toggle_section_public(section_id)
+    except ValueError:
+        await callback.answer("Раздел не найден.", show_alert=True)
+        return
+    section = materials_db.get_section(section_id)
+    await callback.message.edit_text(
+        f"{'🌐' if is_public else '🔒'} <b>{html.escape(section.name)}</b>\n\n"
+        f"Раздел теперь {'доступен всем пользователям' if is_public else 'доступен только сотрудникам'}. "
+        "Настройка распространяется на все материалы внутри.",
+        reply_markup=admin_section_keyboard(section_id),
+    )
+    await callback.answer("Доступ обновлён")
 
 
 def upload_keyboard() -> InlineKeyboardMarkup:

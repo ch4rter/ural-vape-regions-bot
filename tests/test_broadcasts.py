@@ -10,11 +10,12 @@ def test_audience_excel_parsing(tmp_path):
     path = tmp_path / "audience.xlsx"
     workbook = Workbook()
     sheet = workbook.active
-    sheet.append(["Клиент", "Chat ID"])
-    sheet.append(["Первый", -100123])
-    sheet.append(["Дубль", -100123])
-    sheet.append(["Второй", "-100456"])
-    sheet.append(["Ошибка", "abc"])
+    sheet.append(["Клиент", "Chat ID", "Включить"])
+    sheet.append(["Первый", -100123, "Да"])
+    sheet.append(["Дубль", -100123, "Да"])
+    sheet.append(["Второй", "-100456", "Да"])
+    sheet.append(["Исключён", -100789, "Нет"])
+    sheet.append(["Ошибка", "abc", "Да"])
     workbook.save(path)
 
     chat_ids, duplicates, invalid = parse_audience_excel(path)
