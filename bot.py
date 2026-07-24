@@ -117,6 +117,14 @@ class WaitState(StatesGroup):
     edit_comment = State()
 
 
+class LeadState(StatesGroup):
+    full_name = State()
+    position = State()
+    region = State()
+    company = State()
+    outlets = State()
+
+
 class AccessMiddleware(BaseMiddleware):
     async def __call__(
         self,
@@ -159,6 +167,22 @@ class AccessMiddleware(BaseMiddleware):
             return None
         if not user or is_admin(user.id) or materials_db.authorize_user(user.id, user.username):
             return await handler(event, data)
+        lead_state = data.get("raw_state")
+        lead_states = {
+            LeadState.full_name.state,
+            LeadState.position.state,
+            LeadState.region.state,
+            LeadState.company.state,
+            LeadState.outlets.state,
+        }
+        if isinstance(event, Message) and (
+            re.match(r"^/start(?:@\w+)?(?:\s|$)", (event.text or "").strip(), re.IGNORECASE)
+            or lead_state in lead_states
+        ):
+            return await handler(event, data)
+        if isinstance(event, CallbackQuery) and (event.data or "").startswith("lead:"):
+            return await handler(event, data)
+        profile_completed = bool(materials_db.get_lead_profile(user.id))
         if isinstance(event, Message):
             text = (event.text or "").strip()
             public_command = bool(re.match(
@@ -166,12 +190,26 @@ class AccessMiddleware(BaseMiddleware):
                 text,
                 re.IGNORECASE,
             ))
-            if public_command or data.get("raw_state") == AppState.region_search.state:
+            if profile_completed and (
+                public_command or data.get("raw_state") == AppState.region_search.state
+            ):
                 return await handler(event, data)
         if isinstance(event, CallbackQuery):
             callback_data = event.data or ""
-            if callback_data in {"main:menu", "main:region", "main:database"} or callback_data.startswith("db:"):
+            if profile_completed and (
+                callback_data in {"main:menu", "main:region", "main:database"}
+                or callback_data.startswith("db:")
+            ):
                 return await handler(event, data)
+        if not profile_completed:
+            if isinstance(event, CallbackQuery):
+                await event.answer("Сначала заполните короткую анкету в личном чате.", show_alert=True)
+            else:
+                await event.answer(
+                    "👋 Чтобы получить доступ к боту, сначала заполните короткую анкету.\n\n"
+                    "Нажмите /start — это займёт около минуты."
+                )
+            return None
         if isinstance(event, CallbackQuery):
             await event.answer("Доступ к боту не предоставлен.", show_alert=True)
         else:
@@ -402,11 +440,262 @@ async def show_main(target: Message, user_id: int | None, *, edit: bool = False)
         await target.answer(text, reply_markup=main_menu(user_id))
 
 
+async def start_lead_questionnaire(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await state.set_state(LeadState.full_name)
+    await message.answer(
+        "👋 <b>Давайте познакомимся</b>\n\n"
+        "Перед началом работы ответьте на пять коротких вопросов. "
+        "Анкета заполняется один раз и поможет сразу связать вас с нужным менеджером.\n\n"
+        "<b>1 из 5 · Как к вам обращаться?</b>\n"
+        "Укажите имя или имя и фамилию."
+    )
+
+
+def valid_lead_answer(value: str, *, minimum: int = 2, maximum: int = 200) -> bool:
+    return minimum <= len(value.strip()) <= maximum
+
+
+@router.message(
+    StateFilter(
+        LeadState.full_name, LeadState.position, LeadState.region,
+        LeadState.company, LeadState.outlets,
+    ),
+    CommandStart(),
+)
+async def restart_lead_questionnaire(message: Message, state: FSMContext) -> None:
+    await start_lead_questionnaire(message, state)
+
+
+@router.message(LeadState.full_name, F.text)
+async def lead_full_name(message: Message, state: FSMContext) -> None:
+    if not valid_lead_answer(message.text, maximum=100):
+        await message.answer("Укажите имя обычным текстом — от 2 до 100 символов.")
+        return
+    await state.update_data(lead_full_name=message.text.strip())
+    await state.set_state(LeadState.position)
+    await message.answer(
+        "<b>2 из 5 · Какая у вас должность?</b>\n\n"
+        "Например: владелец, руководитель, закупщик или продавец."
+    )
+
+
+@router.message(LeadState.position, F.text)
+async def lead_position(message: Message, state: FSMContext) -> None:
+    if not valid_lead_answer(message.text, maximum=100):
+        await message.answer("Укажите должность обычным текстом — от 2 до 100 символов.")
+        return
+    await state.update_data(lead_position=message.text.strip())
+    await state.set_state(LeadState.region)
+    await message.answer(
+        "<b>3 из 5 · В каком городе или регионе вы работаете?</b>\n\n"
+        "Например: <code>Тамбов</code>, <code>Санкт-Петербург</code> или "
+        "<code>Минская область</code>."
+    )
+
+
+def lead_region_keyboard(indexes: list[int]) -> InlineKeyboardMarkup:
+    rows = []
+    seen = set()
+    for index in indexes[:8]:
+        entry = catalog.entries[index]
+        signature = (entry.name, entry.location, entry.manager)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        label = entry.name
+        if entry.location:
+            label += f" — {entry.location}"
+        if len(label) > 64:
+            label = f"{label[:61]}..."
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"lead:region:{index}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def accept_lead_region(
+    target: Message, state: FSMContext, entry: Entry, *, edit: bool = False
+) -> None:
+    region = entry.name if not entry.location else f"{entry.name} · {entry.location}"
+    await state.update_data(lead_region=region, lead_manager=entry.manager)
+    await state.set_state(LeadState.company)
+    text = (
+        f"✅ Регион: <b>{html.escape(region)}</b>\n"
+        f"Менеджер: {manager_html(entry.manager)}\n\n"
+        "<b>4 из 5 · Как называется ваш магазин или компания?</b>"
+    )
+    if edit:
+        await target.edit_text(text)
+    else:
+        await target.answer(text)
+
+
+@router.message(LeadState.region, F.text)
+async def lead_region(message: Message, state: FSMContext) -> None:
+    query = message.text.strip()
+    if not valid_lead_answer(query):
+        await message.answer("Укажите город или регион обычным текстом.")
+        return
+    found = catalog.exact(query)
+    unique = list(dict.fromkeys((entry.name, entry.location, entry.manager) for entry in found))
+    if len({manager for _, _, manager in unique}) == 1 and found:
+        await accept_lead_region(message, state, found[0])
+        return
+    indexes = (
+        list(catalog.by_name[normalize(query)])
+        if found else catalog.suggestions(query, limit=8)
+    )
+    if not indexes:
+        await message.answer(
+            "Не удалось найти этот регион. Проверьте написание или укажите ближайший крупный город."
+        )
+        return
+    await message.answer(
+        "Выберите подходящий вариант:",
+        reply_markup=lead_region_keyboard(indexes),
+    )
+
+
+@router.callback_query(F.data.startswith("lead:region:"))
+async def select_lead_region(callback: CallbackQuery, state: FSMContext) -> None:
+    try:
+        entry = catalog.entries[int(callback.data.rsplit(":", 1)[1])]
+    except (ValueError, IndexError):
+        await callback.answer("Регион не найден. Введите его ещё раз.", show_alert=True)
+        return
+    await accept_lead_region(callback.message, state, entry, edit=True)
+    await callback.answer()
+
+
+@router.message(LeadState.company, F.text)
+async def lead_company(message: Message, state: FSMContext) -> None:
+    if not valid_lead_answer(message.text, maximum=200):
+        await message.answer("Укажите название магазина или компании — от 2 до 200 символов.")
+        return
+    await state.update_data(lead_company=message.text.strip())
+    await state.set_state(LeadState.outlets)
+    await message.answer(
+        "<b>5 из 5 · Расскажите о формате работы</b>\n\n"
+        "Укажите количество торговых точек. Если работаете оптом — напишите <code>опт</code>. "
+        "Если совмещаете розницу и опт, укажите оба варианта, например: "
+        "<code>3 торговые точки + опт</code>."
+    )
+
+
+def manager_recipient_id(manager: str) -> int | None:
+    username = MANAGER_LINKS.get(normalize(manager))
+    if not username:
+        return None
+    for user in materials_db.list_access_users():
+        if user.username and normalize(user.username) == normalize(username) and user.telegram_id:
+            return user.telegram_id
+    return None
+
+
+def lead_profile_text(profile, *, heading: str = "🆕 <b>Новая анкета клиента</b>") -> str:
+    username = f"@{profile.username}" if profile.username else "не указан"
+    return (
+        f"{heading}\n\n"
+        f"Имя: <b>{html.escape(profile.full_name)}</b>\n"
+        f"Должность: <b>{html.escape(profile.position)}</b>\n"
+        f"Регион: <b>{html.escape(profile.region)}</b>\n"
+        f"Компания: <b>{html.escape(profile.company)}</b>\n"
+        f"Формат: <b>{html.escape(profile.outlets)}</b>\n"
+        f"Telegram: <b>{html.escape(username)}</b>\n"
+        f"Telegram ID: <code>{profile.user_id}</code>\n"
+        f"Ответственный менеджер: {manager_html(profile.manager)}"
+    )
+
+
+def contact_user_url(user_id: int, username: str | None) -> str:
+    return f"https://t.me/{username}" if username else f"tg://user?id={user_id}"
+
+
+async def notify_manager_about_lead(bot: Bot, profile) -> bool:
+    recipient = manager_recipient_id(profile.manager)
+    markup = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="💬 Связаться",
+            url=contact_user_url(profile.user_id, profile.username),
+        )
+    ]])
+    if recipient:
+        try:
+            await bot.send_message(recipient, lead_profile_text(profile), reply_markup=markup)
+            return True
+        except Exception:
+            logging.exception("Не удалось отправить анкету менеджеру %s", profile.manager)
+    fallback_text = (
+        lead_profile_text(profile)
+        + "\n\n⚠️ Анкета не доставлена менеджеру автоматически. "
+        "Проверьте, что менеджер добавлен в белый список по username и запускал бота."
+    )
+    for admin_id in admin_ids:
+        try:
+            await bot.send_message(admin_id, fallback_text, reply_markup=markup)
+        except Exception:
+            logging.exception("Не удалось отправить анкету администратору %s", admin_id)
+    return False
+
+
+@router.message(LeadState.outlets, F.text)
+async def lead_outlets(message: Message, state: FSMContext, bot: Bot) -> None:
+    if not valid_lead_answer(message.text, maximum=200):
+        await message.answer("Укажите количество точек или формат работы обычным текстом.")
+        return
+    data = await state.get_data()
+    profile = materials_db.save_lead_profile(
+        message.from_user.id,
+        message.from_user.username,
+        data["lead_full_name"],
+        data["lead_position"],
+        data["lead_region"],
+        data["lead_company"],
+        message.text.strip(),
+        data["lead_manager"],
+    )
+    delivered = await notify_manager_about_lead(bot, profile)
+    await state.clear()
+    manager_username = MANAGER_LINKS.get(normalize(profile.manager))
+    rows = []
+    if manager_username:
+        rows.append([InlineKeyboardButton(
+            text=f"💬 Связаться с менеджером {profile.manager}",
+            url=f"https://t.me/{manager_username}",
+        )])
+    rows.append(compact_nav())
+    await message.answer(
+        "✅ <b>Спасибо! Анкета сохранена</b>\n\n"
+        f"Ваш менеджер: {manager_html(profile.manager)}\n\n"
+        + (
+            "Мы передали менеджеру ваши контактные данные."
+            if delivered else
+            "Менеджер закреплён за вашим регионом и сможет ознакомиться с вашей анкетой."
+        ),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.message(StateFilter(
+    LeadState.full_name, LeadState.position, LeadState.region,
+    LeadState.company, LeadState.outlets,
+))
+async def lead_non_text(message: Message) -> None:
+    await message.answer("Пожалуйста, ответьте на вопрос обычным текстовым сообщением.")
+
+
 @router.message(CommandStart())
 @router.message(Command("menu"))
 async def command_menu(message: Message, state: FSMContext) -> None:
     await cleanup_pending_excel(state)
     await state.clear()
+    if (
+        message.chat.type == "private"
+        and message.from_user
+        and not has_internal_access(message.from_user.id, message.from_user.username)
+        and not materials_db.get_lead_profile(message.from_user.id)
+    ):
+        await start_lead_questionnaire(message, state)
+        return
     payload = (message.text or "").split(maxsplit=1)
     if len(payload) > 1 and payload[1].startswith("wait_"):
         try:
@@ -426,6 +715,15 @@ async def command_menu(message: Message, state: FSMContext) -> None:
 async def cancel(message: Message, state: FSMContext) -> None:
     await cleanup_pending_excel(state)
     await state.clear()
+    if (
+        message.chat.type == "private"
+        and message.from_user
+        and not has_internal_access(message.from_user.id, message.from_user.username)
+        and not materials_db.get_lead_profile(message.from_user.id)
+    ):
+        await message.answer("Анкета ещё не завершена. Давайте начнём сначала.")
+        await start_lead_questionnaire(message, state)
+        return
     await message.answer("✅ Текущее действие отменено.")
     await show_main(message, message.from_user.id if message.from_user else None)
 
@@ -2633,6 +2931,7 @@ def products_keyboard(
             InlineKeyboardButton(text="👥 Доступ", callback_data="adm:access"),
             InlineKeyboardButton(text="📊 Excel", callback_data="adm:excel"),
             InlineKeyboardButton(text="✏️ Текст /прайс", callback_data="adm:price_message"),
+            InlineKeyboardButton(text="📝 Анкеты клиентов", callback_data="adm:leads"),
         ]))
         rows.append([InlineKeyboardButton(text="💾 Скачать резервную копию", callback_data="adm:backup")])
     if include_navigation:
@@ -3228,6 +3527,7 @@ async def admin_menu(callback: CallbackQuery, state: FSMContext) -> None:
             "Здесь можно настроить сообщение, которое бот отправляет перед актуальными прайсами.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="✏️ Текст /прайс", callback_data="adm:price_message")],
+                [InlineKeyboardButton(text="📝 Анкеты клиентов", callback_data="adm:leads")],
                 compact_nav(),
             ]),
         )
@@ -3240,6 +3540,58 @@ async def admin_menu(callback: CallbackQuery, state: FSMContext) -> None:
         reply_markup=products_keyboard(admin=True),
     )
     await callback.answer()
+
+
+def build_leads_excel(destination: Path) -> int:
+    profiles = materials_db.list_lead_profiles()
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Анкеты"
+    sheet.append([
+        "Дата", "Имя", "Должность", "Регион / город", "Магазин / компания",
+        "Торговые точки / формат", "Менеджер", "Username", "Telegram ID",
+    ])
+    for profile in profiles:
+        sheet.append([
+            profile.created_at,
+            profile.full_name,
+            profile.position,
+            profile.region,
+            profile.company,
+            profile.outlets,
+            profile.manager,
+            f"@{profile.username}" if profile.username else "",
+            profile.user_id,
+        ])
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = sheet.dimensions
+    widths = {
+        "A": 22, "B": 28, "C": 24, "D": 32, "E": 38,
+        "F": 28, "G": 22, "H": 24, "I": 18,
+    }
+    for column, width in widths.items():
+        sheet.column_dimensions[column].width = width
+    workbook.save(destination)
+    workbook.close()
+    return len(profiles)
+
+
+@router.callback_query(F.data == "adm:leads")
+async def export_lead_profiles(callback: CallbackQuery) -> None:
+    if not await require_price_message_admin(callback):
+        return
+    profiles = materials_db.list_lead_profiles()
+    if not profiles:
+        await callback.answer("Заполненных анкет пока нет.", show_alert=True)
+        return
+    await callback.answer("Формирую таблицу…")
+    with tempfile.TemporaryDirectory() as temp_name:
+        destination = Path(temp_name) / f"анкеты клиентов {datetime.now():%Y-%m-%d}.xlsx"
+        count = await asyncio.to_thread(build_leads_excel, destination)
+        await callback.message.answer_document(
+            FSInputFile(destination, filename=destination.name),
+            caption=f"📝 Заполненных анкет: <b>{count}</b>",
+        )
 
 
 def price_message_keyboard() -> InlineKeyboardMarkup:

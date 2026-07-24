@@ -1,6 +1,9 @@
 from openpyxl import Workbook, load_workbook
 
-from bot import SERVICE_CHAT_ID, build_broadcast_report, build_chats_excel, parse_audience_excel
+from bot import (
+    SERVICE_CHAT_ID, build_broadcast_report, build_chats_excel,
+    build_leads_excel, parse_audience_excel,
+)
 import bot
 from materials_db import MaterialsDB
 
@@ -44,6 +47,17 @@ def test_chat_export_and_broadcast_report(tmp_path):
         report = load_workbook(report_path, data_only=True)
         assert report.active["C2"].value == "Отправлено"
         report.close()
+
+        bot.materials_db.save_lead_profile(
+            123456, "client", "Иван", "Владелец", "Тамбов",
+            "Vape Shop", "2 точки", "Андрей",
+        )
+        leads_path = tmp_path / "leads.xlsx"
+        assert build_leads_excel(leads_path) == 1
+        leads = load_workbook(leads_path, data_only=True)
+        assert leads.active["B2"].value == "Иван"
+        assert leads.active["I2"].value == 123456
+        leads.close()
     finally:
         if previous is not None:
             bot.materials_db = previous

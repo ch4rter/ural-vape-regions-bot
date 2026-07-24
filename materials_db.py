@@ -64,6 +64,19 @@ class WaitEntry:
     last_match: dict | None
 
 
+@dataclass(frozen=True)
+class LeadProfile:
+    user_id: int
+    username: str | None
+    full_name: str
+    position: str
+    region: str
+    company: str
+    outlets: str
+    manager: str
+    created_at: str
+
+
 class MaterialsDB:
     def __init__(self, path: Path):
         self.path = path
@@ -130,6 +143,17 @@ class MaterialsDB:
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS lead_profiles (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    full_name TEXT NOT NULL,
+                    position TEXT NOT NULL,
+                    region TEXT NOT NULL,
+                    company TEXT NOT NULL,
+                    outlets TEXT NOT NULL,
+                    manager TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE TABLE IF NOT EXISTS wait_entries (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -219,9 +243,18 @@ class MaterialsDB:
         normalized_username = username.lower() if username else None
         with self._connect() as connection:
             by_id = connection.execute(
-                "SELECT id FROM access_users WHERE telegram_id = ?", (telegram_id,)
+                "SELECT id, username FROM access_users WHERE telegram_id = ?", (telegram_id,)
             ).fetchone()
             if by_id:
+                if normalized_username and not by_id["username"]:
+                    try:
+                        connection.execute(
+                            "UPDATE access_users SET username = ? WHERE id = ? AND username IS NULL",
+                            (normalized_username, by_id["id"]),
+                        )
+                        connection.commit()
+                    except sqlite3.IntegrityError:
+                        pass
                 return True
             if not normalized_username:
                 return False
@@ -528,6 +561,55 @@ class MaterialsDB:
         with self._connect() as connection:
             row = connection.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
         return row["value"] if row else None
+
+    def save_lead_profile(
+        self, user_id: int, username: str | None, full_name: str, position: str,
+        region: str, company: str, outlets: str, manager: str,
+    ) -> LeadProfile:
+        values = [full_name, position, region, company, outlets, manager]
+        if any(not value.strip() for value in values):
+            raise ValueError("Все поля анкеты должны быть заполнены.")
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO lead_profiles(
+                       user_id, username, full_name, position, region, company, outlets, manager
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(user_id) DO NOTHING""",
+                (
+                    user_id, username.lower() if username else None, full_name.strip(),
+                    position.strip(), region.strip(), company.strip(), outlets.strip(), manager.strip(),
+                ),
+            )
+        profile = self.get_lead_profile(user_id)
+        if not profile:
+            raise RuntimeError("Не удалось сохранить анкету.")
+        return profile
+
+    def get_lead_profile(self, user_id: int) -> LeadProfile | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT user_id, username, full_name, position, region, company,
+                          outlets, manager, created_at
+                   FROM lead_profiles WHERE user_id = ?""",
+                (user_id,),
+            ).fetchone()
+        return self._lead_profile(row) if row else None
+
+    def list_lead_profiles(self) -> list[LeadProfile]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT user_id, username, full_name, position, region, company,
+                          outlets, manager, created_at
+                   FROM lead_profiles ORDER BY created_at DESC, user_id DESC"""
+            ).fetchall()
+        return [self._lead_profile(row) for row in rows]
+
+    @staticmethod
+    def _lead_profile(row: sqlite3.Row) -> LeadProfile:
+        return LeadProfile(
+            row["user_id"], row["username"], row["full_name"], row["position"],
+            row["region"], row["company"], row["outlets"], row["manager"], row["created_at"],
+        )
 
     @staticmethod
     def _access_user(row: sqlite3.Row) -> AccessUser:

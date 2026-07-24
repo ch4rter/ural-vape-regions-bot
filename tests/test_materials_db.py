@@ -124,6 +124,23 @@ def test_public_sections_are_opt_in(tmp_path):
     assert db.list_public_products() == []
 
 
+def test_lead_profile_is_saved_once(tmp_path):
+    db = MaterialsDB(tmp_path / "materials.sqlite3")
+    profile = db.save_lead_profile(
+        123456, "client_user", "Иван", "Владелец", "Тамбов",
+        "Vape Shop", "3 точки + опт", "Андрей",
+    )
+    assert profile.manager == "Андрей"
+    assert db.get_lead_profile(123456).company == "Vape Shop"
+
+    repeated = db.save_lead_profile(
+        123456, "changed", "Другое имя", "Закупщик", "Москва",
+        "Другая компания", "опт", "Матвей",
+    )
+    assert repeated.full_name == "Иван"
+    assert len(db.list_lead_profiles()) == 1
+
+
 def test_waitlist_is_scoped_to_manager_and_remembers_matches(tmp_path):
     db = MaterialsDB(tmp_path / "materials.sqlite3")
     first = db.add_wait_entry(
