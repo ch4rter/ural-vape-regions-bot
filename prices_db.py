@@ -552,7 +552,13 @@ class PricesDB:
                     "display": row["display_name"], "category": row["category_name"],
                     "search": [], "counts": {},
                 }
-            merged[key]["search"].append(f"{row['full_path']} {row['item_names'] or ''}")
+            aliases = ""
+            group_search_text = normalize_price_text(
+                f"{row['display_name']} {row['full_path']} {row['item_names'] or ''}"
+            )
+            if is_sp_position(row["full_path"]) and "dojo" in group_search_text.split():
+                aliases = " oggo"
+            merged[key]["search"].append(f"{row['full_path']} {row['item_names'] or ''}{aliases}")
             merged[key]["counts"][row["warehouse"]] = row["item_count"]
         return [
             GroupSummary(value["id"], key, value["display"], value["category"], " ".join(value["search"]), value["counts"])

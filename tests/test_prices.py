@@ -388,6 +388,10 @@ def test_sp_positions_are_separate_and_allow_missing_cash_price(tmp_path):
         "Vaporesso Dojo Opal 12000",
         "Vaporesso Dojo Opal 12000 · СП",
     }
+    assert any("· СП" in group.display_name for group in db.search_groups("OGGO DOJO"))
+    sp_results = db.search_groups("СП OGGO DOJO")
+    assert sp_results
+    assert all("· СП" in group.display_name for group in sp_results)
     details = db.group_details(next(group.callback_id for group in results if "· СП" in group.display_name))
     assert details is not None
     assert details.tiers[0].cash == Decimal("0")
