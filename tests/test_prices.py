@@ -7,6 +7,7 @@ from bot import (
     client_wait_message,
     discounted,
     format_combined_report_notification,
+    format_price_group,
     format_price_item,
     format_price_report,
     manager_html,
@@ -351,3 +352,47 @@ def test_latest_price_change_report_replaces_previous_report(tmp_path):
     assert workbook["Закончилось"]["A2"].value == "003"
     assert workbook["Изменились цены"]["A2"].value == "001"
     workbook.close()
+
+
+def test_sp_positions_are_separate_and_allow_missing_cash_price(tmp_path):
+    source = tmp_path / "sp-price.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    for _ in range(7):
+        sheet.append([])
+    sheet.append(["Код", "Наименование", "Ед.изм.", "от 50т.р. нал", "от 50т.р. безнал"])
+    sheet.append(["ЭС/Одноразовые/Vaporesso/Vaporesso Dojo Opal 12000"])
+    sheet.append(["REG-1", "Vaporesso Dojo Opal 12000 - Cherry", "шт", 590, 649])
+    sheet.append(["ЭС/Одноразовые СП/Vaporesso/Vaporesso Dojo Opal 12000"])
+    sheet.append(["SP-1", "(СП) Vaporesso Dojo Opal 12000 - Cherry", "шт", 0, 1090])
+    sheet.append(["ЭС/Жидкость для ЭСДН/OGGO"])
+    sheet.append(["ZERO-1", "Жидкость OGGO без наличной цены", "шт", 0, 2500])
+    workbook.save(source)
+
+    parsed = parse_price_file(source)
+
+    assert parsed.item_count == 2
+    assert len(parsed.groups) == 2
+    regular = next(group for group in parsed.groups if "· СП" not in group.display_name)
+    sp_group = next(group for group in parsed.groups if "· СП" in group.display_name)
+    assert regular.merge_key != sp_group.merge_key
+    assert regular.display_name == "Vaporesso Dojo Opal 12000"
+    assert sp_group.display_name == "Vaporesso Dojo Opal 12000 · СП"
+    assert sp_group.items[0].cash == Decimal("0")
+    assert sp_group.items[0].cashless == Decimal("1090")
+
+    db = PricesDB(tmp_path / "prices.sqlite3")
+    db.replace_warehouse("center", parsed, source.name)
+    results = db.search_groups("Dojo Opal 12000")
+    assert {group.display_name for group in results} == {
+        "Vaporesso Dojo Opal 12000",
+        "Vaporesso Dojo Opal 12000 · СП",
+    }
+    details = db.group_details(next(group.callback_id for group in results if "· СП" in group.display_name))
+    assert details is not None
+    assert details.tiers[0].cash == Decimal("0")
+    assert details.tiers[0].cashless == Decimal("1090")
+    card = format_price_group(details)
+    assert "Нал —" in card
+    assert "Безнал — <b>1 090,00 ₽</b>" in card
+    assert "<b>0,00 ₽</b>" not in card

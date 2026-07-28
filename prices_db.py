@@ -42,6 +42,23 @@ def normalize_price_text(value: str) -> str:
     return " ".join(aliases.get(word, word) for word in value.split())
 
 
+def is_sp_position(full_path: str, item_name: str = "") -> bool:
+    """Return True only for the standalone СП marker, not words like «распродажа»."""
+    return "сп" in normalize_price_text(f"{full_path} {item_name}").split()
+
+
+def group_identity(full_path: str, display_name: str | None = None, item_name: str = "") -> tuple[str, str]:
+    """Build a stable group key while keeping regular and СП positions separate."""
+    display = display_name if display_name is not None else clean_group_name(full_path)
+    is_sp = is_sp_position(full_path, item_name)
+    if is_sp:
+        display = re.sub(r"^\s*(?:\(\s*СП\s*\)|СП)\s*", "", display, flags=re.IGNORECASE).strip()
+        display = f"{display} · СП"
+    category_key, _ = category_from_path(full_path)
+    merge_key = f"{category_key}|{normalize_price_text(display)}"
+    return merge_key, display
+
+
 def clean_group_name(full_path: str) -> str:
     def clean_segment(value: str) -> str:
         value = re.sub(r"^\d+\s*\.\s*", "", value.strip())
@@ -100,14 +117,14 @@ def category_from_path(full_path: str) -> tuple[str, str]:
     return normalize_price_text(fallback), fallback
 
 
-def to_decimal(value) -> Decimal | None:
+def to_decimal(value, allow_zero: bool = False) -> Decimal | None:
     if isinstance(value, bool) or value is None:
         return None
     try:
         result = Decimal(str(value).replace(",", "."))
     except Exception:
         return None
-    return result if result > 0 else None
+    return result if result > 0 or (allow_zero and result == 0) else None
 
 
 @dataclass(frozen=True)
@@ -227,7 +244,7 @@ def parse_price_file(path: Path) -> ParsedPrice:
             return
         display_name = clean_group_name(current_path)
         category_key, category_name = category_from_path(current_path)
-        merge_key = f"{category_key}|{normalize_price_text(display_name)}"
+        merge_key, display_name = group_identity(current_path, display_name)
         parsed_groups.append(
             ParsedGroup(
                 merge_key, display_name, current_path, category_key, category_name,
@@ -240,23 +257,31 @@ def parse_price_file(path: Path) -> ParsedPrice:
         values = tuple(row)
         first = str(values[0] or "").strip() if values else ""
         name = str(values[name_idx] or "").strip() if len(values) > name_idx else ""
-        cash = to_decimal(values[cash_idx] if len(values) > cash_idx else None)
-        cashless = to_decimal(values[cashless_idx] if len(values) > cashless_idx else None)
-        if first and "/" in first and (not name or cash is None or cashless is None):
+        cash = to_decimal(values[cash_idx] if len(values) > cash_idx else None, allow_zero=True)
+        cashless = to_decimal(values[cashless_idx] if len(values) > cashless_idx else None, allow_zero=True)
+        valid_prices = (
+            cash is not None
+            and cashless is not None
+            and (
+                (cash > 0 and cashless > 0)
+                or (is_sp_position(current_path or first, name) and (cash > 0 or cashless > 0))
+            )
+        )
+        if first and "/" in first and (not name or not valid_prices):
             finish_group()
             current_path = first
             continue
-        if not name or cash is None or cashless is None or not current_path:
+        if not name or not valid_prices or not current_path:
             continue
         if normalize_price_text(name).startswith("акция "):
             action_count += 1
             clean_name = re.sub(r"^\s*АКЦИЯ\s+", "", name, flags=re.IGNORECASE)
             base_name = clean_name.split(" - ", 1)[0].strip() if " - " in clean_name else clean_name
             category_key, category_name = category_from_path(current_path)
-            merge_key = f"{category_key}|{normalize_price_text(base_name)}"
+            merge_key, display_name = group_identity(current_path, base_name, clean_name)
             if merge_key not in action_groups:
                 action_groups[merge_key] = {
-                    "display": base_name,
+                    "display": display_name,
                     "path": f"{current_path}/{base_name}",
                     "category_key": category_key,
                     "category_name": category_name,
@@ -928,24 +953,32 @@ def generate_selected_price(
     for row_number in range(header_row + 1, sheet.max_row + 1):
         first = str(sheet.cell(row_number, 1).value or "").strip()
         name = str(sheet.cell(row_number, name_col).value or "").strip()
-        cash = to_decimal(sheet.cell(row_number, cash_col).value)
-        cashless = to_decimal(sheet.cell(row_number, cashless_col).value)
-        if first and "/" in first and (not name or cash is None or cashless is None):
+        cash = to_decimal(sheet.cell(row_number, cash_col).value, allow_zero=True)
+        cashless = to_decimal(sheet.cell(row_number, cashless_col).value, allow_zero=True)
+        valid_prices = (
+            cash is not None
+            and cashless is not None
+            and (
+                (cash > 0 and cashless > 0)
+                or (is_sp_position(current_path or first, name) and (cash > 0 or cashless > 0))
+            )
+        )
+        if first and "/" in first and (not name or not valid_prices):
             current_path = first
             current_group_row = row_number
             group_rows.append(row_number)
             first_group_row = first_group_row or row_number
             continue
-        if not current_path or not name or cash is None or cashless is None:
+        if not current_path or not name or not valid_prices:
             continue
         last_item_row = row_number
         category_key, _ = category_from_path(current_path)
         if normalize_price_text(name).startswith("акция "):
             clean_name = re.sub(r"^\s*АКЦИЯ\s+", "", name, flags=re.IGNORECASE)
             base_name = clean_name.split(" - ", 1)[0].strip() if " - " in clean_name else clean_name
-            row_key = f"{category_key}|{normalize_price_text(base_name)}"
+            row_key, _ = group_identity(current_path, base_name, clean_name)
         else:
-            row_key = f"{category_key}|{normalize_price_text(clean_group_name(current_path))}"
+            row_key, _ = group_identity(current_path)
         if row_key in selected_keys:
             selected_item_rows.add(row_number)
             code = str(sheet.cell(row_number, 1).value or "").strip()

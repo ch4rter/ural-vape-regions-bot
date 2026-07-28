@@ -1133,6 +1133,10 @@ def discounted(value: Decimal, percent: int) -> Decimal:
     return value * (Decimal(100 - percent) / Decimal(100))
 
 
+def payment_price(value: Decimal, percent: int) -> str:
+    return f"<b>{money(discounted(value, percent))} ₽</b>" if value > 0 else "—"
+
+
 def variant_word(count: int) -> str:
     if count % 10 == 1 and count % 100 != 11:
         return "вариант"
@@ -1230,12 +1234,20 @@ def format_price_group(details: GroupDetails) -> str:
             lines.append(f"❌ {WAREHOUSES[warehouse]} — нет в прайсе")
     lines.extend(["", "💳 <b>Цены внутри группы</b>"])
     if len(details.tiers) > 1:
-        cash_values = [tier.cash for tier in details.tiers]
-        cashless_values = [tier.cashless for tier in details.tiers]
+        cash_values = [tier.cash for tier in details.tiers if tier.cash > 0]
+        cashless_values = [tier.cashless for tier in details.tiers if tier.cashless > 0]
+        lines.append("В этой группе цены зависят от конкретной позиции.")
+        if cash_values:
+            lines.append(f"• Нал — <b>от {money(min(cash_values))} до {money(max(cash_values))} ₽</b>")
+        else:
+            lines.append("• Нал —")
+        if cashless_values:
+            lines.append(
+                f"• Безнал — <b>от {money(min(cashless_values))} до {money(max(cashless_values))} ₽</b>"
+            )
+        else:
+            lines.append("• Безнал —")
         lines.extend([
-            "В этой группе цены зависят от конкретной позиции.",
-            f"• Нал — <b>от {money(min(cash_values))} до {money(max(cash_values))} ₽</b>",
-            f"• Безнал — <b>от {money(min(cashless_values))} до {money(max(cashless_values))} ₽</b>",
             "",
             "Откройте <b>«Позиции и цены»</b>, чтобы выбрать нужную модель или характеристику.",
         ])
@@ -1247,14 +1259,12 @@ def format_price_group(details: GroupDetails) -> str:
                 f"<b>Ценовой уровень {number}</b> · {tier.variant_count} {variant_word(tier.variant_count)}",
             ])
         for percent in (0, 5, 10, 15):
-            cash = money(discounted(tier.cash, percent))
-            cashless = money(discounted(tier.cashless, percent))
             label = "Без скидки" if percent == 0 else f"Скидка {percent}%"
             lines.extend([
                 "",
                 f"<b>{label}</b>",
-                f"• Нал — <b>{cash} ₽</b>",
-                f"• Безнал — <b>{cashless} ₽</b>",
+                f"• Нал — {payment_price(tier.cash, percent)}",
+                f"• Безнал — {payment_price(tier.cashless, percent)}",
             ])
     return "\n".join(lines)
 
@@ -1283,15 +1293,15 @@ def format_price_variants(summary, variants, page: int) -> str:
             cash, cashless = next(iter(unique_prices))
             lines.extend([
                 f"📍 {html.escape(warehouses)}",
-                f"Нал <b>{money(cash)} ₽</b> · Безнал <b>{money(cashless)} ₽</b>",
+                f"Нал {payment_price(cash, 0)} · Безнал {payment_price(cashless, 0)}",
             ])
         else:
             for warehouse in ("center", "west", "ural"):
                 if warehouse in variant.warehouse_prices:
                     cash, cashless = variant.warehouse_prices[warehouse]
                     lines.append(
-                        f"📍 {WAREHOUSES[warehouse]}: нал <b>{money(cash)} ₽</b> · "
-                        f"безнал <b>{money(cashless)} ₽</b>"
+                        f"📍 {WAREHOUSES[warehouse]}: нал {payment_price(cash, 0)} · "
+                        f"безнал {payment_price(cashless, 0)}"
                     )
     return "\n".join(lines)
 
@@ -1313,8 +1323,8 @@ def format_price_item(item) -> str:
         for percent in (0, 5, 10, 15):
             label = "Базовая" if percent == 0 else f"−{percent}%"
             lines.append(
-                f"{label}: нал <b>{money(discounted(cash, percent))} ₽</b> · "
-                f"безнал <b>{money(discounted(cashless, percent))} ₽</b>"
+                f"{label}: нал {payment_price(cash, percent)} · "
+                f"безнал {payment_price(cashless, percent)}"
             )
     missing = [WAREHOUSES[key] for key in ("center", "west", "ural") if key not in item.warehouse_prices]
     if missing:
