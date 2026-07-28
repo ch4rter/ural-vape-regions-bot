@@ -22,7 +22,16 @@ from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, ChatMemberUpdated, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    CallbackQuery,
+    ChatMemberUpdated,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+)
 from dotenv import load_dotenv
 from openpyxl import Workbook, load_workbook
 
@@ -67,6 +76,7 @@ PRICE_MESSAGE_SETTING = "price_command_message"
 PRICE_ATTACHMENT_KIND_SETTING = "price_command_attachment_kind"
 PRICE_ATTACHMENT_ID_SETTING = "price_command_attachment_id"
 PRICE_ATTACHMENT_NAME_SETTING = "price_command_attachment_name"
+HOME_BUTTON_TEXT = "🏠 Главное меню"
 DEFAULT_PRICE_COMMAND_MESSAGE = (
     "📄 <b>Актуальные прайсы</b>\n\n"
     "<b>Центр</b> — Москва\n"
@@ -193,7 +203,9 @@ class AccessMiddleware(BaseMiddleware):
                 re.IGNORECASE,
             ))
             if profile_completed and (
-                public_command or data.get("raw_state") == AppState.region_search.state
+                public_command
+                or text == HOME_BUTTON_TEXT
+                or data.get("raw_state") == AppState.region_search.state
             ):
                 return await handler(event, data)
         if isinstance(event, CallbackQuery):
@@ -431,17 +443,51 @@ async def edit_or_answer(
         await message.answer(text, reply_markup=reply_markup)
 
 
+def persistent_home_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=HOME_BUTTON_TEXT)]],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Выберите действие или напишите сообщение",
+    )
+
+
 async def show_main(target: Message, user_id: int | None, *, edit: bool = False) -> None:
-    text = (
+    intro = (
         "👋 <b>Добро пожаловать!</b>\n\n"
         "Здесь можно найти ответственного менеджера, проверить цены и наличие, "
-        "получить рабочие материалы или открыть свой лист ожидания.\n\n"
-        "Выберите нужный раздел:"
+        "получить рабочие материалы или открыть свой лист ожидания."
     )
     if edit:
-        await target.edit_text(text, reply_markup=main_menu(user_id))
+        await target.edit_text(
+            intro + "\n\nВыберите нужный раздел:",
+            reply_markup=main_menu(user_id),
+        )
     else:
-        await target.answer(text, reply_markup=main_menu(user_id))
+        await target.answer(
+            intro,
+            reply_markup=persistent_home_keyboard(),
+        )
+        await target.answer("Выберите нужный раздел:", reply_markup=main_menu(user_id))
+
+
+@router.message(F.text == HOME_BUTTON_TEXT)
+async def persistent_home_button(message: Message, state: FSMContext) -> None:
+    if (
+        message.chat.type == "private"
+        and message.from_user
+        and not has_internal_access(message.from_user.id, message.from_user.username)
+        and not materials_db.get_lead_profile(message.from_user.id)
+    ):
+        await message.answer("Сначала необходимо завершить короткую анкету.")
+        await start_lead_questionnaire(message, state)
+        return
+    await cleanup_pending_excel(state)
+    await state.clear()
+    await message.answer(
+        "🏠 <b>Главное меню</b>\n\nВыберите нужный раздел:",
+        reply_markup=main_menu(message.from_user.id if message.from_user else None),
+    )
 
 
 async def start_lead_questionnaire(message: Message, state: FSMContext) -> None:
@@ -726,6 +772,10 @@ async def lead_outlets(message: Message, state: FSMContext, bot: Bot) -> None:
             "Менеджер закреплён за вашим регионом и сможет ознакомиться с вашей анкетой."
         ),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await message.answer(
+        "Кнопка «🏠 Главное меню» теперь всегда доступна внизу экрана.",
+        reply_markup=persistent_home_keyboard(),
     )
 
 
@@ -1828,6 +1878,17 @@ async def send_client_tags_setup(bot: Bot, user_id: int, chat_id: int) -> bool:
         return False
 
 
+def group_welcome_text() -> str:
+    return (
+        "👋 <b>Здравствуйте! В чат добавлен бот-помощник URAL VAPE.</b>\n\n"
+        "С его помощью участники группы могут быстро получать актуальные прайсы "
+        "и материалы по товарам:\n\n"
+        "📄 /прайс — получить актуальные базовые прайсы\n"
+        "🗃 /materials — получить мокапы, декларации и промоматериалы по товарам\n\n"
+        "Бот реагирует только на команды и не будет мешать обычной переписке."
+    )
+
+
 @router.my_chat_member()
 async def track_client_chat(event: ChatMemberUpdated, bot: Bot) -> None:
     if event.chat.type not in {"group", "supergroup"}:
@@ -1843,19 +1904,9 @@ async def track_client_chat(event: ChatMemberUpdated, bot: Bot) -> None:
     if not active or was_active:
         return
     authorized = is_admin(actor.id) or materials_db.authorize_user(actor.id, actor.username)
-    if authorized and await send_client_tags_setup(bot, actor.id, event.chat.id):
-        await bot.send_message(
-            event.chat.id,
-            f"✅ Бот подключён. {actor.mention_html()}, настройка характеристик отправлена вам в личные сообщения.",
-        )
-        return
-    text = (
-        f"✅ Бот подключён. {actor.mention_html()}, нажмите кнопку, чтобы указать характеристики клиента."
-        if authorized
-        else "✅ Бот подключён. Сотрудник из белого списка может настроить характеристики командой /chat."
-    )
-    markup = client_tags_keyboard(event.chat.id) if authorized else None
-    await bot.send_message(event.chat.id, text, reply_markup=markup)
+    await bot.send_message(event.chat.id, group_welcome_text())
+    if authorized:
+        await send_client_tags_setup(bot, actor.id, event.chat.id)
 
 
 @router.message(Command("chat"))

@@ -1,5 +1,12 @@
 import bot
-from bot import clean_client_title, compact_nav, main_menu
+from bot import (
+    HOME_BUTTON_TEXT,
+    clean_client_title,
+    compact_nav,
+    group_welcome_text,
+    main_menu,
+    persistent_home_keyboard,
+)
 from materials_db import MaterialsDB
 
 
@@ -37,6 +44,16 @@ def test_compact_navigation_uses_icon_only_buttons():
     row = compact_nav("section:back", forward_data="section:next", search_data="main:prices")
     assert [button.text for button in row] == ["⬅️", "➡️", "🔎", "🏠"]
     assert row[-1].callback_data == "main:menu"
+
+
+def test_persistent_home_keyboard_and_group_welcome():
+    keyboard = persistent_home_keyboard()
+    assert keyboard.is_persistent is True
+    assert keyboard.keyboard[0][0].text == HOME_BUTTON_TEXT
+    welcome = group_welcome_text()
+    assert "бот-помощник URAL VAPE" in welcome
+    assert "/прайс" in welcome
+    assert "мокапы, декларации и промоматериалы" in welcome
 
 
 def test_client_chat_title_removes_company_name():
