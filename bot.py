@@ -35,6 +35,9 @@ from aiogram.types import (
 from dotenv import load_dotenv
 from openpyxl import Workbook, load_workbook
 
+from crm_bot import configure_crm, router as crm_router
+from crm_db import CRMDatabase
+from google_crm import GoogleCRM
 from materials_db import Material, MaterialsDB
 from prices_db import (
     WAREHOUSES,
@@ -66,7 +69,9 @@ router = Router()
 catalog: "Catalog"
 materials_db: MaterialsDB
 prices_db: PricesDB
+crm_database: CRMDatabase
 admin_ids: set[int] = set()
+crm_beta_ids: set[int] = {5533726476}
 active_excel_path: Path
 managed_excel_path: Path
 price_storage_path: Path
@@ -426,6 +431,8 @@ def main_menu(user_id: int | None) -> InlineKeyboardMarkup:
     if can_manage_price_message(user_id):
         extra.append(InlineKeyboardButton(text="⚙️ Управление", callback_data="main:admin"))
     rows.extend(button_grid(extra))
+    if user_id in crm_beta_ids:
+        rows.append([InlineKeyboardButton(text="📇 CRM · Бета", callback_data="crm:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -3255,6 +3262,10 @@ def build_backup_archive(archive_path: Path) -> None:
         prices_copy = temp_dir / "prices.sqlite3"
         if prices_database is not None:
             prices_database.backup_to(prices_copy)
+        crm_database_instance = globals().get("crm_database")
+        crm_copy = temp_dir / "crm.sqlite3"
+        if crm_database_instance is not None:
+            crm_database_instance.backup_to(crm_copy)
         metadata = temp_dir / "README.txt"
         metadata.write_text(
             "Резервная копия Ural Vape Regions Bot\n"
@@ -3263,6 +3274,7 @@ def build_backup_archive(archive_path: Path) -> None:
             "materials.sqlite3 — товары, разделы и материалы\n"
             "managers.xlsx — действующая таблица территорий\n"
             "prices.sqlite3 — загруженные складские цены и товарные группы\n"
+            "crm.sqlite3 — задачи, список обзвона и журнал действий CRM\n"
             "price_files/ — последние исходные прайсы складов\n",
             encoding="utf-8",
         )
@@ -3271,6 +3283,8 @@ def build_backup_archive(archive_path: Path) -> None:
             archive.write(excel_copy, excel_copy.name)
             if prices_copy.exists():
                 archive.write(prices_copy, prices_copy.name)
+            if crm_copy.exists():
+                archive.write(crm_copy, crm_copy.name)
             storage = globals().get("price_storage_path")
             if storage and storage.exists():
                 for warehouse in WAREHOUSES:
@@ -4386,7 +4400,8 @@ async def outside_mode(message: Message) -> None:
 
 
 async def main() -> None:
-    global catalog, materials_db, prices_db, admin_ids
+    global catalog, materials_db, prices_db, crm_database, admin_ids
+    global crm_beta_ids
     global active_excel_path, managed_excel_path, price_storage_path
     load_dotenv(BASE_DIR / ".env")
     token = os.getenv("BOT_TOKEN", "").strip()
@@ -4403,6 +4418,11 @@ async def main() -> None:
     if not prices_db_path.is_absolute(): prices_db_path = BASE_DIR / prices_db_path
     if not price_storage_path.is_absolute(): price_storage_path = BASE_DIR / price_storage_path
     admin_ids = {int(value.strip()) for value in os.getenv("ADMIN_IDS", "5533726476").split(",") if value.strip()}
+    crm_beta_ids = {
+        int(value.strip())
+        for value in os.getenv("CRM_BETA_IDS", "5533726476").split(",")
+        if value.strip()
+    }
     active_excel_path = managed_excel_path if managed_excel_path.exists() else excel_path
     catalog = Catalog(active_excel_path)
     materials_db = MaterialsDB(db_path)
@@ -4413,10 +4433,38 @@ async def main() -> None:
                 registered_chat.chat_id, cleaned_title, registered_chat.chat_type, registered_chat.is_active
             )
     prices_db = PricesDB(prices_db_path)
+    crm_database_path = Path(os.getenv("CRM_DB", "data/crm.sqlite3"))
+    if not crm_database_path.is_absolute():
+        crm_database_path = BASE_DIR / crm_database_path
+    crm_database = CRMDatabase(crm_database_path)
+    credentials_setting = os.getenv("GOOGLE_CREDENTIALS", "").strip()
+    credentials_path = Path(credentials_setting) if credentials_setting else BASE_DIR / "secrets/google-service-account.json"
+    if not credentials_path.is_absolute():
+        credentials_path = BASE_DIR / credentials_path
+    if not credentials_path.exists() and not credentials_setting:
+        candidates = list((BASE_DIR / "secrets").glob("*.json"))
+        if len(candidates) == 1:
+            credentials_path = candidates[0]
+    crm_service = None
+    if credentials_path.exists():
+        try:
+            crm_service = await asyncio.to_thread(
+                GoogleCRM,
+                credentials_path,
+                os.getenv("GOOGLE_SPREADSHEET_ID", "1G3OVKOVvueHapaQVMcAdijZRuoGRZ4gV1G2shnmpdkQ"),
+                os.getenv("GOOGLE_SHEET_NAME", "Активные клиенты"),
+            )
+            logging.info("Google CRM подключена: лист %s", crm_service.sheet_name)
+        except Exception:
+            logging.exception("Не удалось подключить Google CRM")
+    else:
+        logging.warning("Google CRM отключена: не найден JSON-ключ %s", credentials_path)
+    configure_crm(crm_service, crm_database, crm_beta_ids)
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dispatcher = Dispatcher()
     router.message.outer_middleware(AccessMiddleware())
     router.callback_query.outer_middleware(AccessMiddleware())
+    dispatcher.include_router(crm_router)
     dispatcher.include_router(router)
     await bot.delete_webhook(drop_pending_updates=False)
     await dispatcher.start_polling(bot)

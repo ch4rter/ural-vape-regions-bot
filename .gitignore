@@ -5,6 +5,7 @@ __pycache__/
 *.pyc
 ~$*.xlsx
 data/
+secrets/
 *.sqlite3
 *.sqlite3-shm
 *.sqlite3-wal
