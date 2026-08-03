@@ -18,6 +18,8 @@ router = Router(name="crm_beta")
 crm: GoogleCRM | None = None
 database: CRMDatabase | None = None
 owner_ids: set[int] = set()
+TASKS_PER_PAGE = 10
+CALL_LIST_PER_PAGE = 12
 
 
 class CRMState(StatesGroup):
@@ -169,14 +171,15 @@ async def open_menu(callback: CallbackQuery, state: FSMContext) -> None:
     if not await guard(callback):
         return
     await state.clear()
-    tasks = database.tasks(callback.from_user.id)
+    due_tasks = database.tasks(callback.from_user.id)
+    all_tasks = database.tasks(callback.from_user.id, include_future=True)
     call_count = len(database.call_list(callback.from_user.id))
-    overdue = sum(task.due_date < date.today().isoformat() for task in tasks)
+    overdue = sum(task.due_date < date.today().isoformat() for task in due_tasks)
     await render(
         callback.message,
         "📇 <b>CRM · Активные клиенты</b>\n\n"
         f"В списке обзвона: <b>{call_count}</b>\n"
-        f"Задач на сегодня и просроченных: <b>{len(tasks)}</b>"
+        f"Активных задач: <b>{len(all_tasks)}</b> · на сегодня и просроченных: <b>{len(due_tasks)}</b>"
         + (f" · просрочено <b>{overdue}</b>" if overdue else "")
         + "\n\nВыберите действие:",
         crm_menu_keyboard(),
@@ -544,22 +547,51 @@ async def tasks(callback: CallbackQuery, state: FSMContext) -> None:
     if not await guard(callback):
         return
     await state.clear()
-    items = database.tasks(callback.from_user.id)
+    await render_tasks(callback, 0)
+
+
+@router.callback_query(F.data.startswith("crm:tasks_page:"))
+async def tasks_page(callback: CallbackQuery) -> None:
+    if not await guard(callback):
+        return
+    await render_tasks(callback, int(callback.data.rsplit(":", 1)[1]))
+
+
+async def render_tasks(callback: CallbackQuery, page: int) -> None:
+    items = database.tasks(callback.from_user.id, include_future=True)
     if not items:
         await render(
-            callback.message, "✅ <b>Задачи</b>\n\nНа сегодня и в просроченных задач нет.",
+            callback.message, "✅ <b>Все задачи</b>\n\nАктивных задач пока нет.",
             InlineKeyboardMarkup(inline_keyboard=[nav()]),
         )
         await callback.answer()
         return
-    lines = ["✅ <b>Задачи на сегодня и просроченные</b>"]
-    rows = []
+    page_count = max(1, (len(items) + TASKS_PER_PAGE - 1) // TASKS_PER_PAGE)
+    page = max(0, min(page, page_count - 1))
+    start = page * TASKS_PER_PAGE
+    shown = items[start:start + TASKS_PER_PAGE]
     today = date.today().isoformat()
-    for index, task in enumerate(items[:20], 1):
-        icon = "🔴" if task.due_date < today else "📅"
+    overdue = sum(task.due_date < today for task in items)
+    due_today = sum(task.due_date == today for task in items)
+    future = sum(task.due_date > today for task in items)
+    lines = [
+        "✅ <b>Все активные задачи</b>",
+        f"🔴 Просрочено: <b>{overdue}</b> · 📅 Сегодня: <b>{due_today}</b> · 🔵 Позже: <b>{future}</b>",
+        f"Страница <b>{page + 1}</b> из <b>{page_count}</b>",
+    ]
+    rows = []
+    for index, task in enumerate(shown, start + 1):
+        icon = "🔴" if task.due_date < today else "📅" if task.due_date == today else "🔵"
         lines.extend(["", f"<b>{index}. {html.escape(task.client_name)}</b>",
                       f"{icon} {datetime.fromisoformat(task.due_date).strftime('%d.%m.%Y')} · {html.escape(task.text)}"])
         rows.append([InlineKeyboardButton(text=f"✅ Выполнено · {task.client_name}"[:64], callback_data=f"crm:task_done:{task.id}")])
+    pagination = []
+    if page > 0:
+        pagination.append(InlineKeyboardButton(text="⬅️", callback_data=f"crm:tasks_page:{page - 1}"))
+    if page + 1 < page_count:
+        pagination.append(InlineKeyboardButton(text="➡️", callback_data=f"crm:tasks_page:{page + 1}"))
+    if pagination:
+        rows.append(pagination)
     rows.append(nav())
     await render(callback.message, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
     await callback.answer()
@@ -571,7 +603,7 @@ async def task_done(callback: CallbackQuery, state: FSMContext) -> None:
         return
     task_id = int(callback.data.rsplit(":", 1)[1])
     database.complete_task(callback.from_user.id, task_id)
-    await tasks(callback, state)
+    await render_tasks(callback, 0)
 
 
 @router.callback_query(F.data == "crm:list_add")
@@ -606,14 +638,38 @@ async def call_list(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     items = database.call_list(callback.from_user.id)
     await state.update_data(crm_call_identities=[row["client_identity"] for row in items])
+    await render_call_list(callback, items, 0)
+
+
+@router.callback_query(F.data.startswith("crm:call_page:"))
+async def call_list_page(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await guard(callback):
+        return
+    items = database.call_list(callback.from_user.id)
+    await state.update_data(crm_call_identities=[row["client_identity"] for row in items])
+    await render_call_list(callback, items, int(callback.data.rsplit(":", 1)[1]))
+
+
+async def render_call_list(callback: CallbackQuery, items, page: int) -> None:
+    page_count = max(1, (len(items) + CALL_LIST_PER_PAGE - 1) // CALL_LIST_PER_PAGE)
+    page = max(0, min(page, page_count - 1))
+    start = page * CALL_LIST_PER_PAGE
     rows = [[InlineKeyboardButton(
         text=f"{index + 1}. {row['client_name']}"[:64], callback_data=f"crm:call:{index}"
-    )] for index, row in enumerate(items[:30])]
+    )] for index, row in enumerate(items[start:start + CALL_LIST_PER_PAGE], start)]
+    pagination = []
+    if page > 0:
+        pagination.append(InlineKeyboardButton(text="⬅️", callback_data=f"crm:call_page:{page - 1}"))
+    if page + 1 < page_count:
+        pagination.append(InlineKeyboardButton(text="➡️", callback_data=f"crm:call_page:{page + 1}"))
+    if pagination:
+        rows.append(pagination)
     if items:
         rows.append([InlineKeyboardButton(text="🗑 Очистить список", callback_data="crm:list_clear")])
     rows.append(nav())
     text = (
         f"📋 <b>Мой список обзвона</b>\n\nКлиентов: <b>{len(items)}</b>\n"
+        f"Страница <b>{page + 1}</b> из <b>{page_count}</b>\n"
         "Открывайте карточки по порядку и фиксируйте результат."
         if items else "📋 <b>Мой список обзвона</b>\n\nСписок пока пуст. Добавьте клиентов через поиск или подборку."
     )
@@ -686,6 +742,7 @@ async def pick_menu(callback: CallbackQuery, state: FSMContext) -> None:
         callback.message,
         "🎯 <b>Подобрать клиентов</b>\n\nВыберите готовое условие для первой бета-версии:",
         InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⚙️ Настроить по характеристикам", callback_data="crm:filter")],
             [InlineKeyboardButton(text="📞 Не звонили 30 дней", callback_data="crm:pick_do:old_call")],
             [InlineKeyboardButton(text="🛑 Перестали заказывать", callback_data="crm:pick_do:stopped")],
             [InlineKeyboardButton(text="⏳ Ждём заказ", callback_data="crm:pick_do:waiting")],
@@ -696,6 +753,179 @@ async def pick_menu(callback: CallbackQuery, state: FSMContext) -> None:
         ]),
     )
     await callback.answer()
+
+
+def default_filter() -> dict:
+    return {"kind": "all", "scale": "any", "products": [], "product_mode": "any"}
+
+
+def filter_keyboard(settings: dict) -> InlineKeyboardMarkup:
+    kind = settings.get("kind", "all")
+    scale = settings.get("scale", "any")
+    products = set(settings.get("products", []))
+    mode = settings.get("product_mode", "any")
+    mark = lambda selected, label: f"✅ {label}" if selected else label
+    rows = [
+        [
+            InlineKeyboardButton(text=mark(kind == "all", "Все"), callback_data="crm:filter_kind:all"),
+            InlineKeyboardButton(text=mark(kind == "retail", "Розница"), callback_data="crm:filter_kind:retail"),
+            InlineKeyboardButton(text=mark(kind == "wholesale", "Опт"), callback_data="crm:filter_kind:wholesale"),
+        ],
+        [
+            InlineKeyboardButton(text=mark(scale == "any", "Любое кол-во"), callback_data="crm:filter_scale:any"),
+            InlineKeyboardButton(text=mark(scale == "1_3", "1–3 ТТ"), callback_data="crm:filter_scale:1_3"),
+        ],
+        [
+            InlineKeyboardButton(text=mark(scale == "4_10", "4–10 ТТ"), callback_data="crm:filter_scale:4_10"),
+            InlineKeyboardButton(text=mark(scale == "11_plus", "11+ ТТ"), callback_data="crm:filter_scale:11_plus"),
+        ],
+    ]
+    product_buttons = [InlineKeyboardButton(
+        text=mark(key in products, label), callback_data=f"crm:filter_product:{key}"
+    ) for key, (_, label) in PRODUCT_COLUMNS.items()]
+    rows.extend([product_buttons[index:index + 2] for index in range(0, len(product_buttons), 2)])
+    rows.append([
+        InlineKeyboardButton(
+            text=mark(mode == "any", "Хотя бы одна"), callback_data="crm:filter_mode:any"
+        ),
+        InlineKeyboardButton(
+            text=mark(mode == "all", "Все выбранные"), callback_data="crm:filter_mode:all"
+        ),
+    ])
+    rows.append([InlineKeyboardButton(text="🔎 Показать клиентов", callback_data="crm:filter_apply")])
+    rows.append(nav("crm:pick"))
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def filter_description(settings: dict) -> str:
+    kind_names = {"all": "все типы", "retail": "розница", "wholesale": "опт и опт+розница"}
+    scale_names = {"any": "любое количество ТТ", "1_3": "1–3 ТТ", "4_10": "4–10 ТТ", "11_plus": "11+ ТТ"}
+    selected = [PRODUCT_COLUMNS[key][1] for key in settings.get("products", []) if key in PRODUCT_COLUMNS]
+    products = ", ".join(selected) if selected else "любые товарные группы"
+    mode = "хотя бы одну" if settings.get("product_mode") == "any" else "все выбранные"
+    return (
+        "⚙️ <b>Подбор по характеристикам</b>\n\n"
+        f"Тип клиента: <b>{kind_names.get(settings.get('kind'), 'все типы')}</b>\n"
+        f"Масштаб: <b>{scale_names.get(settings.get('scale'), 'любое количество ТТ')}</b>\n"
+        f"Покупает: <b>{html.escape(products)}</b>"
+        + (f" · условие «{mode}»" if selected else "")
+        + "\n\nМожно выбрать несколько товарных групп."
+    )
+
+
+async def show_filter(callback: CallbackQuery, state: FSMContext, reset: bool = False) -> None:
+    data = await state.get_data()
+    settings = default_filter() if reset else data.get("crm_filter", default_filter())
+    await state.update_data(crm_filter=settings)
+    await render(callback.message, filter_description(settings), filter_keyboard(settings))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "crm:filter")
+async def open_filter(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await guard(callback):
+        return
+    await state.clear()
+    await show_filter(callback, state, reset=True)
+
+
+@router.callback_query(F.data.startswith("crm:filter_kind:"))
+async def set_filter_kind(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await guard(callback):
+        return
+    settings = (await state.get_data()).get("crm_filter", default_filter())
+    settings["kind"] = callback.data.rsplit(":", 1)[1]
+    await state.update_data(crm_filter=settings)
+    await show_filter(callback, state)
+
+
+@router.callback_query(F.data.startswith("crm:filter_scale:"))
+async def set_filter_scale(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await guard(callback):
+        return
+    settings = (await state.get_data()).get("crm_filter", default_filter())
+    settings["scale"] = callback.data.rsplit(":", 1)[1]
+    await state.update_data(crm_filter=settings)
+    await show_filter(callback, state)
+
+
+@router.callback_query(F.data.startswith("crm:filter_product:"))
+async def toggle_filter_product(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await guard(callback):
+        return
+    key = callback.data.rsplit(":", 1)[1]
+    settings = (await state.get_data()).get("crm_filter", default_filter())
+    selected = list(settings.get("products", []))
+    if key in selected:
+        selected.remove(key)
+    elif key in PRODUCT_COLUMNS:
+        selected.append(key)
+    settings["products"] = selected
+    await state.update_data(crm_filter=settings)
+    await show_filter(callback, state)
+
+
+@router.callback_query(F.data.startswith("crm:filter_mode:"))
+async def set_filter_mode(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await guard(callback):
+        return
+    settings = (await state.get_data()).get("crm_filter", default_filter())
+    settings["product_mode"] = callback.data.rsplit(":", 1)[1]
+    await state.update_data(crm_filter=settings)
+    await show_filter(callback, state)
+
+
+def numeric_outlets(value: str) -> int | None:
+    match = re.search(r"\d+(?:[.,]\d+)?", value or "")
+    return int(float(match.group(0).replace(",", "."))) if match else None
+
+
+def matches_filter(client: CRMClient, settings: dict) -> bool:
+    client_type = client.client_type.casefold().replace("ё", "е")
+    kind = settings.get("kind", "all")
+    if kind == "retail" and "розниц" not in client_type:
+        return False
+    if kind == "wholesale" and "опт" not in client_type and "опт" not in client.outlets.casefold():
+        return False
+    outlets = numeric_outlets(client.outlets)
+    scale = settings.get("scale", "any")
+    if scale == "1_3" and (outlets is None or not 1 <= outlets <= 3):
+        return False
+    if scale == "4_10" and (outlets is None or not 4 <= outlets <= 10):
+        return False
+    if scale == "11_plus" and (outlets is None or outlets < 11):
+        return False
+    products = [key for key in settings.get("products", []) if key in PRODUCT_COLUMNS]
+    if products:
+        matches = [client.products.get(key) == "buy" for key in products]
+        if settings.get("product_mode") == "all" and not all(matches):
+            return False
+        if settings.get("product_mode") != "all" and not any(matches):
+            return False
+    return True
+
+
+@router.callback_query(F.data == "crm:filter_apply")
+async def apply_filter(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await guard(callback):
+        return
+    settings = (await state.get_data()).get("crm_filter", default_filter())
+    await callback.answer("Подбираю клиентов…")
+    clients = await asyncio.to_thread(crm.clients)
+    selected = [client for client in clients if matches_filter(client, settings)]
+    await state.update_data(crm_pick=[{"identity": item.identity, "name": item.name} for item in selected])
+    preview = "\n".join(f"• {html.escape(item.name)}" for item in selected[:15])
+    if len(selected) > 15:
+        preview += f"\n…и ещё {len(selected) - 15}"
+    await render(
+        callback.message,
+        filter_description(settings)
+        + f"\n\n<b>Найдено: {len(selected)}</b>\n\n{preview or 'Никого не найдено.'}",
+        InlineKeyboardMarkup(inline_keyboard=(
+            [[InlineKeyboardButton(text="➕ Добавить всех в мой список", callback_data="crm:pick_add")]]
+            if selected else []
+        ) + [nav("crm:filter")]),
+    )
 
 
 @router.callback_query(F.data.startswith("crm:pick_do:"))
@@ -761,25 +991,69 @@ async def daily_report(callback: CallbackQuery, state: FSMContext) -> None:
     events = database.daily_events(callback.from_user.id)
     if not events:
         text = "📝 <b>Итоги дня</b>\n\nСегодня через бота пока не зафиксировано ни одного действия."
-    else:
-        counts = Counter(row["kind"] for row in events)
-        clients = len({row["client_identity"] for row in events})
-        lines = [
-            f"📝 <b>Итоги за {date.today().strftime('%d.%m.%Y')}</b>", "",
-            f"Клиентов обработано: <b>{clients}</b>",
-            f"Записей о разговорах: <b>{counts['note']}</b>",
-            f"Отмечено заказов: <b>{counts['order']}</b>",
-            f"Изменено статусов: <b>{counts['status']}</b>",
-            f"Изменено товарных групп: <b>{counts['product']}</b>",
-            f"Создано задач: <b>{counts['task']}</b>",
-            "", "<b>Результаты</b>",
-        ]
-        for row in events[-30:]:
-            lines.extend(["", f"• <b>{html.escape(row['client_name'])}</b>", html.escape(row["summary"])])
-        if len(events) > 30:
-            lines.append(f"\nПоказаны последние 30 из {len(events)} действий.")
-        text = "\n".join(lines)
-    await render(callback.message, text, InlineKeyboardMarkup(inline_keyboard=[nav()]))
+        await render(callback.message, text, InlineKeyboardMarkup(inline_keyboard=[nav()]))
+        await callback.answer()
+        return
+    counts = Counter(row["kind"] for row in events)
+    grouped = {}
+    for row in events:
+        client = grouped.setdefault(row["client_identity"], {
+            "name": row["client_name"], "note": "", "order": False,
+            "status": "", "tasks": [], "product_changed": False,
+        })
+        if row["kind"] == "note":
+            client["note"] = row["summary"]
+        elif row["kind"] == "order":
+            client["order"] = True
+        elif row["kind"] == "status":
+            client["status"] = row["summary"]
+        elif row["kind"] == "task":
+            client["tasks"].append(row["summary"])
+        elif row["kind"] == "product":
+            client["product_changed"] = True
+
+    result_clients = sum(bool(item["note"]) for item in grouped.values())
+    header = (
+        f"📝 <b>Итоги за {date.today().strftime('%d.%m.%Y')}</b>\n\n"
+        f"Клиентов обработано: <b>{len(grouped)}</b>\n"
+        f"Зафиксировано результатов: <b>{result_clients}</b>\n"
+        f"Отмечено заказов: <b>{sum(item['order'] for item in grouped.values())}</b>\n"
+        f"Поставлено следующих задач: <b>{counts['task']}</b>\n\n"
+        "<b>Результаты по клиентам</b>"
+    )
+    blocks = []
+    for item in grouped.values():
+        details = []
+        if item["note"]:
+            details.append(html.escape(item["note"]))
+        if item["order"]:
+            details.append("✅ Сделал заказ")
+        if item["status"]:
+            details.append(html.escape(item["status"]))
+        if item["tasks"]:
+            details.append("Следующий шаг: " + html.escape(item["tasks"][-1]))
+        if not details and item["product_changed"]:
+            details.append("Актуализирована информация по товарным группам")
+        blocks.append(f"• <b>{html.escape(item['name'])}</b>\n" + "\n".join(details))
+
+    chunks = []
+    current = header
+    for block in blocks:
+        candidate = f"{current}\n\n{block}"
+        if len(candidate) > 3800 and current:
+            chunks.append(current)
+            current = block
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    markup = InlineKeyboardMarkup(inline_keyboard=[nav()])
+    try:
+        await callback.message.edit_text(chunks[0], reply_markup=markup if len(chunks) == 1 else None)
+    except Exception:
+        await callback.message.answer(chunks[0], reply_markup=markup if len(chunks) == 1 else None)
+    for index, chunk in enumerate(chunks[1:], 1):
+        await callback.message.answer(chunk, reply_markup=markup if index == len(chunks) - 1 else None)
     await callback.answer()
 
 
