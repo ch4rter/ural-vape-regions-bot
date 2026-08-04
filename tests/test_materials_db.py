@@ -141,6 +141,19 @@ def test_lead_profile_is_saved_once(tmp_path):
     assert len(db.list_lead_profiles()) == 1
 
 
+def test_unmatched_regions_are_stored_separately_and_resolved_together(tmp_path):
+    db = MaterialsDB(tmp_path / "materials.sqlite3")
+    first = db.save_unmatched_region(101, "client_one", "  Новый город ", "новый город")
+    repeated = db.save_unmatched_region(101, "client_one", "Новый город", "новый город")
+    second = db.save_unmatched_region(202, None, "НОВЫЙ ГОРОД", "новый город")
+
+    assert first.id == repeated.id
+    assert len(db.list_unmatched_regions()) == 2
+    assert db.get_unmatched_region(second.id).raw_region == "НОВЫЙ ГОРОД"
+    assert db.resolve_unmatched_regions("новый город") == 2
+    assert db.list_unmatched_regions() == []
+
+
 def test_known_telegram_user_resolves_manager_username(tmp_path):
     db = MaterialsDB(tmp_path / "materials.sqlite3")
     db.remember_telegram_user(101, "ShmidtUV", "Андрей")

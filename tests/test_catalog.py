@@ -2,6 +2,7 @@ from pathlib import Path
 
 from openpyxl import Workbook
 
+import bot
 from bot import Catalog, Entry, format_result, normalize, suggestion_label, validate_excel
 
 
@@ -79,3 +80,23 @@ def test_excel_upload_requires_all_headers(tmp_path):
         assert "местоположение" in str(error)
     else:
         raise AssertionError("Missing location header must be rejected")
+
+
+def test_admin_can_append_region_without_changing_existing_rows(tmp_path, monkeypatch):
+    source = tmp_path / "managers.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Местоположение", "Территория", "Менеджер"])
+    sheet.append(["Россия / Тамбовская область", "Тамбов", "Андрей"])
+    workbook.save(source)
+
+    managed = tmp_path / "data" / "managers.xlsx"
+    monkeypatch.setattr(bot, "active_excel_path", source, raising=False)
+    monkeypatch.setattr(bot, "managed_excel_path", managed, raising=False)
+    updated, backup = bot.append_region_to_excel(
+        "Новый город", "Россия / Новая область", "Валера"
+    )
+
+    assert backup.exists()
+    assert updated.exact("Тамбов")[0].manager == "Андрей"
+    assert updated.exact("Новый город")[0].location == "Россия / Новая область"

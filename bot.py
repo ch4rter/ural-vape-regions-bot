@@ -116,6 +116,9 @@ class AdminState(StatesGroup):
     access_user = State()
     price_message = State()
     price_attachment = State()
+    region_territory = State()
+    region_location = State()
+    region_manager = State()
 
 
 class BroadcastState(StatesGroup):
@@ -566,6 +569,9 @@ def lead_region_keyboard(indexes: list[int]) -> InlineKeyboardMarkup:
         if len(label) > 64:
             label = f"{label[:61]}..."
         rows.append([InlineKeyboardButton(text=label, callback_data=f"lead:region:{index}")])
+    rows.append([InlineKeyboardButton(
+        text="Не нашёл свой регион", callback_data="lead:region_missing"
+    )])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -592,6 +598,7 @@ async def lead_region(message: Message, state: FSMContext) -> None:
     if not valid_lead_answer(query):
         await message.answer("Укажите город или регион обычным текстом.")
         return
+    await state.update_data(lead_region_query=query)
     found = catalog.exact(query)
     unique = list(dict.fromkeys((entry.name, entry.location, entry.manager) for entry in found))
     if len({manager for _, _, manager in unique}) == 1 and found:
@@ -603,13 +610,40 @@ async def lead_region(message: Message, state: FSMContext) -> None:
     )
     if not indexes:
         await message.answer(
-            "Не удалось найти этот регион. Проверьте написание или укажите ближайший крупный город."
+            "Не удалось найти этот регион. Проверьте написание или воспользуйтесь кнопкой ниже.",
+            reply_markup=lead_region_keyboard([]),
         )
         return
     await message.answer(
         "Выберите подходящий вариант:",
         reply_markup=lead_region_keyboard(indexes),
     )
+
+
+@router.callback_query(F.data == "lead:region_missing", StateFilter(LeadState.region))
+async def accept_missing_lead_region(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    raw_region = str(data.get("lead_region_query", "")).strip()
+    if not raw_region:
+        await callback.answer("Сначала напишите город или регион.", show_alert=True)
+        return
+    materials_db.save_unmatched_region(
+        callback.from_user.id, callback.from_user.username, raw_region, normalize(raw_region)
+    )
+    await state.update_data(
+        lead_region=raw_region,
+        lead_manager="Валера",
+        lead_region_unmatched=True,
+    )
+    await state.set_state(LeadState.company)
+    await callback.message.edit_text(
+        "📍 <b>Регион пока отсутствует в нашей базе</b>\n\n"
+        "Мы сохранили указанное местоположение. Пока вашим менеджером будет "
+        f"{manager_html('Валера')}. Он уточнит информацию и при необходимости передаст вас "
+        "нужному специалисту.\n\n"
+        "<b>4 из 5 · Как называется ваш магазин или компания?</b>"
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("lead:region:"))
@@ -3081,6 +3115,7 @@ def products_keyboard(
             InlineKeyboardButton(text="💰 Прайсы", callback_data="adm:prices"),
             InlineKeyboardButton(text="👥 Доступ", callback_data="adm:access"),
             InlineKeyboardButton(text="📊 Excel", callback_data="adm:excel"),
+            InlineKeyboardButton(text="🗺 Регионы", callback_data="adm:regions"),
             InlineKeyboardButton(text="✏️ Текст /прайс", callback_data="adm:price_message"),
             InlineKeyboardButton(text="📝 Анкеты клиентов", callback_data="adm:leads"),
         ]))
@@ -3249,6 +3284,290 @@ async def cleanup_pending_excel(state: FSMContext) -> None:
         pending = data.get(key)
         if pending:
             Path(pending).unlink(missing_ok=True)
+
+
+def regions_admin_keyboard() -> InlineKeyboardMarkup:
+    pending_count = len(materials_db.list_unmatched_regions())
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"⚠️ Не найденные регионы · {pending_count}",
+            callback_data="adm:missing_regions:0",
+        )],
+        [
+            InlineKeyboardButton(text="➕ Добавить", callback_data="adm:add_region"),
+            InlineKeyboardButton(text="📤 Скачать Excel", callback_data="adm:download_regions"),
+        ],
+        [InlineKeyboardButton(text="📥 Загрузить новый Excel", callback_data="adm:excel")],
+        compact_nav("main:admin"),
+    ])
+
+
+@router.callback_query(F.data == "adm:regions")
+async def manage_regions(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin(callback):
+        return
+    await state.clear()
+    await callback.message.edit_text(
+        "🗺 <b>Регионы и менеджеры</b>\n\n"
+        f"Сейчас в рабочей таблице <b>{len(catalog.entries):,}</b> записей. "
+        "Здесь можно обработать запросы клиентов, добавить регион вручную или заменить таблицу.",
+        reply_markup=regions_admin_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adm:download_regions")
+async def download_regions(callback: CallbackQuery) -> None:
+    if not await require_admin(callback):
+        return
+    await callback.answer("Отправляю таблицу…")
+    await callback.message.answer_document(
+        FSInputFile(active_excel_path, filename=active_excel_path.name),
+        caption=f"🗺 Действующая таблица регионов · <b>{len(catalog.entries):,}</b> записей",
+    )
+
+
+def grouped_unmatched_regions() -> list[tuple[str, str, list]]:
+    grouped: dict[str, tuple[str, list]] = {}
+    for item in materials_db.list_unmatched_regions():
+        if item.normalized_region not in grouped:
+            grouped[item.normalized_region] = (item.raw_region, [])
+        grouped[item.normalized_region][1].append(item)
+    return [
+        (normalized, raw, items)
+        for normalized, (raw, items) in grouped.items()
+    ]
+
+
+@router.callback_query(F.data.startswith("adm:missing_regions:"))
+async def show_missing_regions(callback: CallbackQuery) -> None:
+    if not await require_admin(callback):
+        return
+    try:
+        page = max(0, int(callback.data.rsplit(":", 1)[1]))
+    except ValueError:
+        page = 0
+    groups = grouped_unmatched_regions()
+    per_page = 10
+    pages = max(1, (len(groups) + per_page - 1) // per_page)
+    page = min(page, pages - 1)
+    rows = []
+    for _, raw, items in groups[page * per_page:(page + 1) * per_page]:
+        label = f"{raw} · {len(items)}" if len(items) > 1 else raw
+        rows.append([InlineKeyboardButton(
+            text=label[:64], callback_data=f"adm:missing_region:{items[0].id}"
+        )])
+    navigation = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm:missing_regions:{page - 1}"))
+    if page + 1 < pages:
+        navigation.append(InlineKeyboardButton(text="➡️", callback_data=f"adm:missing_regions:{page + 1}"))
+    if navigation:
+        rows.append(navigation)
+    rows.append(compact_nav("adm:regions"))
+    text = (
+        "⚠️ <b>Не найденные регионы</b>\n\n"
+        "Уведомления по этим запросам не отправлялись. Одинаковые варианты объединены."
+    )
+    if groups:
+        text += f"\n\nСтраница <b>{page + 1}</b> из <b>{pages}</b> · вариантов: <b>{len(groups)}</b>"
+    else:
+        text += "\n\nНовых запросов нет."
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:missing_region:"))
+async def show_missing_region(callback: CallbackQuery) -> None:
+    if not await require_admin(callback):
+        return
+    item = materials_db.get_unmatched_region(int(callback.data.rsplit(":", 1)[1]))
+    if not item or item.status != "pending":
+        await callback.answer("Запрос уже обработан.", show_alert=True)
+        return
+    matching = [
+        entry for entry in materials_db.list_unmatched_regions()
+        if entry.normalized_region == item.normalized_region
+    ]
+    profile = materials_db.get_lead_profile(item.user_id)
+    client = profile.company if profile else (f"@{item.username}" if item.username else str(item.user_id))
+    await callback.message.edit_text(
+        "⚠️ <b>Не найденный регион</b>\n\n"
+        f"Как написал клиент: <b>{html.escape(item.raw_region)}</b>\n"
+        f"Обращений: <b>{len(matching)}</b>\n"
+        f"Последний клиент: <b>{html.escape(client)}</b>\n"
+        f"Дата: <b>{html.escape(item.updated_at)}</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить в справочник", callback_data=f"adm:add_missing_region:{item.id}")],
+            [InlineKeyboardButton(text="✅ Не добавлять · обработано", callback_data=f"adm:ignore_missing_region:{item.id}")],
+            compact_nav("adm:missing_regions:0"),
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:ignore_missing_region:"))
+async def ignore_missing_region(callback: CallbackQuery) -> None:
+    if not await require_admin(callback):
+        return
+    item = materials_db.get_unmatched_region(int(callback.data.rsplit(":", 1)[1]))
+    if item:
+        for related in materials_db.list_unmatched_regions():
+            if related.normalized_region == item.normalized_region:
+                materials_db.set_unmatched_region_status(related.id, "ignored")
+    await callback.answer("Запрос отмечен обработанным.")
+    await callback.message.edit_text(
+        "✅ <b>Запрос обработан</b>\n\nРегион не был добавлен в рабочую таблицу.",
+        reply_markup=regions_admin_keyboard(),
+    )
+
+
+async def ask_region_location(callback: CallbackQuery, state: FSMContext, territory: str) -> None:
+    await state.update_data(region_territory=territory)
+    await state.set_state(AdminState.region_location)
+    await callback.message.edit_text(
+        "➕ <b>Добавление региона</b>\n\n"
+        f"Территория: <b>{html.escape(territory)}</b>\n\n"
+        "Введите более общее <b>местоположение</b>, как оно должно попасть в Excel. "
+        "Например: <code>Россия / Тамбовская область</code>.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[compact_nav("adm:regions")]),
+    )
+
+
+@router.callback_query(F.data == "adm:add_region")
+async def start_add_region(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin(callback):
+        return
+    await state.clear()
+    await state.set_state(AdminState.region_territory)
+    await callback.message.edit_text(
+        "➕ <b>Добавление региона</b>\n\nВведите название территории, города или населённого пункта.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[compact_nav("adm:regions")]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:add_missing_region:"))
+async def start_add_missing_region(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin(callback):
+        return
+    item = materials_db.get_unmatched_region(int(callback.data.rsplit(":", 1)[1]))
+    if not item:
+        await callback.answer("Запрос не найден.", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(region_unmatched_normalized=item.normalized_region)
+    await ask_region_location(callback, state, item.raw_region)
+    await callback.answer()
+
+
+@router.message(AdminState.region_territory, F.text)
+async def receive_region_territory(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id) or not valid_lead_answer(message.text):
+        await message.answer("Введите корректное название территории.")
+        return
+    await state.update_data(region_territory=message.text.strip())
+    await state.set_state(AdminState.region_location)
+    await message.answer(
+        "Введите более общее <b>местоположение</b>. Например: "
+        "<code>Россия / Тамбовская область</code>."
+    )
+
+
+@router.message(AdminState.region_location, F.text)
+async def receive_region_location(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id) or not valid_lead_answer(message.text):
+        await message.answer("Введите корректное местоположение.")
+        return
+    managers = sorted({entry.manager for entry in catalog.entries} | {"Валера"})
+    await state.update_data(region_location=message.text.strip(), region_managers=managers)
+    await state.set_state(AdminState.region_manager)
+    rows = button_grid([
+        InlineKeyboardButton(text=name[:64], callback_data=f"adm:region_manager:{index}")
+        for index, name in enumerate(managers)
+    ])
+    rows.append(compact_nav("adm:regions"))
+    await message.answer(
+        "Выберите менеджера, которому будет принадлежать территория:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+def append_region_to_excel(territory: str, location: str, manager: str) -> tuple[Catalog, Path]:
+    workbook = load_workbook(active_excel_path)
+    sheet = workbook.active
+    headers = [normalize(str(cell.value or "")) for cell in sheet[1]]
+    location_idx = next(i for i, value in enumerate(headers, 1) if "местополож" in value)
+    territory_idx = next(i for i, value in enumerate(headers, 1) if "территор" in value or "назван" in value)
+    manager_idx = next(i for i, value in enumerate(headers, 1) if "менеджер" in value)
+    row = sheet.max_row + 1
+    sheet.cell(row, location_idx, location)
+    sheet.cell(row, territory_idx, territory)
+    sheet.cell(row, manager_idx, manager)
+    managed_excel_path.parent.mkdir(parents=True, exist_ok=True)
+    backup_dir = managed_excel_path.parent / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    backup_path = backup_dir / f"managers_{timestamp}.xlsx"
+    shutil.copy2(active_excel_path, backup_path)
+    temporary = managed_excel_path.with_name(f"{managed_excel_path.stem}.new.xlsx")
+    try:
+        workbook.save(temporary)
+    finally:
+        workbook.close()
+    checked, _ = validate_excel(temporary)
+    os.replace(temporary, managed_excel_path)
+    checked.path = managed_excel_path
+    return checked, backup_path
+
+
+@router.callback_query(F.data.startswith("adm:region_manager:"), StateFilter(AdminState.region_manager))
+async def save_new_region(callback: CallbackQuery, state: FSMContext) -> None:
+    global catalog, active_excel_path
+    if not await require_admin(callback):
+        return
+    data = await state.get_data()
+    try:
+        manager = data["region_managers"][int(callback.data.rsplit(":", 1)[1])]
+        territory = data["region_territory"]
+        location = data["region_location"]
+    except (KeyError, IndexError, ValueError):
+        await callback.answer("Данные устарели. Начните добавление заново.", show_alert=True)
+        return
+    if any(
+        normalize(entry.name) == normalize(territory)
+        and normalize(entry.location) == normalize(location)
+        and normalize(entry.manager) == normalize(manager)
+        for entry in catalog.entries
+    ):
+        await callback.answer("Такая запись уже есть в таблице.", show_alert=True)
+        return
+    await callback.answer("Добавляю регион…")
+    try:
+        new_catalog, backup_path = await asyncio.to_thread(
+            append_region_to_excel, territory, location, manager
+        )
+        catalog = new_catalog
+        active_excel_path = managed_excel_path
+        unmatched_normalized = data.get("region_unmatched_normalized")
+        resolved = materials_db.resolve_unmatched_regions(unmatched_normalized) if unmatched_normalized else 0
+    except Exception:
+        logging.exception("Не удалось добавить регион в Excel")
+        await callback.message.edit_text(
+            "❌ Не удалось добавить регион. Рабочая таблица не изменена.",
+            reply_markup=regions_admin_keyboard(),
+        )
+        return
+    await state.clear()
+    await callback.message.edit_text(
+        "✅ <b>Регион добавлен</b>\n\n"
+        f"Территория: <b>{html.escape(territory)}</b>\n"
+        f"Местоположение: <b>{html.escape(location)}</b>\n"
+        f"Менеджер: {manager_html(manager)}\n"
+        f"Обработано клиентских запросов: <b>{resolved}</b>\n\n"
+        f"Резервная копия: <code>{html.escape(backup_path.name)}</code>",
+        reply_markup=regions_admin_keyboard(),
+    )
 
 
 def build_backup_archive(archive_path: Path) -> None:

@@ -77,6 +77,18 @@ class LeadProfile:
     created_at: str
 
 
+@dataclass(frozen=True)
+class UnmatchedRegion:
+    id: int
+    user_id: int
+    username: str | None
+    raw_region: str
+    normalized_region: str
+    status: str
+    created_at: str
+    updated_at: str
+
+
 class MaterialsDB:
     def __init__(self, path: Path):
         self.path = path
@@ -161,6 +173,20 @@ class MaterialsDB:
                     full_name TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS unmatched_regions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    username TEXT,
+                    raw_region TEXT NOT NULL,
+                    normalized_region TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending', 'resolved', 'ignored')),
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id, normalized_region)
+                );
+                CREATE INDEX IF NOT EXISTS idx_unmatched_regions_status
+                    ON unmatched_regions(status, updated_at);
                 CREATE TABLE IF NOT EXISTS wait_entries (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     chat_id INTEGER NOT NULL,
@@ -610,6 +636,75 @@ class MaterialsDB:
             ).fetchall()
         return [self._lead_profile(row) for row in rows]
 
+    def save_unmatched_region(
+        self, user_id: int, username: str | None, raw_region: str, normalized_region: str
+    ) -> UnmatchedRegion:
+        raw_region = raw_region.strip()
+        normalized_region = normalized_region.strip()
+        if not raw_region or not normalized_region:
+            raise ValueError("Регион не может быть пустым.")
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO unmatched_regions(
+                       user_id, username, raw_region, normalized_region
+                   ) VALUES (?, ?, ?, ?)
+                   ON CONFLICT(user_id, normalized_region) DO UPDATE SET
+                       username=excluded.username,
+                       raw_region=excluded.raw_region,
+                       status='pending',
+                       updated_at=CURRENT_TIMESTAMP""",
+                (user_id, username.lower() if username else None, raw_region, normalized_region),
+            )
+            row = connection.execute(
+                """SELECT id, user_id, username, raw_region, normalized_region,
+                          status, created_at, updated_at
+                   FROM unmatched_regions
+                   WHERE user_id = ? AND normalized_region = ?""",
+                (user_id, normalized_region),
+            ).fetchone()
+        return self._unmatched_region(row)
+
+    def list_unmatched_regions(self, status: str = "pending") -> list[UnmatchedRegion]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT id, user_id, username, raw_region, normalized_region,
+                          status, created_at, updated_at
+                   FROM unmatched_regions WHERE status = ?
+                   ORDER BY updated_at DESC, id DESC""",
+                (status,),
+            ).fetchall()
+        return [self._unmatched_region(row) for row in rows]
+
+    def get_unmatched_region(self, region_id: int) -> UnmatchedRegion | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT id, user_id, username, raw_region, normalized_region,
+                          status, created_at, updated_at
+                   FROM unmatched_regions WHERE id = ?""",
+                (region_id,),
+            ).fetchone()
+        return self._unmatched_region(row) if row else None
+
+    def set_unmatched_region_status(self, region_id: int, status: str) -> bool:
+        if status not in {"pending", "resolved", "ignored"}:
+            raise ValueError("Некорректный статус.")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """UPDATE unmatched_regions SET status = ?, updated_at=CURRENT_TIMESTAMP
+                   WHERE id = ?""",
+                (status, region_id),
+            )
+        return cursor.rowcount > 0
+
+    def resolve_unmatched_regions(self, normalized_region: str) -> int:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """UPDATE unmatched_regions SET status = 'resolved', updated_at=CURRENT_TIMESTAMP
+                   WHERE normalized_region = ? AND status = 'pending'""",
+                (normalized_region.strip(),),
+            )
+        return cursor.rowcount
+
     def remember_telegram_user(
         self, user_id: int, username: str | None, full_name: str = ""
     ) -> None:
@@ -643,6 +738,13 @@ class MaterialsDB:
         return LeadProfile(
             row["user_id"], row["username"], row["full_name"], row["position"],
             row["region"], row["company"], row["outlets"], row["manager"], row["created_at"],
+        )
+
+    @staticmethod
+    def _unmatched_region(row: sqlite3.Row) -> UnmatchedRegion:
+        return UnmatchedRegion(
+            row["id"], row["user_id"], row["username"], row["raw_region"],
+            row["normalized_region"], row["status"], row["created_at"], row["updated_at"],
         )
 
     @staticmethod
