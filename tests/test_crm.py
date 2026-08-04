@@ -89,6 +89,16 @@ def test_configurable_client_filters():
     assert not matches_filter(retail, {"kind": "retail", "scale": "4_10", "products": [], "product_mode": "any"})
     assert matches_filter(wholesale, {"kind": "wholesale", "scale": "any", "products": ["dojo", "oggo"], "product_mode": "any"})
     assert not matches_filter(wholesale, {"kind": "wholesale", "scale": "any", "products": ["dojo", "oggo"], "product_mode": "all"})
+    assert matches_filter(retail, {
+        "kind": "all", "scale": "any", "region": "моск", "statuses": ["Работаем"],
+        "products": ["dojo"], "product_mode": "all", "product_state": "no",
+    })
+    assert not matches_filter(retail, {
+        "kind": "all", "scale": "any", "statuses": ["Ждем заказ"], "products": [],
+    })
+    assert matches_filter(sample_client(status=""), {
+        "kind": "all", "scale": "any", "statuses": ["__empty__"], "products": [],
+    })
 
 
 def test_daily_report_groups_client_and_hides_technical_product_changes():

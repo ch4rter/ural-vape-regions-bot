@@ -28,6 +28,7 @@ class CRMState(StatesGroup):
     product_reason = State()
     task_text = State()
     task_date = State()
+    filter_region = State()
 
 
 def configure_crm(service: GoogleCRM | None, db: CRMDatabase, owners: set[int]) -> None:
@@ -756,7 +757,15 @@ async def pick_menu(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 def default_filter() -> dict:
-    return {"kind": "all", "scale": "any", "products": [], "product_mode": "any"}
+    return {
+        "kind": "all",
+        "scale": "any",
+        "region": "",
+        "statuses": [],
+        "products": [],
+        "product_mode": "any",
+        "product_state": "buy",
+    }
 
 
 def filter_keyboard(settings: dict) -> InlineKeyboardMarkup:
@@ -764,6 +773,9 @@ def filter_keyboard(settings: dict) -> InlineKeyboardMarkup:
     scale = settings.get("scale", "any")
     products = set(settings.get("products", []))
     mode = settings.get("product_mode", "any")
+    product_state = settings.get("product_state", "buy")
+    statuses = settings.get("statuses", [])
+    region = settings.get("region", "")
     mark = lambda selected, label: f"✅ {label}" if selected else label
     rows = [
         [
@@ -779,11 +791,31 @@ def filter_keyboard(settings: dict) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text=mark(scale == "4_10", "4–10 ТТ"), callback_data="crm:filter_scale:4_10"),
             InlineKeyboardButton(text=mark(scale == "11_plus", "11+ ТТ"), callback_data="crm:filter_scale:11_plus"),
         ],
+        [
+            InlineKeyboardButton(
+                text=f"📍 Регион{' · ' + region[:18] if region else ''}", callback_data="crm:filter_region"
+            ),
+            InlineKeyboardButton(
+                text=f"🔄 Статусы · {len(statuses)}", callback_data="crm:filter_statuses"
+            ),
+        ],
     ]
     product_buttons = [InlineKeyboardButton(
         text=mark(key in products, label), callback_data=f"crm:filter_product:{key}"
     ) for key, (_, label) in PRODUCT_COLUMNS.items()]
     rows.extend([product_buttons[index:index + 2] for index in range(0, len(product_buttons), 2)])
+    rows.append([
+        InlineKeyboardButton(
+            text=mark(product_state == "buy", "🟢 Покупает"), callback_data="crm:filter_product_state:buy"
+        ),
+        InlineKeyboardButton(
+            text=mark(product_state == "no", "🔴 Не покупает"), callback_data="crm:filter_product_state:no"
+        ),
+    ])
+    rows.append([InlineKeyboardButton(
+        text=mark(product_state == "unknown", "⚪ Не заполнено"),
+        callback_data="crm:filter_product_state:unknown",
+    )])
     rows.append([
         InlineKeyboardButton(
             text=mark(mode == "any", "Хотя бы одна"), callback_data="crm:filter_mode:any"
@@ -803,11 +835,20 @@ def filter_description(settings: dict) -> str:
     selected = [PRODUCT_COLUMNS[key][1] for key in settings.get("products", []) if key in PRODUCT_COLUMNS]
     products = ", ".join(selected) if selected else "любые товарные группы"
     mode = "хотя бы одну" if settings.get("product_mode") == "any" else "все выбранные"
+    selected_statuses = []
+    for value in settings.get("statuses", []):
+        selected_statuses.append("не заполнен" if value == "__empty__" else value)
+    statuses = ", ".join(selected_statuses) if selected_statuses else "любые"
+    product_state = {
+        "buy": "покупает", "no": "не покупает", "unknown": "не заполнено",
+    }.get(settings.get("product_state"), "покупает")
     return (
         "⚙️ <b>Подбор по характеристикам</b>\n\n"
+        f"Регион: <b>{html.escape(settings.get('region') or 'любой')}</b>\n"
         f"Тип клиента: <b>{kind_names.get(settings.get('kind'), 'все типы')}</b>\n"
         f"Масштаб: <b>{scale_names.get(settings.get('scale'), 'любое количество ТТ')}</b>\n"
-        f"Покупает: <b>{html.escape(products)}</b>"
+        f"Статус: <b>{html.escape(statuses)}</b>\n"
+        f"Товары ({product_state}): <b>{html.escape(products)}</b>"
         + (f" · условие «{mode}»" if selected else "")
         + "\n\nМожно выбрать несколько товарных групп."
     )
@@ -817,6 +858,7 @@ async def show_filter(callback: CallbackQuery, state: FSMContext, reset: bool = 
     data = await state.get_data()
     settings = default_filter() if reset else data.get("crm_filter", default_filter())
     await state.update_data(crm_filter=settings)
+    await state.set_state(None)
     await render(callback.message, filter_description(settings), filter_keyboard(settings))
     await callback.answer()
 
@@ -849,6 +891,108 @@ async def set_filter_scale(callback: CallbackQuery, state: FSMContext) -> None:
     await show_filter(callback, state)
 
 
+@router.callback_query(F.data == "crm:filter_region")
+async def ask_filter_region(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await guard(callback):
+        return
+    settings = (await state.get_data()).get("crm_filter", default_filter())
+    rows = []
+    if settings.get("region"):
+        rows.append([InlineKeyboardButton(text="🗑 Сбросить регион", callback_data="crm:filter_region_clear")])
+    rows.append(nav("crm:filter"))
+    await state.set_state(CRMState.filter_region)
+    await callback.message.edit_text(
+        "📍 <b>Регион клиента</b>\n\n"
+        "Введите город, область или часть названия региона. Точное совпадение не требуется.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+@router.message(CRMState.filter_region, F.text)
+async def save_filter_region(message: Message, state: FSMContext) -> None:
+    if not await guard(message):
+        return
+    value = message.text.strip()
+    if len(value) < 2 or len(value) > 100:
+        await message.answer("Введите от 2 до 100 символов.")
+        return
+    settings = (await state.get_data()).get("crm_filter", default_filter())
+    settings["region"] = value
+    await state.update_data(crm_filter=settings)
+    await state.set_state(None)
+    await render(message, filter_description(settings), filter_keyboard(settings))
+
+
+@router.callback_query(F.data == "crm:filter_region_clear")
+async def clear_filter_region(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await guard(callback):
+        return
+    settings = (await state.get_data()).get("crm_filter", default_filter())
+    settings["region"] = ""
+    await state.update_data(crm_filter=settings)
+    await state.set_state(None)
+    await show_filter(callback, state)
+
+
+def status_filter_keyboard(settings: dict) -> InlineKeyboardMarkup:
+    selected = set(settings.get("statuses", []))
+    choices = list(CRM_STATUSES) + ["__empty__"]
+    rows = []
+    for index, value in enumerate(choices):
+        label = "Не заполнен" if value == "__empty__" else value
+        if value in selected:
+            label = f"✅ {label}"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"crm:filter_status:{index}")])
+    if selected:
+        rows.append([InlineKeyboardButton(text="🗑 Сбросить статусы", callback_data="crm:filter_status_clear")])
+    rows.append(nav("crm:filter"))
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == "crm:filter_statuses")
+async def open_filter_statuses(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await guard(callback):
+        return
+    settings = (await state.get_data()).get("crm_filter", default_filter())
+    await callback.message.edit_text(
+        "🔄 <b>Статус работы</b>\n\n"
+        "Отметьте один или несколько статусов. Клиент подойдёт, если у него установлен любой из выбранных.",
+        reply_markup=status_filter_keyboard(settings),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("crm:filter_status:"))
+async def toggle_filter_status(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await guard(callback):
+        return
+    choices = list(CRM_STATUSES) + ["__empty__"]
+    try:
+        value = choices[int(callback.data.rsplit(":", 1)[1])]
+    except (ValueError, IndexError):
+        await callback.answer("Неизвестный статус.", show_alert=True)
+        return
+    settings = (await state.get_data()).get("crm_filter", default_filter())
+    selected = list(settings.get("statuses", []))
+    selected.remove(value) if value in selected else selected.append(value)
+    settings["statuses"] = selected
+    await state.update_data(crm_filter=settings)
+    await callback.message.edit_reply_markup(reply_markup=status_filter_keyboard(settings))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "crm:filter_status_clear")
+async def clear_filter_statuses(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await guard(callback):
+        return
+    settings = (await state.get_data()).get("crm_filter", default_filter())
+    settings["statuses"] = []
+    await state.update_data(crm_filter=settings)
+    await callback.message.edit_reply_markup(reply_markup=status_filter_keyboard(settings))
+    await callback.answer("Статусы сброшены.")
+
+
 @router.callback_query(F.data.startswith("crm:filter_product:"))
 async def toggle_filter_product(callback: CallbackQuery, state: FSMContext) -> None:
     if not await guard(callback):
@@ -875,12 +1019,30 @@ async def set_filter_mode(callback: CallbackQuery, state: FSMContext) -> None:
     await show_filter(callback, state)
 
 
+@router.callback_query(F.data.startswith("crm:filter_product_state:"))
+async def set_filter_product_state(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await guard(callback):
+        return
+    value = callback.data.rsplit(":", 1)[1]
+    if value not in {"buy", "no", "unknown"}:
+        await callback.answer("Неизвестное состояние.", show_alert=True)
+        return
+    settings = (await state.get_data()).get("crm_filter", default_filter())
+    settings["product_state"] = value
+    await state.update_data(crm_filter=settings)
+    await show_filter(callback, state)
+
+
 def numeric_outlets(value: str) -> int | None:
     match = re.search(r"\d+(?:[.,]\d+)?", value or "")
     return int(float(match.group(0).replace(",", "."))) if match else None
 
 
 def matches_filter(client: CRMClient, settings: dict) -> bool:
+    region_query = re.sub(r"\s+", " ", settings.get("region", "").casefold().replace("ё", "е")).strip()
+    client_region = re.sub(r"\s+", " ", client.region.casefold().replace("ё", "е")).strip()
+    if region_query and region_query not in client_region:
+        return False
     client_type = client.client_type.casefold().replace("ё", "е")
     kind = settings.get("kind", "all")
     if kind == "retail" and "розниц" not in client_type:
@@ -895,9 +1057,18 @@ def matches_filter(client: CRMClient, settings: dict) -> bool:
         return False
     if scale == "11_plus" and (outlets is None or outlets < 11):
         return False
+    statuses = settings.get("statuses", [])
+    if statuses:
+        current_status = client.status.strip().casefold().replace("ё", "е")
+        allowed_statuses = {
+            value.casefold().replace("ё", "е") for value in statuses if value != "__empty__"
+        }
+        if current_status not in allowed_statuses and not ("__empty__" in statuses and not current_status):
+            return False
     products = [key for key in settings.get("products", []) if key in PRODUCT_COLUMNS]
     if products:
-        matches = [client.products.get(key) == "buy" for key in products]
+        product_state = settings.get("product_state", "buy")
+        matches = [client.products.get(key) == product_state for key in products]
         if settings.get("product_mode") == "all" and not all(matches):
             return False
         if settings.get("product_mode") != "all" and not any(matches):
