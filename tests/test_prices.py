@@ -105,6 +105,7 @@ def test_prices_and_group_name_formatting():
     assert variant_word(2) == "варианта"
     assert variant_word(15) == "вариантов"
     assert manager_html("Андрей") == '<b><a href="https://t.me/shmidtuv">Андрей</a></b>'
+    assert manager_html("Вадим") == '<b><a href="https://t.me/vadimurv">Вадим</a></b>'
     assert manager_html("Другой") == "<b>Другой</b>"
 
 

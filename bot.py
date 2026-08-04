@@ -95,6 +95,10 @@ MANAGER_LINKS = {
     "андрей": "shmidtuv",
     "матвей": "ural_vape",
     "евгений": "evgenuralv",
+    "вадим": "vadimurv",
+}
+MANAGER_IDS = {
+    "вадим": 8844943870,
 }
 
 
@@ -684,6 +688,10 @@ def manager_contact_username(manager: str) -> str | None:
 
 
 def manager_recipient_id(manager: str) -> int | None:
+    normalized = normalize(manager)
+    direct_id = MANAGER_IDS.get(normalized)
+    if direct_id:
+        return direct_id
     username = manager_contact_username(manager)
     if not username:
         return None
