@@ -21,10 +21,9 @@ from openpyxl.utils import get_column_letter
 
 
 WAREHOUSES = {
-    "center": "Москва",
-    "west": "Санкт-Петербург",
-    "ural": "Челябинск",
+    "common": "Общий прайс",
 }
+PRICE_SOURCE = "common"
 
 
 def normalize_price_text(value: str) -> str:
@@ -197,6 +196,19 @@ class ItemSummary:
     warehouse_prices: dict[str, tuple[Decimal, Decimal]]
 
 
+def price_header_indexes(headers: list[str]) -> tuple[int, int, int] | None:
+    """Return name/cash/cashless indexes for both legacy and simplified common prices."""
+    name_idx = next((i for i, value in enumerate(headers) if value == "наименование"), None)
+    cashless_idx = next((i for i, value in enumerate(headers) if "безнал" in value), None)
+    cash_idx = next(
+        (i for i, value in enumerate(headers) if "нал" in value and "безнал" not in value),
+        None,
+    )
+    if None in (name_idx, cash_idx, cashless_idx):
+        return None
+    return name_idx, cash_idx, cashless_idx
+
+
 def parse_price_file(path: Path) -> ParsedPrice:
     workbook = load_workbook(path, read_only=True, data_only=True)
     sheet = workbook.active
@@ -212,11 +224,7 @@ def parse_price_file(path: Path) -> ParsedPrice:
             raw_date = values[1]
             price_date = raw_date.isoformat() if hasattr(raw_date, "isoformat") else str(raw_date)
         normalized = [normalize_price_text(str(value or "")) for value in values]
-        if (
-            any(value == "наименование" for value in normalized)
-            and any("50т р нал" in value for value in normalized)
-            and any("50т р безнал" in value for value in normalized)
-        ):
+        if price_header_indexes(normalized):
             header_row = (number, normalized)
             break
         if number >= 30:
@@ -226,9 +234,7 @@ def parse_price_file(path: Path) -> ParsedPrice:
         raise ValueError("Не найдена строка заголовков прайса.")
 
     _, headers = header_row
-    name_idx = headers.index("наименование")
-    cash_idx = next(i for i, value in enumerate(headers) if "50т р нал" in value)
-    cashless_idx = next(i for i, value in enumerate(headers) if "50т р безнал" in value)
+    name_idx, cash_idx, cashless_idx = price_header_indexes(headers)
     code_idx = next((i for i, value in enumerate(headers) if value == "код"), 0)
 
     parsed_groups = []
@@ -385,7 +391,7 @@ class PricesDB:
 
     def replace_warehouse(self, warehouse: str, parsed: ParsedPrice, file_name: str) -> None:
         if warehouse not in WAREHOUSES:
-            raise ValueError("Неизвестный склад.")
+            raise ValueError("Неизвестный источник прайса.")
         with closing(self._connect()) as connection, connection:
             connection.execute("DELETE FROM price_groups WHERE warehouse = ?", (warehouse,))
             for group_position, group in enumerate(parsed.groups):
@@ -420,7 +426,9 @@ class PricesDB:
 
     def import_statuses(self) -> dict[str, sqlite3.Row]:
         with closing(self._connect()) as connection, connection:
-            rows = connection.execute("SELECT * FROM price_imports").fetchall()
+            rows = connection.execute(
+                "SELECT * FROM price_imports WHERE warehouse = ?", (PRICE_SOURCE,)
+            ).fetchall()
         return {row["warehouse"]: row for row in rows}
 
     def build_change_report(
@@ -514,7 +522,10 @@ class PricesDB:
 
     def latest_reports(self) -> dict[str, dict]:
         with closing(self._connect()) as connection:
-            rows = connection.execute("SELECT warehouse, report_json FROM price_latest_reports").fetchall()
+            rows = connection.execute(
+                "SELECT warehouse, report_json FROM price_latest_reports WHERE warehouse = ?",
+                (PRICE_SOURCE,),
+            ).fetchall()
         return {row["warehouse"]: json.loads(row["report_json"]) for row in rows}
 
     def report_broadcast_sent(self, signature: str) -> bool:
@@ -541,7 +552,9 @@ class PricesDB:
                           g.warehouse, COUNT(i.id) AS item_count,
                           GROUP_CONCAT(i.name, ' ') AS item_names
                    FROM price_groups g JOIN price_items i ON i.group_id = g.id
+                   WHERE g.warehouse = ?
                    GROUP BY g.id ORDER BY g.position"""
+                , (PRICE_SOURCE,)
             ).fetchall()
         merged = {}
         for row in groups:
@@ -639,8 +652,8 @@ class PricesDB:
             rows = connection.execute(
                 """SELECT i.code, i.name, i.cash, i.cashless
                    FROM price_items i JOIN price_groups g ON g.id = i.group_id
-                   WHERE g.merge_key = ?""",
-                (merge_key,),
+                   WHERE g.merge_key = ? AND g.warehouse = ?""",
+                (merge_key, PRICE_SOURCE),
             ).fetchall()
         tiers = defaultdict(set)
         variants = set()
@@ -663,8 +676,8 @@ class PricesDB:
             rows = connection.execute(
                 """SELECT g.warehouse, i.code, i.name, i.cash, i.cashless
                    FROM price_items i JOIN price_groups g ON g.id = i.group_id
-                   WHERE g.merge_key = ? ORDER BY i.position""",
-                (summary.merge_key,),
+                   WHERE g.merge_key = ? AND g.warehouse = ? ORDER BY i.position""",
+                (summary.merge_key, PRICE_SOURCE),
             ).fetchall()
         variants = {}
         for row in rows:
@@ -690,7 +703,9 @@ class PricesDB:
                 """SELECT i.id, i.code, i.name, i.cash, i.cashless,
                           g.warehouse, g.display_name, g.category_name
                    FROM price_items i JOIN price_groups g ON g.id = i.group_id
+                   WHERE g.warehouse = ?
                    ORDER BY g.position, i.position"""
+                , (PRICE_SOURCE,)
             ).fetchall()
         merged = {}
         for row in rows:
@@ -751,8 +766,8 @@ class PricesDB:
             rows = connection.execute(
                 f"""SELECT g.warehouse, i.code, i.name
                     FROM price_items i JOIN price_groups g ON g.id = i.group_id
-                    WHERE g.merge_key IN ({placeholders})""",
-                merge_keys,
+                    WHERE g.merge_key IN ({placeholders}) AND g.warehouse = ?""",
+                (*merge_keys, PRICE_SOURCE),
             ).fetchall()
         availability: dict[str, set[str]] = defaultdict(set)
         for row in rows:
@@ -876,19 +891,15 @@ def generate_discounted_price(source: Path, destination: Path, percent: int = 10
     headers = None
     for row_number, row in enumerate(sheet.iter_rows(min_row=1, max_row=30), 1):
         normalized = [normalize_price_text(str(cell.value or "")) for cell in row]
-        if (
-            any(value == "наименование" for value in normalized)
-            and any("50т р нал" in value for value in normalized)
-            and any("50т р безнал" in value for value in normalized)
-        ):
+        if price_header_indexes(normalized):
             header_row, headers = row_number, normalized
             break
     if not header_row or headers is None:
         workbook.close()
         raise ValueError("Не найдена строка заголовков прайса.")
     name_idx = headers.index("наименование") + 1
-    cash_idx = next(i for i, value in enumerate(headers, 1) if "50т р нал" in value)
-    cashless_idx = next(i for i, value in enumerate(headers, 1) if "50т р безнал" in value)
+    _, cash_zero, cashless_zero = price_header_indexes(headers)
+    cash_idx, cashless_idx = cash_zero + 1, cashless_zero + 1
     sheet.cell(header_row, cash_idx).value = f"от 50т.р. нал — скидка {percent}%"
     sheet.cell(header_row, cashless_idx).value = f"от 50т.р. безнал — скидка {percent}%"
     multiplier = Decimal(100 - percent) / Decimal(100)
@@ -921,7 +932,7 @@ def generate_selected_price(
     availability: dict[str, set[str]],
     discount: int = 0,
 ) -> int:
-    """Filter a native warehouse price while preserving its original workbook design."""
+    """Filter the native common price while preserving its original workbook design."""
     if discount not in (0, 10):
         raise ValueError("Поддерживаются базовые цены или скидка 10%.")
     if not merge_keys:
@@ -933,19 +944,14 @@ def generate_selected_price(
     headers = None
     for row_number, row in enumerate(sheet.iter_rows(min_row=1, max_row=30), 1):
         normalized = [normalize_price_text(str(cell.value or "")) for cell in row]
-        if (
-            any(value == "наименование" for value in normalized)
-            and any("50т р нал" in value for value in normalized)
-            and any("50т р безнал" in value for value in normalized)
-        ):
+        if price_header_indexes(normalized):
             header_row, headers = row_number, normalized
             break
     if not header_row or headers is None:
         workbook.close()
         raise ValueError("Не найдена строка заголовков прайса.")
-    name_col = headers.index("наименование") + 1
-    cash_col = next(i for i, value in enumerate(headers, 1) if "50т р нал" in value)
-    cashless_col = next(i for i, value in enumerate(headers, 1) if "50т р безнал" in value)
+    name_zero, cash_zero, cashless_zero = price_header_indexes(headers)
+    name_col, cash_col, cashless_col = name_zero + 1, cash_zero + 1, cashless_zero + 1
 
     keep_rows = [True] * (sheet.max_row + 1)
     group_rows: list[int] = []
@@ -1077,23 +1083,6 @@ def generate_selected_price(
             translated = formula
         sheet.cell(mapped_row, column).value = translated
 
-    availability_columns = {"center": 9, "west": 10, "ural": 11}
-    for warehouse, column in availability_columns.items():
-        header = sheet.cell(header_row, column)
-        header.value = WAREHOUSES[warehouse]
-        header._style = copy(sheet.cell(header_row, cash_col)._style)
-        header.alignment = copy(sheet.cell(header_row, cash_col).alignment)
-        column_letter = get_column_letter(column)
-        current_width = sheet.column_dimensions[column_letter].width or 0
-        sheet.column_dimensions[column_letter].width = max(current_width, 20)
-    for old_row, identity in selected_identities.items():
-        mapped_row = row_map[old_row]
-        warehouses = availability.get(identity, set())
-        for warehouse, column in availability_columns.items():
-            cell = sheet.cell(mapped_row, column)
-            cell._style = copy(sheet.cell(mapped_row, cash_col)._style)
-            cell.alignment = copy(sheet.cell(mapped_row, cash_col).alignment)
-            cell.value = "✅" if warehouse in warehouses else "❌"
     sheet.freeze_panes = "A9"
 
     if discount:

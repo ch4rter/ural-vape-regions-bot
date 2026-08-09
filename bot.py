@@ -40,6 +40,7 @@ from crm_db import CRMDatabase
 from google_crm import GoogleCRM
 from materials_db import Material, MaterialsDB
 from prices_db import (
+    PRICE_SOURCE,
     WAREHOUSES,
     GroupDetails,
     PricesDB,
@@ -83,6 +84,10 @@ PRICE_ATTACHMENT_ID_SETTING = "price_command_attachment_id"
 PRICE_ATTACHMENT_NAME_SETTING = "price_command_attachment_name"
 HOME_BUTTON_TEXT = "🏠 Главное меню"
 DEFAULT_PRICE_COMMAND_MESSAGE = (
+    "📄 <b>Актуальный прайс</b>\n\n"
+    "Ниже представлена последняя загруженная версия с базовыми ценами."
+)
+LEGACY_DEFAULT_PRICE_COMMAND_MESSAGE = (
     "📄 <b>Актуальные прайсы</b>\n\n"
     "<b>Центр</b> — Москва\n"
     "<b>Урал</b> — Челябинск\n"
@@ -469,7 +474,7 @@ def persistent_home_keyboard() -> ReplyKeyboardMarkup:
 async def show_main(target: Message, user_id: int | None, *, edit: bool = False) -> None:
     intro = (
         "👋 <b>Добро пожаловать!</b>\n\n"
-        "Здесь можно найти ответственного менеджера, проверить цены и наличие, "
+        "Здесь можно найти ответственного менеджера, проверить цены и ассортимент, "
         "получить рабочие материалы или открыть свой лист ожидания."
     )
     if edit:
@@ -901,45 +906,20 @@ async def send_price_command_intro(message: Message) -> None:
 
 
 async def send_current_base_prices(message: Message) -> bool:
-    """Send the latest original base price file for every warehouse."""
-    warehouse_cities = {
-        "center": "Москва",
-        "ural": "Челябинск",
-        "west": "Санкт-Петербург",
-    }
-    warehouse_order = ("center", "ural", "west")
+    """Send the latest original common base price file."""
     import_statuses = prices_db.import_statuses()
-    available = [
-        warehouse
-        for warehouse in warehouse_order
-        if (price_storage_path / f"{warehouse}.xlsx").is_file()
-    ]
-
-    if not available:
+    source = price_storage_path / f"{PRICE_SOURCE}.xlsx"
+    if PRICE_SOURCE not in import_statuses or not source.is_file():
         await message.answer(
-            "📄 <b>Актуальные прайсы</b>\n\n"
-            "Прайсы пока не загружены. Обратитесь к администратору."
+            "📄 <b>Актуальный прайс</b>\n\n"
+            "Прайс пока не загружен. Обратитесь к администратору."
         )
         return False
 
     await send_price_command_intro(message)
-    for warehouse in available:
-        source = price_storage_path / f"{warehouse}.xlsx"
-        status = import_statuses.get(warehouse)
-        original_name = Path(str(status["file_name"])).name if status and status["file_name"] else source.name
-        await message.answer_document(
-            FSInputFile(source, filename=original_name),
-        )
-
-    missing = [
-        f"{WAREHOUSES[warehouse]} — {warehouse_cities[warehouse]}"
-        for warehouse in warehouse_order
-        if warehouse not in available
-    ]
-    if missing:
-        await message.answer(
-            "⚠️ Пока недоступны:\n" + "\n".join(f"• {html.escape(value)}" for value in missing)
-        )
+    status = import_statuses[PRICE_SOURCE]
+    original_name = Path(str(status["file_name"])).name if status["file_name"] else source.name
+    await message.answer_document(FSInputFile(source, filename=original_name))
     return True
 
 
@@ -953,7 +933,7 @@ async def notify_price_request_if_external(bot: Bot, message: Message) -> None:
 
 @router.message(F.text.regexp(re.compile(r"^/прайс(?:@\w+)?\s*$", re.IGNORECASE)))
 async def send_all_current_prices(message: Message, state: FSMContext, bot: Bot) -> None:
-    """Send the latest base price file for every warehouse."""
+    """Send the latest common base price file."""
     await state.clear()
     if await send_current_base_prices(message):
         await notify_price_request_if_external(bot, message)
@@ -1264,7 +1244,7 @@ def price_item_search_text(total: int, page: int) -> str:
     text = f"🔎 <b>Подходящих позиций: {total}</b>"
     if page_count > 1:
         text += f"\nСтраница <b>{page + 1}</b> из <b>{page_count}</b>"
-    return f"{text}\n\nВыберите товар, чтобы увидеть цены и наличие:"
+    return f"{text}\n\nВыберите товар, чтобы увидеть цены:"
 
 
 def format_price_group(details: GroupDetails) -> str:
@@ -1273,14 +1253,10 @@ def format_price_group(details: GroupDetails) -> str:
         f"Категория: <b>{html.escape(details.summary.category_name)}</b>",
         f"Уникальных вариантов: <b>{details.unique_variants}</b>",
         "",
-        "🏢 <b>Наличие и ассортимент</b>",
+        "📦 <b>Ассортимент в прайсе</b>",
     ]
-    for warehouse in ("center", "west", "ural"):
-        count = details.summary.warehouse_counts.get(warehouse, 0)
-        if count:
-            lines.append(f"✅ {WAREHOUSES[warehouse]} — <b>{count}</b> {variant_word(count)}")
-        else:
-            lines.append(f"❌ {WAREHOUSES[warehouse]} — нет в прайсе")
+    count = details.summary.warehouse_counts.get(PRICE_SOURCE, 0)
+    lines.append(f"Вариантов: <b>{count}</b> {variant_word(count)}")
     lines.extend(["", "💳 <b>Цены внутри группы</b>"])
     if len(details.tiers) > 1:
         cash_values = [tier.cash for tier in details.tiers if tier.cash > 0]
@@ -1334,24 +1310,12 @@ def format_price_variants(summary, variants, page: int) -> str:
             "",
             f"<b>{number}.</b> {html.escape(variant.name)}",
         ])
-        unique_prices = set(variant.warehouse_prices.values())
-        if len(unique_prices) == 1:
-            warehouses = " · ".join(
-                WAREHOUSES[key] for key in ("center", "west", "ural") if key in variant.warehouses
-            )
-            cash, cashless = next(iter(unique_prices))
+        prices = variant.warehouse_prices.get(PRICE_SOURCE)
+        if prices:
+            cash, cashless = prices
             lines.extend([
-                f"📍 {html.escape(warehouses)}",
                 f"Нал {payment_price(cash, 0)} · Безнал {payment_price(cashless, 0)}",
             ])
-        else:
-            for warehouse in ("center", "west", "ural"):
-                if warehouse in variant.warehouse_prices:
-                    cash, cashless = variant.warehouse_prices[warehouse]
-                    lines.append(
-                        f"📍 {WAREHOUSES[warehouse]}: нал {payment_price(cash, 0)} · "
-                        f"безнал {payment_price(cashless, 0)}"
-                    )
     return "\n".join(lines)
 
 
@@ -1361,23 +1325,17 @@ def format_price_item(item) -> str:
         f"Группа: <b>{html.escape(item.group_name)}</b>",
         f"Категория: <b>{html.escape(item.category_name)}</b>",
         "",
-        "🏢 <b>Цены и наличие</b>",
+        "💳 <b>Цены</b>",
     ]
-    price_warehouses = {}
-    for warehouse, prices in item.warehouse_prices.items():
-        price_warehouses.setdefault(prices, []).append(warehouse)
-    for (cash, cashless), warehouses in price_warehouses.items():
-        names = " · ".join(WAREHOUSES[key] for key in ("center", "west", "ural") if key in warehouses)
-        lines.extend(["", f"📍 <b>{html.escape(names)}</b>"])
+    prices = item.warehouse_prices.get(PRICE_SOURCE)
+    if prices:
+        cash, cashless = prices
         for percent in (0, 5, 10, 15):
             label = "Базовая" if percent == 0 else f"−{percent}%"
             lines.append(
                 f"{label}: нал {payment_price(cash, percent)} · "
                 f"безнал {payment_price(cashless, percent)}"
             )
-    missing = [WAREHOUSES[key] for key in ("center", "west", "ural") if key not in item.warehouse_prices]
-    if missing:
-        lines.extend(["", f"❌ Нет в прайсе: {html.escape(' · '.join(missing))}"])
     return "\n".join(lines)
 
 
@@ -1420,7 +1378,7 @@ def wait_match_score(query: str, group_name: str, item_name: str) -> float:
 
 
 async def notify_waitlist_matches(bot: Bot, reports: dict[str, dict] | None) -> int:
-    """Notify managers immediately for the warehouse price that has just been applied."""
+    """Notify managers immediately after the common price has been applied."""
     if not reports:
         return 0
     arrivals = []
@@ -1440,34 +1398,28 @@ async def notify_waitlist_matches(bot: Bot, reports: dict[str, dict] | None) -> 
             if not score:
                 continue
             item_key = normalize_price_text(item["name"])
-            warehouse_signature = f"{warehouse}|{item_key}"
-            if materials_db.wait_match_seen(entry.id, warehouse_signature):
+            price_signature = f"{PRICE_SOURCE}|{item_key}"
+            if materials_db.wait_match_seen(entry.id, price_signature):
                 continue
             match = matches.setdefault(item_key, {
                 "name": item["name"], "group": item["group"],
                 "category": item.get("category", ""), "score": score,
-                "warehouses": {}, "signatures": set(),
+                "prices": {}, "signatures": set(),
             })
             match["score"] = max(match["score"], score)
-            match["warehouses"][warehouse] = (Decimal(item["cash"]), Decimal(item["cashless"]))
-            match["signatures"].add(warehouse_signature)
+            match["prices"] = (Decimal(item["cash"]), Decimal(item["cashless"]))
+            match["signatures"].add(price_signature)
         if not matches:
             continue
         group_wait = not any(char.isdigit() for char in normalize_price_text(entry.query))
         selected = sorted(matches.items(), key=lambda value: (-value[1]["score"], value[1]["name"]))
         if not group_wait:
             selected = selected[:1]
-        warehouse_counts = {}
         payload_items = []
         for _, item in selected:
-            warehouses = [WAREHOUSES[key] for key in ("center", "west", "ural") if key in item["warehouses"]]
-            payload_items.append({"name": item["name"], "warehouses": warehouses})
-            for warehouse in warehouses:
-                warehouse_counts[warehouse] = warehouse_counts.get(warehouse, 0) + 1
+            payload_items.append({"name": item["name"]})
         payload = {
             "count": len(selected),
-            "warehouses": list(warehouse_counts),
-            "warehouse_counts": warehouse_counts,
             "items": payload_items,
             "categories": sorted({item.get("category", "") for _, item in selected if item.get("category")}),
         }
@@ -1499,8 +1451,6 @@ async def notify_waitlist_matches(bot: Bot, reports: dict[str, dict] | None) -> 
         if entry.comment:
             lines.append(f"Комментарий: {html.escape(entry.comment)}")
         lines.extend(["", f"Подходящих новых позиций: <b>{len(selected)}</b>"])
-        for warehouse, count in warehouse_counts.items():
-            lines.append(f"• {warehouse}: <b>{count}</b>")
         lines.extend(["", "Откройте подробности или подготовьте сообщение клиенту."])
         try:
             await bot.send_message(
@@ -1577,7 +1527,6 @@ def wait_entry_text(entry) -> str:
         lines.extend([
             "", "✅ <b>Последнее найденное поступление</b>",
             f"Подходящих позиций: <b>{entry.last_match.get('count', 0)}</b>",
-            f"Склады: {html.escape(' · '.join(entry.last_match.get('warehouses', [])))}",
         ])
     return "\n".join(lines)
 
@@ -1762,10 +1711,7 @@ async def show_wait_arrival(callback: CallbackQuery) -> None:
     ]
     items = entry.last_match.get("items", [])
     for number, item in enumerate(items[:25], 1):
-        lines.append(
-            f"<b>{number}.</b> {html.escape(item['name'])}\n"
-            f"📍 {html.escape(' · '.join(item.get('warehouses', [])))}"
-        )
+        lines.append(f"<b>{number}.</b> {html.escape(item['name'])}")
     if len(items) > 25:
         lines.extend(["", f"И ещё позиций: <b>{len(items) - 25}</b>"])
     await callback.message.edit_text("\n\n".join(lines), reply_markup=wait_entry_keyboard(entry))
@@ -1885,14 +1831,9 @@ def price_variants_keyboard(callback_id: int, page: int, total: int) -> InlineKe
 
 def downloadable_prices_keyboard() -> InlineKeyboardMarkup:
     statuses = prices_db.import_statuses()
-    buttons = [
-            InlineKeyboardButton(
-                text=f"🏢 {WAREHOUSES[warehouse]}",
-                callback_data=f"files:w:{warehouse}",
-            )
-        for warehouse in ("center", "west", "ural")
-        if warehouse in statuses
-    ]
+    buttons = [InlineKeyboardButton(
+        text="📄 Общий прайс", callback_data=f"files:w:{PRICE_SOURCE}"
+    )] if PRICE_SOURCE in statuses else []
     rows = button_grid(buttons)
     rows.append(compact_nav())
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -2425,21 +2366,15 @@ async def run_client_broadcast(callback: CallbackQuery, state: FSMContext, bot: 
 
 
 def combined_report_bundle() -> tuple[dict[str, dict] | None, str | None]:
-    reports = prices_db.latest_reports()
-    required = ("center", "west", "ural")
-    if any(warehouse not in reports for warehouse in required):
-        return None, "Сначала загрузите свежие прайсы всех трёх складов."
-    today = datetime.now().astimezone().date().isoformat()
-    if any(str(reports[warehouse].get("created_at", "")).split("T", 1)[0] != today for warehouse in required):
-        return None, "Для общей рассылки нужны три отчёта, сформированные сегодня."
-    return {warehouse: reports[warehouse] for warehouse in required}, None
+    report = prices_db.latest_report(PRICE_SOURCE)
+    if not report:
+        return None, "Сначала загрузите общий прайс повторно, чтобы сформировать сравнение."
+    return {PRICE_SOURCE: report}, None
 
 
 def combined_report_signature(reports: dict[str, dict]) -> str:
-    return "|".join(
-        f"{warehouse}:{reports[warehouse].get('created_at')}:{reports[warehouse].get('current_file')}"
-        for warehouse in ("center", "west", "ural")
-    )
+    report = reports[PRICE_SOURCE]
+    return f"{PRICE_SOURCE}:{report.get('created_at')}:{report.get('current_file')}"
 
 
 def price_reports_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
@@ -2447,7 +2382,7 @@ def price_reports_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
     buttons = [InlineKeyboardButton(
             text=f"📊 {WAREHOUSES[warehouse]}", callback_data=f"reports:show:{warehouse}"
         )
-        for warehouse in ("center", "west", "ural") if warehouse in reports
+        for warehouse in WAREHOUSES if warehouse in reports
     ]
     rows = button_grid(buttons)
     combined, _ = combined_report_bundle()
@@ -2475,7 +2410,7 @@ def format_price_report(report: dict) -> str:
     previous_date = str(report["previous_date"]).split("T", 1)[0]
     current_date = str(report["current_date"]).split("T", 1)[0]
     return (
-        f"📊 <b>Изменения прайса · {WAREHOUSES[report['warehouse']]}</b>\n\n"
+        "📊 <b>Изменения общего прайса</b>\n\n"
         f"Сравнение: <b>{html.escape(previous_date)}</b> → <b>{html.escape(current_date)}</b>\n"
         f"Позиций: <b>{report['previous_count']}</b> → <b>{report['current_count']}</b>\n\n"
         f"➕ Появилось: <b>{len(report['added'])}</b>\n"
@@ -2497,27 +2432,14 @@ def report_actions_keyboard(warehouse: str) -> InlineKeyboardMarkup:
 
 
 def format_combined_report_notification(reports: dict[str, dict]) -> str:
-    lines = ["🔔 <b>Прайсы обновлены</b>", "", "Свежие цены и остатки загружены по всем складам."]
-    total_added = total_removed = total_prices = 0
-    for warehouse in ("center", "west", "ural"):
-        report = reports[warehouse]
-        added, removed = len(report["added"]), len(report["removed"])
-        changed = len(report["price_changes"])
-        total_added += added
-        total_removed += removed
-        total_prices += changed
-        lines.extend([
-            "", f"🏢 <b>{WAREHOUSES[warehouse]}</b>",
-            f"➕ Появилось: <b>{added}</b> · ❌ Закончилось: <b>{removed}</b>",
-            f"💰 Изменилось цен: <b>{changed}</b>",
-        ])
-    lines.extend([
-        "", "📊 <b>Итого по трём складам</b>",
-        f"➕ Появилось: <b>{total_added}</b>",
-        f"❌ Закончилось: <b>{total_removed}</b>",
-        f"💰 Изменилось цен: <b>{total_prices}</b>",
-        "", "Подробные отчёты доступны в разделе «Изменения прайсов».",
-    ])
+    report = reports[PRICE_SOURCE]
+    lines = [
+        "🔔 <b>Общий прайс обновлён</b>", "",
+        f"➕ Появилось: <b>{len(report['added'])}</b>",
+        f"❌ Закончилось: <b>{len(report['removed'])}</b>",
+        f"💰 Изменилось цен: <b>{len(report['price_changes'])}</b>",
+        "", "Подробный отчёт доступен в разделе «Изменения прайса».",
+    ]
     return "\n".join(lines)
 
 
@@ -2527,15 +2449,14 @@ async def open_price_reports(callback: CallbackQuery, state: FSMContext) -> None
     reports = prices_db.latest_reports()
     if not reports:
         await callback.message.edit_text(
-            "📊 <b>Изменения прайсов</b>\n\n"
-            "Отчётов пока нет. Первый отчёт появится после следующего обновления склада, "
-            "для которого уже загружен предыдущий прайс.",
+            "📊 <b>Изменения прайса</b>\n\n"
+            "Отчётов пока нет. Первый отчёт появится после второй загрузки общего прайса.",
             reply_markup=back_main(),
         )
     else:
         await callback.message.edit_text(
-            "📊 <b>Изменения прайсов</b>\n\n"
-            "Здесь хранится только последнее сравнение для каждого склада. Выберите склад:",
+            "📊 <b>Изменения общего прайса</b>\n\n"
+            "Здесь хранится последнее сравнение с предыдущей версией:",
             reply_markup=price_reports_keyboard(callback.from_user.id),
         )
     await callback.answer()
@@ -2546,7 +2467,7 @@ async def show_price_report(callback: CallbackQuery) -> None:
     warehouse = callback.data.rsplit(":", 1)[1]
     report = prices_db.latest_report(warehouse)
     if warehouse not in WAREHOUSES or not report:
-        await callback.answer("Отчёт этого склада пока недоступен.", show_alert=True)
+        await callback.answer("Отчёт пока недоступен.", show_alert=True)
         return
     await callback.message.edit_text(
         format_price_report(report),
@@ -2561,11 +2482,11 @@ async def confirm_report_broadcast(callback: CallbackQuery) -> None:
         return
     reports, error = combined_report_bundle()
     if not reports:
-        await callback.answer(error or "Общий отчёт пока недоступен.", show_alert=True)
+        await callback.answer(error or "Отчёт пока недоступен.", show_alert=True)
         return
     signature = combined_report_signature(reports)
     if prices_db.report_broadcast_sent(signature):
-        await callback.answer("Этот общий отчёт уже был отправлен.", show_alert=True)
+        await callback.answer("Этот отчёт уже был отправлен.", show_alert=True)
         return
     users = materials_db.list_access_users()
     ready = len({user.telegram_id for user in users if user.telegram_id})
@@ -2592,11 +2513,11 @@ async def send_report_broadcast(callback: CallbackQuery, bot: Bot) -> None:
         return
     reports, error = combined_report_bundle()
     if not reports:
-        await callback.answer(error or "Общий отчёт пока недоступен.", show_alert=True)
+        await callback.answer(error or "Отчёт пока недоступен.", show_alert=True)
         return
     signature = combined_report_signature(reports)
     if prices_db.report_broadcast_sent(signature):
-        await callback.answer("Этот общий отчёт уже был отправлен.", show_alert=True)
+        await callback.answer("Этот отчёт уже был отправлен.", show_alert=True)
         return
     recipients = sorted({
         user.telegram_id for user in materials_db.list_access_users() if user.telegram_id
@@ -2605,7 +2526,7 @@ async def send_report_broadcast(callback: CallbackQuery, bot: Bot) -> None:
     await callback.answer("Начинаю рассылку…")
     await callback.message.edit_text(
         "⏳ <b>Отправляю уведомление</b>\n\n"
-        "Отчёт: <b>Москва · Санкт-Петербург · Челябинск</b>\n"
+        "Отчёт: <b>общий прайс</b>\n"
         f"Получателей: <b>{len(recipients)}</b>"
     )
     sent = 0
@@ -2646,17 +2567,17 @@ async def download_price_report(callback: CallbackQuery) -> None:
     warehouse = callback.data.rsplit(":", 1)[1]
     report = prices_db.latest_report(warehouse)
     if warehouse not in WAREHOUSES or not report:
-        await callback.answer("Отчёт этого склада пока недоступен.", show_alert=True)
+        await callback.answer("Отчёт пока недоступен.", show_alert=True)
         return
     await callback.answer("Готовлю отчёт…")
     try:
         with tempfile.TemporaryDirectory() as temp_name:
             date = str(report["current_date"]).split("T", 1)[0]
-            destination = Path(temp_name) / f"изменения прайса {WAREHOUSES[warehouse]} {date}.xlsx"
+            destination = Path(temp_name) / f"изменения общего прайса {date}.xlsx"
             await asyncio.to_thread(generate_change_report_excel, report, destination)
             await callback.message.answer_document(
                 FSInputFile(destination, filename=destination.name),
-                caption=f"📊 <b>Изменения прайса · {WAREHOUSES[warehouse]}</b>",
+                caption="📊 <b>Изменения общего прайса</b>",
             )
     except Exception:
         logging.exception("Не удалось сформировать отчёт прайса %s", warehouse)
@@ -2671,7 +2592,7 @@ async def open_downloadable_prices(callback: CallbackQuery, state: FSMContext) -
         return
     await callback.message.edit_text(
         "📄 <b>Прайсы</b>\n\n"
-        "Выберите склад. Можно скачать исходный прайс с базовыми ценами или версию, "
+        "Можно скачать исходный прайс с базовыми ценами или версию, "
         "в которой цены нал/безнал уже уменьшены на 10%.",
         reply_markup=downloadable_prices_keyboard(),
     )
@@ -2683,11 +2604,11 @@ async def select_price_warehouse(callback: CallbackQuery) -> None:
     warehouse = callback.data.rsplit(":", 1)[1]
     status = prices_db.import_statuses().get(warehouse)
     if warehouse not in WAREHOUSES or not status:
-        await callback.answer("Прайс этого склада пока недоступен.", show_alert=True)
+        await callback.answer("Прайс пока недоступен.", show_alert=True)
         return
     price_date = (status["price_date"] or status["updated_at"] or "").split("T", 1)[0]
     await callback.message.edit_text(
-        f"📄 <b>{WAREHOUSES[warehouse]}</b>\n\n"
+        "📄 <b>Общий прайс</b>\n\n"
         f"Дата прайса: <b>{html.escape(price_date)}</b>\n"
         f"Товарных позиций: <b>{status['item_count']}</b>\n\n"
         "Выберите нужный вариант:",
@@ -2717,26 +2638,27 @@ async def send_price_file(callback: CallbackQuery) -> None:
         await callback.answer("Исходный файл не найден. Попросите администратора обновить прайс.", show_alert=True)
         return
     await callback.answer("Готовлю файл…")
-    warehouse_name = WAREHOUSES[warehouse]
     if version == "base":
+        status = prices_db.import_statuses().get(warehouse)
+        original_name = Path(str(status["file_name"])).name if status and status["file_name"] else source.name
         await callback.message.answer_document(
-            FSInputFile(source, filename=f"прайс {warehouse_name} базовый.xlsx"),
-            caption=f"📄 <b>{warehouse_name}</b> · базовые цены",
+            FSInputFile(source, filename=original_name),
+            caption="📄 <b>Общий прайс</b> · базовые цены",
         )
         return
     try:
         with tempfile.TemporaryDirectory() as temp_name:
-            destination = Path(temp_name) / f"прайс {warehouse_name} скидка 10.xlsx"
+            destination = Path(temp_name) / "общий прайс скидка 10.xlsx"
             changed = await asyncio.to_thread(generate_discounted_price, source, destination, 10)
             await callback.message.answer_document(
                 FSInputFile(destination, filename=destination.name),
                 caption=(
-                    f"📄 <b>{warehouse_name}</b> · цены со скидкой 10%\n\n"
+                    "📄 <b>Общий прайс</b> · цены со скидкой 10%\n\n"
                     f"Пересчитано товарных позиций: <b>{changed}</b>"
                 ),
             )
     except Exception:
-        logging.exception("Не удалось сформировать прайс со скидкой для %s", warehouse)
+        logging.exception("Не удалось сформировать общий прайс со скидкой")
         await callback.message.answer(
             "⚠️ Не удалось сформировать файл. Попробуйте ещё раз или сообщите администратору."
         )
@@ -2750,7 +2672,7 @@ async def open_price_search(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AppState.price_search)
     await state.update_data(price_result_ids=[], price_result_page=0)
     await callback.message.edit_text(
-        "💰 <b>Цены и наличие</b>\n\n"
+        "💰 <b>Цены и ассортимент</b>\n\n"
         "Введите название товарной группы. Можно использовать бренд, модель, категорию "
         "или их часть — точное совпадение не требуется.\n\n"
         "Например: <code>OGGO VLIQ</code> или <code>Dojo 12000</code>",
@@ -3055,29 +2977,19 @@ async def export_selected_prices(callback: CallbackQuery, state: FSMContext) -> 
         with tempfile.TemporaryDirectory() as temp_name:
             suffix = "скидка 10" if discount else "базовые цены"
             merge_keys, availability = prices_db.selection_availability(selected)
-            sent = 0
-            for warehouse in ("center", "west", "ural"):
-                source = price_storage_path / f"{warehouse}.xlsx"
-                if not source.exists():
-                    continue
-                destination = Path(temp_name) / f"прайс {WAREHOUSES[warehouse]} подборка {suffix}.xlsx"
-                try:
-                    count = await asyncio.to_thread(
-                        generate_selected_price, source, destination, merge_keys, availability, discount
-                    )
-                except ValueError as error:
-                    if "отсутствуют" in str(error):
-                        continue
-                    raise
-                await callback.message.answer_document(
-                    FSInputFile(destination, filename=destination.name),
-                    caption=(f"📄 <b>{WAREHOUSES[warehouse]}</b> · выбранные товары\n\n"
-                             f"Товарных позиций: <b>{count}</b> · "
-                             f"{'скидка 10%' if discount else 'базовые цены'}"),
-                )
-                sent += 1
-            if not sent:
-                raise ValueError("Выбранные товары отсутствуют в действующих прайсах.")
+            source = price_storage_path / f"{PRICE_SOURCE}.xlsx"
+            if not source.exists():
+                raise ValueError("Общий прайс ещё не загружен.")
+            destination = Path(temp_name) / f"общий прайс подборка {suffix}.xlsx"
+            count = await asyncio.to_thread(
+                generate_selected_price, source, destination, merge_keys, availability, discount
+            )
+            await callback.message.answer_document(
+                FSInputFile(destination, filename=destination.name),
+                caption=("📄 <b>Подборка из общего прайса</b>\n\n"
+                         f"Товарных позиций: <b>{count}</b> · "
+                         f"{'скидка 10%' if discount else 'базовые цены'}"),
+            )
     except Exception:
         logging.exception("Не удалось сформировать прайс по подборке")
         await callback.message.answer("⚠️ Не удалось сформировать файл. Попробуйте ещё раз.")
@@ -3600,9 +3512,9 @@ def build_backup_archive(archive_path: Path) -> None:
             f"Записей территорий: {len(catalog.entries)}\n"
             "materials.sqlite3 — товары, разделы и материалы\n"
             "managers.xlsx — действующая таблица территорий\n"
-            "prices.sqlite3 — загруженные складские цены и товарные группы\n"
+            "prices.sqlite3 — загруженные цены и товарные группы\n"
             "crm.sqlite3 — задачи, список обзвона и журнал действий CRM\n"
-            "price_files/ — последние исходные прайсы складов\n",
+            "price_files/ — последний исходный общий прайс\n",
             encoding="utf-8",
         )
         with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -3614,7 +3526,7 @@ def build_backup_archive(archive_path: Path) -> None:
                 archive.write(crm_copy, crm_copy.name)
             storage = globals().get("price_storage_path")
             if storage and storage.exists():
-                for warehouse in WAREHOUSES:
+                for warehouse in (PRICE_SOURCE, "center", "west", "ural"):
                     source = storage / f"{warehouse}.xlsx"
                     if source.exists():
                         archive.write(source, f"price_files/{source.name}")
@@ -3639,7 +3551,7 @@ async def download_backup(callback: CallbackQuery) -> None:
                 FSInputFile(archive_path),
                 caption=(
                     "✅ <b>Резервная копия готова</b>\n\n"
-                    "В архиве находятся база материалов, таблица территорий и складские прайсы. "
+                    "В архиве находятся база материалов, таблица территорий и общий прайс. "
                     "Храните файл в надёжном месте."
                 ),
             )
@@ -3780,14 +3692,11 @@ async def cancel_excel(callback: CallbackQuery, state: FSMContext) -> None:
 
 def price_admin_keyboard() -> InlineKeyboardMarkup:
     statuses = prices_db.import_statuses()
-    buttons = []
-    for warehouse in ("center", "west", "ural"):
-        marker = "✅" if warehouse in statuses else "➕"
-        buttons.append(InlineKeyboardButton(
-                text=f"{marker} {WAREHOUSES[warehouse]}",
-                callback_data=f"adm:price_wh:{warehouse}",
-            ))
-    rows = button_grid(buttons)
+    marker = "✅" if PRICE_SOURCE in statuses else "➕"
+    rows = [[InlineKeyboardButton(
+        text=f"{marker} Загрузить общий прайс",
+        callback_data=f"adm:price_wh:{PRICE_SOURCE}",
+    )]]
     rows.append(compact_nav("main:admin"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -3795,22 +3704,16 @@ def price_admin_keyboard() -> InlineKeyboardMarkup:
 def price_status_text() -> str:
     statuses = prices_db.import_statuses()
     lines = [
-        "💰 <b>Управление прайсами</b>",
+        "💰 <b>Управление общим прайсом</b>",
         "",
-        "Выберите склад, для которого хотите загрузить свежий прайс.",
-        "Данные остальных складов не изменятся.",
-        "",
+        "Загрузите один актуальный файл с наименованием и базовыми ценами нал/безнал.", "",
     ]
-    for warehouse in ("center", "west", "ural"):
-        status = statuses.get(warehouse)
-        if status:
-            date = (status["price_date"] or status["updated_at"] or "").split("T", 1)[0]
-            lines.append(
-                f"✅ <b>{WAREHOUSES[warehouse]}</b> — {status['item_count']} позиций, "
-                f"прайс от {html.escape(date)}"
-            )
-        else:
-            lines.append(f"➕ <b>{WAREHOUSES[warehouse]}</b> — прайс не загружен")
+    status = statuses.get(PRICE_SOURCE)
+    if status:
+        date = (status["price_date"] or status["updated_at"] or "").split("T", 1)[0]
+        lines.append(f"✅ Загружено <b>{status['item_count']}</b> позиций · прайс от {html.escape(date)}")
+    else:
+        lines.append("➕ Общий прайс ещё не загружен")
     return "\n".join(lines)
 
 
@@ -3829,15 +3732,14 @@ async def start_price_upload(callback: CallbackQuery, state: FSMContext) -> None
     if not await require_admin(callback):
         return
     warehouse = callback.data.rsplit(":", 1)[1]
-    if warehouse not in WAREHOUSES:
-        await callback.answer("Неизвестный склад.", show_alert=True)
+    if warehouse != PRICE_SOURCE:
+        await callback.answer("Неизвестный источник прайса.", show_alert=True)
         return
     await cleanup_pending_excel(state)
     await state.set_state(AdminState.price_upload)
     await state.update_data(price_warehouse=warehouse)
     await callback.message.edit_text(
-        f"💰 <b>Обновление прайса</b>\n"
-        f"Склад: <b>{WAREHOUSES[warehouse]}</b>\n\n"
+        "💰 <b>Обновление общего прайса</b>\n\n"
         "Отправьте свежий прайс в формате <code>.xlsx</code>. Бот проверит структуру, "
         "товарные группы и цены, после чего покажет сводку перед применением.",
         reply_markup=InlineKeyboardMarkup(
@@ -3855,7 +3757,7 @@ async def receive_price_file(message: Message, state: FSMContext, bot: Bot) -> N
     warehouse = data.get("price_warehouse")
     if warehouse not in WAREHOUSES:
         await state.clear()
-        await message.answer("Склад не выбран. Начните загрузку заново.")
+        await message.answer("Загрузка не была начата. Откройте раздел прайсов заново.")
         return
     if not message.document or not (message.document.file_name or "").lower().endswith(".xlsx"):
         await message.answer("⚠️ Отправьте прайс как документ в формате <code>.xlsx</code>.")
@@ -3869,7 +3771,7 @@ async def receive_price_file(message: Message, state: FSMContext, bot: Bot) -> N
         parsed = await asyncio.to_thread(parse_price_file, pending_path)
     except Exception as error:
         pending_path.unlink(missing_ok=True)
-        logging.warning("Отклонён прайс склада %s: %s", warehouse, error)
+        logging.warning("Отклонён общий прайс: %s", error)
         await message.answer(
             "❌ <b>Прайс не прошёл проверку</b>\n\n"
             f"Причина: {html.escape(str(error))}\n\n"
@@ -3885,12 +3787,11 @@ async def receive_price_file(message: Message, state: FSMContext, bot: Bot) -> N
     price_date = parsed.price_date.split("T", 1)[0] if parsed.price_date else "не указана"
     await message.answer(
         "✅ <b>Прайс успешно проверен</b>\n\n"
-        f"Склад: <b>{WAREHOUSES[warehouse]}</b>\n"
         f"Дата прайса: <b>{html.escape(price_date)}</b>\n"
         f"Товарных групп: <b>{len(parsed.groups)}</b>\n"
         f"Товарных позиций: <b>{parsed.item_count}</b>\n"
         f"Позиций с пометкой «АКЦИЯ»: <b>{parsed.action_count}</b>\n\n"
-        "Применить этот прайс? Предыдущая версия выбранного склада будет сохранена.",
+        "Применить этот прайс? Предыдущая версия будет сохранена.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(text="✅ Применить", callback_data="adm:apply_price"),
@@ -3928,7 +3829,7 @@ async def apply_price(callback: CallbackQuery, state: FSMContext, bot: Bot) -> N
         await callback.answer("Файл проверки не найден. Загрузите прайс ещё раз.", show_alert=True)
         return
     if warehouse in price_updates_in_progress:
-        await callback.answer("Прайс этого склада уже обрабатывается. Дождитесь завершения.", show_alert=True)
+        await callback.answer("Прайс уже обрабатывается. Дождитесь завершения.", show_alert=True)
         return
     price_updates_in_progress.add(warehouse)
     await callback.answer()
@@ -3936,15 +3837,14 @@ async def apply_price(callback: CallbackQuery, state: FSMContext, bot: Bot) -> N
         await edit_or_answer(
             callback.message,
             "⏳ <b>Применяю прайс</b>\n\n"
-            f"Склад: <b>{WAREHOUSES[warehouse]}</b>\n\n"
-            "Проверяю изменения цен и наличия, сохраняю предыдущую версию и формирую отчёт. "
+            "Проверяю изменения цен и ассортимента, сохраняю предыдущую версию и формирую отчёт. "
             "Это может занять некоторое время — повторно нажимать ничего не нужно."
         )
         group_count, item_count, _, report = await asyncio.to_thread(
             apply_pending_price, pending_path, warehouse, data.get("price_file_name", pending_path.name)
         )
     except Exception:
-        logging.exception("Не удалось применить прайс склада %s", warehouse)
+        logging.exception("Не удалось применить общий прайс")
         await edit_or_answer(
             callback.message,
             "❌ Не удалось применить прайс. Предыдущие данные сохранены.",
@@ -3980,10 +3880,9 @@ async def apply_price(callback: CallbackQuery, state: FSMContext, bot: Bot) -> N
         await edit_or_answer(
             callback.message,
             "✅ <b>Прайс обновлён</b>\n\n"
-            f"Склад: <b>{WAREHOUSES[warehouse]}</b>\n"
             f"Товарных групп: <b>{group_count}</b>\n"
             f"Товарных позиций: <b>{item_count}</b>\n\n"
-            "Это первая загрузка склада, поэтому сравнение появится при следующем обновлении.",
+            "Это первая загрузка общего прайса, поэтому сравнение появится при следующем обновлении.",
             reply_markup=price_admin_keyboard(),
         )
 
@@ -4753,6 +4652,8 @@ async def main() -> None:
     active_excel_path = managed_excel_path if managed_excel_path.exists() else excel_path
     catalog = Catalog(active_excel_path)
     materials_db = MaterialsDB(db_path)
+    if materials_db.get_setting(PRICE_MESSAGE_SETTING) == LEGACY_DEFAULT_PRICE_COMMAND_MESSAGE:
+        materials_db.set_setting(PRICE_MESSAGE_SETTING, DEFAULT_PRICE_COMMAND_MESSAGE)
     for registered_chat in materials_db.list_client_chats():
         cleaned_title = clean_client_title(registered_chat.title)
         if cleaned_title != registered_chat.title:

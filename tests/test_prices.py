@@ -64,30 +64,43 @@ def test_price_parser_uses_group_rows_and_ignores_actions(tmp_path):
     assert parsed.action_count == 1
 
 
-def test_warehouse_replacement_search_and_aggregation(tmp_path):
-    center = tmp_path / "center.xlsx"
-    west = tmp_path / "west.xlsx"
-    make_price(center, include_action=False)
-    make_price(west, suffix=" West", include_action=False)
+def test_simplified_three_column_common_price(tmp_path):
+    path = tmp_path / "common.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Наименование", "Цена нал", "Цена безнал"])
+    sheet.append(["ЭС/3.Жидкости/Производитель OGGO/OGGO VLIQ"])
+    sheet.append(["OGGO VLIQ Манго", 235, 259])
+    sheet.append(["OGGO VLIQ Арбуз", 235, 259])
+    workbook.save(path)
+
+    parsed = parse_price_file(path)
+    assert parsed.item_count == 2
+    assert parsed.groups[0].display_name == "OGGO VLIQ"
+    assert parsed.groups[0].items[0].cash == Decimal("235")
+
+
+def test_common_price_replacement_search_and_aggregation(tmp_path):
+    common = tmp_path / "common.xlsx"
+    make_price(common, include_action=False)
     db = PricesDB(tmp_path / "prices.sqlite3")
-    db.replace_warehouse("center", parse_price_file(center), center.name)
-    db.replace_warehouse("west", parse_price_file(west), west.name)
+    db.replace_warehouse("common", parse_price_file(common), common.name)
 
     results = db.search_groups("ogo vlq balance")
     assert len(results) == 1
-    assert results[0].warehouse_counts == {"center": 2, "west": 2}
+    assert results[0].warehouse_counts == {"common": 2}
     details = db.group_details(results[0].callback_id)
     assert len(details.tiers) == 2
     assert details.unique_variants == 2
     selected_keys, availability = db.selection_availability([results[0].callback_id])
     assert selected_keys == [results[0].merge_key]
-    assert availability["001"] == {"center", "west"}
+    assert availability["001"] == {"common"}
 
     replacement = tmp_path / "replacement.xlsx"
     make_price(replacement, suffix=" New", include_action=False)
-    db.replace_warehouse("center", parse_price_file(replacement), replacement.name)
+    db.replace_warehouse("common", parse_price_file(replacement), replacement.name)
     result = db.search_groups("VLIQ BALANCE")[0]
-    assert result.warehouse_counts == {"west": 2, "center": 2}
+    assert result.warehouse_counts == {"common": 2}
 
     liquid_results = db.search_groups("жидкость OGGO")
     assert liquid_results
@@ -163,19 +176,13 @@ def test_specific_position_search_uses_name_not_product_code(tmp_path):
             ParsedItem("027180", "Картридж Vaporesso XROS (3мл) - 0.6 ohm", Decimal("556"), Decimal("570")),
         ),
     )
-    db.replace_warehouse("center", ParsedPrice("Прайс", None, (group,), 0), "center.xlsx")
-    west_group = ParsedGroup(
-        group.merge_key, group.display_name, group.full_path, group.category_key, group.category_name,
-        (ParsedItem("027881", group.items[0].name, Decimal("532"), Decimal("549")),),
-    )
-    db.replace_warehouse("west", ParsedPrice("Прайс", None, (west_group,), 0), "west.xlsx")
+    db.replace_warehouse("common", ParsedPrice("Прайс", None, (group,), 0), "common.xlsx")
 
     results = db.search_items("vaporesso xros 0.6 2мл")
     assert len(results) == 1
     assert "(2мл)" in results[0].name
     assert results[0].warehouse_prices == {
-        "center": (Decimal("532"), Decimal("549")),
-        "west": (Decimal("532"), Decimal("549")),
+        "common": (Decimal("532"), Decimal("549")),
     }
     assert db.search_items("027881") == []
     group_results = db.search_groups("картриджи xros")
@@ -183,13 +190,12 @@ def test_specific_position_search_uses_name_not_product_code(tmp_path):
     assert group_results[0].display_name == "Vaporesso Расходники"
 
     card = format_price_item(results[0])
-    assert "Москва · Санкт-Петербург" in card
     assert "−15%" in card
     assert "027881" not in card
 
     _, variants = db.group_variants(db.search_groups("vaporesso")[0].callback_id)
     two_ml = next(item for item in variants if "2мл" in item.name)
-    assert two_ml.warehouse_prices["center"] == (Decimal("532"), Decimal("549"))
+    assert two_ml.warehouse_prices["common"] == (Decimal("532"), Decimal("549"))
 
 
 def test_waitlist_matching_requires_exact_numeric_characteristics():
@@ -205,7 +211,7 @@ def test_waitlist_matching_requires_exact_numeric_characteristics():
     assert wait_match_score("жидкости OGGO", "Жидкости OGGO VLIQ", "OGGO VLIQ Манго") > 0.8
 
 
-def test_group_wait_notifies_after_each_warehouse_without_same_warehouse_duplicates(tmp_path):
+def test_group_wait_notifies_once_for_common_price(tmp_path):
     database = MaterialsDB(tmp_path / "materials.sqlite3")
     database.add_wait_entry(-100123, "Клиент", 101, "Андрей", "жидкости OGGO", 55, "Нужна коробка")
     previous = getattr(bot_module, "materials_db", None)
@@ -222,14 +228,12 @@ def test_group_wait_notifies_after_each_warehouse_without_same_warehouse_duplica
         "name": name, "group": "OGGO VLIQ", "category": "Жидкости",
         "cash": "235", "cashless": "259",
     }
-    center_report = {"center": {"added": [item("OGGO VLIQ Манго"), item("OGGO VLIQ Арбуз")]}}
-    west_report = {"west": {"added": [item("OGGO VLIQ Манго")]}}
+    common_report = {"common": {"added": [item("OGGO VLIQ Манго"), item("OGGO VLIQ Арбуз")]}}
     fake = FakeBot()
     try:
-        assert asyncio.run(bot_module.notify_waitlist_matches(fake, center_report)) == 1
+        assert asyncio.run(bot_module.notify_waitlist_matches(fake, common_report)) == 1
         assert len(fake.messages) == 1
         assert "Подходящих новых позиций: <b>2</b>" in fake.messages[0][1]
-        assert "• Москва: <b>2</b>" in fake.messages[0][1]
         assert "Нужна коробка" in fake.messages[0][1]
         stored = database.list_wait_entries(manager_id=101)[0]
         assert stored.last_match["count"] == 2
@@ -238,10 +242,8 @@ def test_group_wait_notifies_after_each_warehouse_without_same_warehouse_duplica
         assert "разные линейки и вкусы" in client_text
         assert "товар ещё нужен" in client_text
         assert "позиций" not in client_text
-        assert asyncio.run(bot_module.notify_waitlist_matches(fake, center_report)) == 0
-        assert asyncio.run(bot_module.notify_waitlist_matches(fake, west_report)) == 1
-        assert len(fake.messages) == 2
-        assert "• Санкт-Петербург: <b>1</b>" in fake.messages[1][1]
+        assert asyncio.run(bot_module.notify_waitlist_matches(fake, common_report)) == 0
+        assert len(fake.messages) == 1
     finally:
         if previous is None:
             del bot_module.materials_db
@@ -269,10 +271,10 @@ def test_client_wait_message_adapts_to_product_category(tmp_path):
 
 
 def test_selected_price_contains_only_chosen_groups_and_discount(tmp_path):
-    source = tmp_path / "center.xlsx"
+    source = tmp_path / "common.xlsx"
     make_price(source)
     db = PricesDB(tmp_path / "prices.sqlite3")
-    db.replace_warehouse("center", parse_price_file(source), source.name)
+    db.replace_warehouse("common", parse_price_file(source), source.name)
     selected = db.search_groups("VLIQ OGGO BALANCE 20")[0]
     destination = tmp_path / "selection.xlsx"
 
@@ -289,11 +291,7 @@ def test_selected_price_contains_only_chosen_groups_and_discount(tmp_path):
     mango_row = values.index("VLIQ OGGO BALANCE Манго") + 1
     assert sheet.cell(mango_row, 4).value == 211.5
     assert sheet.cell(mango_row, 5).value == 233.1
-    assert [sheet.cell(8, column).value for column in (9, 10, 11)] == [
-        "Москва", "Санкт-Петербург", "Челябинск"
-    ]
-    assert sheet.cell(mango_row, 9).value == "✅"
-    assert sheet.cell(mango_row, 10).value == "❌"
+    assert sheet.cell(8, 9).value is None
     assert sheet.freeze_panes == "A9"
     assert "A2:E2" in {str(value) for value in sheet.merged_cells.ranges}
     cherry_row = values.index("VLIQ OGGO BALANCE Вишня") + 1
@@ -308,7 +306,7 @@ def test_latest_price_change_report_replaces_previous_report(tmp_path):
     make_price(source, include_action=False)
     db = PricesDB(tmp_path / "prices.sqlite3")
     old = parse_price_file(source)
-    db.replace_warehouse("center", old, source.name)
+    db.replace_warehouse("common", old, source.name)
     original_group = old.groups[0]
     new = ParsedPrice(
         "Sheet", "2026-07-22", (
@@ -323,25 +321,21 @@ def test_latest_price_change_report_replaces_previous_report(tmp_path):
         ), 0,
     )
 
-    report = db.build_change_report("center", new, "new.xlsx")
+    report = db.build_change_report("common", new, "new.xlsx")
     assert report is not None
     formatted = format_price_report(report)
     assert isinstance(formatted, str)
-    assert "Изменения прайса" in formatted
+    assert "Изменения общего прайса" in formatted
     assert "Появилось: <b>1</b>" in formatted
-    combined = {
-        warehouse: {**report, "warehouse": warehouse}
-        for warehouse in ("center", "west", "ural")
-    }
+    combined = {"common": report}
     notification = format_combined_report_notification(combined)
-    assert "Прайсы обновлены" in notification
-    assert "Итого по трём складам" in notification
-    assert "Появилось: <b>3</b>" in notification
+    assert "Общий прайс обновлён" in notification
+    assert "Появилось: <b>1</b>" in notification
     assert [item["code"] for item in report["added"]] == ["004"]
     assert [item["code"] for item in report["removed"]] == ["003"]
     assert [item["code"] for item in report["price_changes"]] == ["001"]
     db.save_latest_report(report)
-    assert db.latest_report("center")["current_file"] == "new.xlsx"
+    assert db.latest_report("common")["current_file"] == "new.xlsx"
     assert db.report_broadcast_sent("daily-signature") is False
     db.mark_report_broadcast_sent("daily-signature")
     assert db.report_broadcast_sent("daily-signature") is True
@@ -383,7 +377,7 @@ def test_sp_positions_are_separate_and_allow_missing_cash_price(tmp_path):
     assert sp_group.items[0].cashless == Decimal("1090")
 
     db = PricesDB(tmp_path / "prices.sqlite3")
-    db.replace_warehouse("center", parsed, source.name)
+    db.replace_warehouse("common", parsed, source.name)
     results = db.search_groups("Dojo Opal 12000")
     assert {group.display_name for group in results} == {
         "Vaporesso Dojo Opal 12000",
