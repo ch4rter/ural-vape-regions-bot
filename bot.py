@@ -18,7 +18,7 @@ from pathlib import Path
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -4694,7 +4694,20 @@ async def main() -> None:
     router.callback_query.outer_middleware(AccessMiddleware())
     dispatcher.include_router(crm_router)
     dispatcher.include_router(router)
-    await bot.delete_webhook(drop_pending_updates=False)
+    retry_delay = 2
+    while True:
+        try:
+            await bot.delete_webhook(drop_pending_updates=False)
+            break
+        except (TelegramNetworkError, TelegramServerError) as error:
+            logging.warning(
+                "Telegram API временно недоступен при подготовке polling: %s. "
+                "Повтор через %s сек.",
+                error,
+                retry_delay,
+            )
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 30)
     await dispatcher.start_polling(bot)
 
 
