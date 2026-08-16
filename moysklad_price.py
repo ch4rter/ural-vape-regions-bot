@@ -192,12 +192,20 @@ def _price_type_names(
         if price.get("priceType", {}).get("name")
     }
 
-    def resolve(configured: str, marker: str, exclude: str = "") -> str:
+    def resolve(
+        configured: str,
+        marker: str,
+        exclude: str = "",
+        preferred: str = "",
+    ) -> str:
         if configured:
             exact = [name for name in names if name.casefold() == configured.casefold()]
             if not exact:
                 raise MoySkladError(f"Тип цены «{configured}» не найден в МоемСкладе.")
             return exact[0]
+        preferred_match = [name for name in names if name.casefold() == preferred.casefold()]
+        if preferred and preferred_match:
+            return preferred_match[0]
         matches = [
             name for name in names
             if marker in name.casefold() and (not exclude or exclude not in name.casefold())
@@ -210,8 +218,12 @@ def _price_type_names(
             )
         return matches[0]
 
-    cashless = resolve(cashless_name.strip(), "безнал")
-    cash = resolve(cash_name.strip(), "нал", "безнал")
+    cashless = resolve(
+        cashless_name.strip(), "безнал", preferred="от 50т.р. безнал"
+    )
+    cash = resolve(
+        cash_name.strip(), "нал", "безнал", preferred="от 50т.р. нал"
+    )
     return cash, cashless
 
 

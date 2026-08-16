@@ -33,6 +33,8 @@ class FakeMoySkladClient:
 
     def assortment(self):
         prices = [
+            {"priceType": {"name": "Дистр нал"}, "value": 10000},
+            {"priceType": {"name": "Дистр безнал"}, "value": 11000},
             {"priceType": {"name": "от 50т.р. нал"}, "value": 12345},
             {"priceType": {"name": "от 50т.р. безнал"}, "value": 13579},
         ]
