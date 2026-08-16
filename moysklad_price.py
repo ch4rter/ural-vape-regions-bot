@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import gzip
 import ssl
-from copy import copy
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
@@ -15,10 +14,8 @@ from urllib.parse import urlencode, urlparse
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from openpyxl import Workbook, load_workbook
-from openpyxl.formula.translate import Translator
+from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.utils import get_column_letter
 
 
 API_ROOT = "https://api.moysklad.ru/api/remap/1.2"
@@ -39,83 +36,6 @@ class MoySkladPriceResult:
     store_names: tuple[str, ...]
     cash_price_type: str
     cashless_price_type: str
-
-
-def _header_text(value: object) -> str:
-    return " ".join(
-        str(value or "").casefold().replace("ё", "е").replace(".", " ").split()
-    )
-
-
-def _template_layout(sheet) -> dict:
-    for row in range(1, min(sheet.max_row, 40) + 1):
-        headers = [_header_text(sheet.cell(row, column).value) for column in range(1, sheet.max_column + 1)]
-        name_column = next((i for i, value in enumerate(headers, 1) if value == "наименование"), None)
-        cashless_column = next((i for i, value in enumerate(headers, 1) if "безнал" in value), None)
-        cash_column = next(
-            (i for i, value in enumerate(headers, 1) if "нал" in value and "безнал" not in value),
-            None,
-        )
-        if name_column and cash_column and cashless_column:
-            header_row = row
-            code_column = next((i for i, value in enumerate(headers, 1) if value == "код"), 1)
-            unit_column = next((i for i, value in enumerate(headers, 1) if value in {"ед изм", "единица измерения"}), None)
-            break
-    else:
-        raise MoySkladError(
-            "В шаблоне не найдены колонки «Наименование», «нал» и «безнал»."
-        )
-
-    group_row = None
-    action_row = None
-    product_row = None
-    for row in range(header_row + 1, sheet.max_row + 1):
-        code = str(sheet.cell(row, code_column).value or "").strip()
-        name = str(sheet.cell(row, name_column).value or "").strip()
-        cash = sheet.cell(row, cash_column).value
-        cashless = sheet.cell(row, cashless_column).value
-        if group_row is None and "/" in code and not name and cash is None and cashless is None:
-            group_row = row
-        if name and cash is not None and cashless is not None:
-            if name.casefold().startswith("акция ") and action_row is None:
-                action_row = row
-            elif product_row is None:
-                product_row = row
-        if group_row and product_row and action_row:
-            break
-    product_row = product_row or action_row
-    action_row = action_row or product_row
-    if not group_row or not product_row:
-        raise MoySkladError(
-            "В шаблоне не найдены образцы строки товарной группы и товарной позиции."
-        )
-    return {
-        "header_row": header_row,
-        "code_column": code_column,
-        "name_column": name_column,
-        "unit_column": unit_column,
-        "cash_column": cash_column,
-        "cashless_column": cashless_column,
-        "group_row": group_row,
-        "product_row": product_row,
-        "action_row": action_row,
-    }
-
-
-def validate_price_template(path: Path) -> dict:
-    try:
-        workbook = load_workbook(path, data_only=False)
-    except Exception as error:
-        raise MoySkladError(f"Не удалось открыть Excel-шаблон: {error}") from error
-    try:
-        layout = _template_layout(workbook.active)
-        return {
-            "sheet_name": workbook.active.title,
-            "header_row": layout["header_row"],
-            "columns": workbook.active.max_column,
-        }
-    finally:
-        workbook.close()
 
 
 def _canonical_href(value: str) -> str:
@@ -331,103 +251,6 @@ def _available_stock(rows: list[dict], store_ids: tuple[str, ...]) -> dict[str, 
     return {key: values for key, values in result.items() if sum(values) > 0}
 
 
-def _row_blueprint(sheet, source_row: int) -> dict:
-    merges = [
-        (merged.min_col, merged.max_col)
-        for merged in sheet.merged_cells.ranges
-        if merged.min_row == source_row and merged.max_row == source_row
-    ]
-    return {
-        "source_row": source_row,
-        "height": sheet.row_dimensions[source_row].height,
-        "cells": [
-            (cell.value, copy(cell._style), cell.number_format)
-            for cell in sheet[source_row]
-        ],
-        "merges": merges,
-    }
-
-
-def _apply_blueprint(sheet, target_row: int, blueprint: dict, *, formulas: bool) -> None:
-    source_row = blueprint["source_row"]
-    sheet.row_dimensions[target_row].height = blueprint["height"]
-    for column, (value, style, number_format) in enumerate(blueprint["cells"], 1):
-        cell = sheet.cell(target_row, column)
-        cell._style = copy(style)
-        cell.number_format = number_format
-        if formulas and isinstance(value, str) and value.startswith("="):
-            try:
-                value = Translator(
-                    value, origin=f"{get_column_letter(column)}{source_row}"
-                ).translate_formula(f"{get_column_letter(column)}{target_row}")
-            except Exception:
-                pass
-            cell.value = value
-        else:
-            cell.value = None
-    for start_column, end_column in blueprint["merges"]:
-        sheet.merge_cells(
-            start_row=target_row,
-            start_column=start_column,
-            end_row=target_row,
-            end_column=end_column,
-        )
-
-
-def _write_template_price(
-    template_path: Path,
-    destination: Path,
-    groups: dict[str, list[tuple[str, str, Decimal, Decimal, tuple[Decimal, ...]]]],
-) -> None:
-    workbook = load_workbook(template_path, data_only=False)
-    sheet = workbook.active
-    layout = _template_layout(sheet)
-    header_row = layout["header_row"]
-    original_max_row = sheet.max_row
-    original_max_column = sheet.max_column
-    group_blueprint = _row_blueprint(sheet, layout["group_row"])
-    product_blueprint = _row_blueprint(sheet, layout["product_row"])
-    action_blueprint = _row_blueprint(sheet, layout["action_row"])
-
-    for merged in list(sheet.merged_cells.ranges):
-        if merged.max_row > header_row:
-            sheet.unmerge_cells(str(merged))
-    if original_max_row > header_row:
-        sheet.delete_rows(header_row + 1, original_max_row - header_row)
-
-    target_row = header_row + 1
-    for group_path in sorted(groups, key=str.casefold):
-        _apply_blueprint(sheet, target_row, group_blueprint, formulas=False)
-        sheet.cell(target_row, layout["code_column"]).value = group_path
-        target_row += 1
-        for code, name, cash, cashless, _ in sorted(
-            groups[group_path], key=lambda item: item[1].casefold()
-        ):
-            blueprint = (
-                action_blueprint
-                if name.casefold().startswith("акция ")
-                else product_blueprint
-            )
-            _apply_blueprint(sheet, target_row, blueprint, formulas=True)
-            sheet.cell(target_row, layout["code_column"]).value = code
-            sheet.cell(target_row, layout["name_column"]).value = name
-            if layout["unit_column"]:
-                sheet.cell(target_row, layout["unit_column"]).value = "шт"
-            sheet.cell(target_row, layout["cash_column"]).value = float(cash)
-            sheet.cell(target_row, layout["cashless_column"]).value = float(cashless)
-            target_row += 1
-
-    for row in range(1, min(header_row, 40) + 1):
-        for column in range(1, original_max_column + 1):
-            if "актуален" in _header_text(sheet.cell(row, column).value):
-                sheet.cell(row, min(column + 1, original_max_column)).value = date.today()
-                break
-
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    workbook.save(destination)
-    workbook.close()
-
-
 def build_price_from_moysklad(
     token: str,
     destination: Path,
@@ -435,7 +258,6 @@ def build_price_from_moysklad(
     store_names: tuple[str, ...] = DEFAULT_STORES,
     cash_price_type: str = "",
     cashless_price_type: str = "",
-    template_path: Path | None = None,
     client: MoySkladClient | None = None,
 ) -> MoySkladPriceResult:
     client = client or MoySkladClient(token)
@@ -478,19 +300,6 @@ def build_price_from_moysklad(
     if not groups:
         raise MoySkladError(
             "Не найдено доступных позиций с обеими ценами на выбранных складах."
-        )
-
-    if template_path is not None:
-        if not template_path.is_file():
-            raise MoySkladError("Шаблон прайса не загружен.")
-        _write_template_price(template_path, destination, groups)
-        return MoySkladPriceResult(
-            destination,
-            sum(len(items) for items in groups.values()),
-            len(groups),
-            store_names,
-            cash_name,
-            cashless_name,
         )
 
     workbook = Workbook()
