@@ -39,7 +39,11 @@ from crm_bot import configure_crm, router as crm_router
 from crm_db import CRMDatabase
 from google_crm import GoogleCRM
 from materials_db import Material, MaterialsDB
-from moysklad_price import MoySkladError, build_price_from_moysklad
+from moysklad_price import (
+    MoySkladError,
+    build_price_from_moysklad,
+    build_product_folder_mapping,
+)
 from prices_db import (
     PRICE_SOURCE,
     WAREHOUSES,
@@ -3702,6 +3706,10 @@ def price_admin_keyboard() -> InlineKeyboardMarkup:
         text="🔄 Сформировать из МоегоСклада",
         callback_data="adm:moysklad_price",
     )])
+    rows.append([InlineKeyboardButton(
+        text="📂 Папки для классификации",
+        callback_data="adm:moysklad_folders",
+    )])
     rows.append(compact_nav("main:admin"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -3750,6 +3758,49 @@ def moysklad_settings() -> tuple[str, tuple[str, ...], str, str]:
     )
 
 
+@router.callback_query(F.data == "adm:moysklad_folders")
+async def export_moysklad_folders(callback: CallbackQuery) -> None:
+    if not await require_admin(callback):
+        return
+    token, _, _, _ = moysklad_settings()
+    if not token:
+        await callback.answer("Сначала добавьте MOYSKLAD_TOKEN в .env.", show_alert=True)
+        return
+    await callback.answer("Получаю папки из МоегоСклада…")
+    await edit_or_answer(
+        callback.message,
+        "⏳ <b>Формирую таблицу классификации</b>\n\n"
+        "Читаю актуальное дерево папок товаров из МоегоСклада. Данные учётной записи не изменяются.",
+    )
+    with tempfile.TemporaryDirectory() as temporary:
+        destination = Path(temporary) / "Классификация товарных папок.xlsx"
+        try:
+            count = await asyncio.to_thread(
+                build_product_folder_mapping, token, destination
+            )
+            await callback.message.answer_document(
+                FSInputFile(destination, filename=destination.name),
+                caption=(
+                    "📂 <b>Папки товаров из МоегоСклада</b>\n\n"
+                    f"Активных папок: <b>{count}</b>. Заполните колонку «Категория». "
+                    "Для родительской папки укажите, распространяется ли правило на вложенные."
+                ),
+            )
+        except Exception as error:
+            logging.exception("Не удалось выгрузить папки товаров из МоегоСклада")
+            await edit_or_answer(
+                callback.message,
+                "❌ <b>Не удалось выгрузить папки</b>\n\n"
+                f"{html.escape(str(error))}",
+                reply_markup=price_admin_keyboard(),
+            )
+            return
+    await edit_or_answer(
+        callback.message,
+        "✅ <b>Таблица классификации готова</b>\n\n"
+        "Заполните её и передайте мне для настройки отчёта по менеджерам.",
+        reply_markup=price_admin_keyboard(),
+    )
 @router.callback_query(F.data == "adm:moysklad_price")
 async def generate_moysklad_price(callback: CallbackQuery, state: FSMContext) -> None:
     if not await require_admin(callback):

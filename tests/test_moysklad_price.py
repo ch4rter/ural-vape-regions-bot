@@ -4,7 +4,13 @@ from decimal import Decimal
 
 from openpyxl import load_workbook
 
-from moysklad_price import MoySkladClient, MoySkladError, build_price_from_moysklad
+from moysklad_price import (
+    BONUS_CATEGORIES,
+    MoySkladClient,
+    MoySkladError,
+    build_price_from_moysklad,
+    build_product_folder_mapping,
+)
 from prices_db import parse_price_file
 
 
@@ -143,3 +149,30 @@ def test_fails_if_required_store_is_missing(tmp_path):
         assert "Не найдены склады" in str(error)
     else:
         raise AssertionError("Missing stores must stop price generation")
+
+
+def test_builds_product_folder_mapping_from_moysklad(tmp_path):
+    class FakeFolderClient:
+        def product_folders(self):
+            return [
+                {"id": "root", "name": "ЭС", "pathName": ""},
+                {"id": "liquids", "name": "Жидкости", "pathName": "ЭС"},
+                {"id": "old", "name": "Архив", "pathName": "", "archived": True},
+            ]
+
+    destination = tmp_path / "folders.xlsx"
+    count = build_product_folder_mapping(
+        "test-token", destination, client=FakeFolderClient()
+    )
+
+    assert count == 2
+    workbook = load_workbook(destination)
+    sheet = workbook["Классификация папок"]
+    values = list(sheet.iter_rows(min_row=2, values_only=True))
+    assert ("ЭС", None, "Да", None, "root") in values
+    assert ("ЭС/Жидкости", None, "Да", None, "liquids") in values
+    assert sheet.freeze_panes == "A2"
+    assert len(sheet.data_validations.dataValidation) == 2
+    guide_values = [cell.value for cell in workbook["Справочник"]["A"]][1:]
+    assert guide_values == list(BONUS_CATEGORIES)
+    workbook.close()

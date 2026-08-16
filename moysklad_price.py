@@ -15,11 +15,20 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from openpyxl import Workbook
+from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.styles import Alignment, Font, PatternFill
 
 
 API_ROOT = "https://api.moysklad.ru/api/remap/1.2"
 DEFAULT_STORES = ("Мордор", "Годзибасы", "Жможики")
+BONUS_CATEGORIES = (
+    "Космо Аромы/жижи",
+    "Эльфлик + LM Аромы/жижи",
+    "Разки",
+    "OGGO Аромы/жижи",
+    "Железо",
+    "Не учитывать",
+)
 
 
 class MoySkladError(RuntimeError):
@@ -161,6 +170,85 @@ class MoySkladClient:
 
     def assortment(self) -> list[dict]:
         return self._rows("entity/assortment")
+
+    def product_folders(self) -> list[dict]:
+        return self._rows("entity/productfolder")
+
+
+def build_product_folder_mapping(
+    token: str,
+    destination: Path,
+    *,
+    client: MoySkladClient | None = None,
+) -> int:
+    """Export the MoySklad folder tree for manual bonus-category mapping."""
+    client = client or MoySkladClient(token)
+    folders = client.product_folders()
+    rows = []
+    for folder in folders:
+        if folder.get("archived") is True:
+            continue
+        name = str(folder.get("name", "")).strip()
+        parent_path = str(folder.get("pathName", "")).strip(" /\t")
+        if not name:
+            continue
+        full_path = f"{parent_path}/{name}" if parent_path else name
+        rows.append((full_path, str(folder.get("id", "")).strip()))
+    rows = sorted(set(rows), key=lambda row: row[0].casefold())
+    if not rows:
+        raise MoySkladError("В МоемСкладе не найдены активные папки товаров.")
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Классификация папок"
+    headers = [
+        "Полный путь папки",
+        "Категория",
+        "Включать вложенные папки",
+        "Комментарий",
+        "ID папки МоегоСклада",
+    ]
+    sheet.append(headers)
+    for cell in sheet[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="2F5597")
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    for full_path, folder_id in rows:
+        sheet.append([full_path, "", "Да", "", folder_id])
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = f"A1:E{sheet.max_row}"
+    sheet.column_dimensions["A"].width = 85
+    sheet.column_dimensions["B"].width = 32
+    sheet.column_dimensions["C"].width = 28
+    sheet.column_dimensions["D"].width = 45
+    sheet.column_dimensions["E"].width = 40
+
+    guide = workbook.create_sheet("Справочник")
+    guide.append(["Допустимые категории"])
+    guide["A1"].font = Font(bold=True, color="FFFFFF")
+    guide["A1"].fill = PatternFill("solid", fgColor="2F5597")
+    for category in BONUS_CATEGORIES:
+        guide.append([category])
+    guide.column_dimensions["A"].width = 35
+    validation = DataValidation(
+        type="list",
+        formula1=f"'Справочник'!$A$2:$A${len(BONUS_CATEGORIES) + 1}",
+        allow_blank=True,
+    )
+    validation.error = "Выберите категорию из списка."
+    validation.errorTitle = "Неизвестная категория"
+    validation.prompt = "Выберите премиальную категорию или «Не учитывать»."
+    validation.promptTitle = "Категория"
+    sheet.add_data_validation(validation)
+    validation.add(f"B2:B{sheet.max_row}")
+    yes_no = DataValidation(type="list", formula1='"Да,Нет"', allow_blank=False)
+    sheet.add_data_validation(yes_no)
+    yes_no.add(f"C2:C{sheet.max_row}")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    workbook.save(destination)
+    workbook.close()
+    return len(rows)
 
 
 def _select_stores(rows: list[dict], wanted: tuple[str, ...]) -> tuple[dict, ...]:
