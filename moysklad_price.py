@@ -11,6 +11,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urlencode, urlparse
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from openpyxl import Workbook
@@ -22,7 +23,9 @@ DEFAULT_STORES = ("Мордор", "Годзибасы", "Жможики")
 
 
 class MoySkladError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 @dataclass(frozen=True)
@@ -93,6 +96,25 @@ class MoySkladClient:
                 if str(response.headers.get("Content-Encoding", "")).casefold() == "gzip":
                     body = gzip.decompress(body)
                 return json.loads(body.decode("utf-8"))
+        except HTTPError as error:
+            try:
+                body = error.read()
+                if str(error.headers.get("Content-Encoding", "")).casefold() == "gzip":
+                    body = gzip.decompress(body)
+                payload = json.loads(body.decode("utf-8"))
+                errors = payload.get("errors", []) if isinstance(payload, dict) else []
+                details = "; ".join(
+                    str(item.get("error", "")).strip()
+                    for item in errors
+                    if isinstance(item, dict) and item.get("error")
+                )
+            except Exception:
+                details = ""
+            endpoint = urlparse(url).path
+            message = f"МойСклад отклонил GET {endpoint}: HTTP {error.code}"
+            if details:
+                message += f" — {details}"
+            raise MoySkladError(message, status=error.code) from error
         except MoySkladError:
             raise
         except Exception as error:
@@ -117,13 +139,22 @@ class MoySkladClient:
 
     def current_availability(self, store_ids: tuple[str, ...]) -> list[dict]:
         """Return MoySklad's native «Доступно» value for selected stores."""
-        payload = self._get_json(
-            f"{API_ROOT}/report/stock/bystore/current",
-            {
-                "stockType": "quantity",
-                "filter": f"storeId={','.join(store_ids)}",
-            },
-        )
+        endpoint = f"{API_ROOT}/report/stock/bystore/current"
+        try:
+            payload = self._get_json(
+                endpoint,
+                {
+                    "stockType": "quantity",
+                    "filter": f"storeId={','.join(store_ids)}",
+                },
+            )
+        except MoySkladError as error:
+            # Some accounts/API revisions reject the documented multi-store filter.
+            # The unfiltered report is still read-only; selected stores are filtered
+            # locally by _available_stock.
+            if error.status != 400:
+                raise
+            payload = self._get_json(endpoint, {"stockType": "quantity"})
         if not isinstance(payload, list):
             raise MoySkladError("API МоегоСклада вернул неизвестный формат отчёта «Доступно».")
         return [row for row in payload if isinstance(row, dict)]

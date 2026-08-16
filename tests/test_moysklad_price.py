@@ -84,6 +84,24 @@ def test_api_requests_gzip_and_uses_get_only():
     assert captured == {"method": "GET", "accept_encoding": "gzip"}
 
 
+def test_current_availability_retries_without_store_filter_on_400():
+    client = MoySkladClient("test-token", opener=lambda *args, **kwargs: None)
+    calls = []
+
+    def fake_get(url, params):
+        calls.append(params)
+        if len(calls) == 1:
+            raise MoySkladError("bad filter", status=400)
+        return [{"assortmentId": "item", "storeId": "1", "quantity": 3}]
+
+    client._get_json = fake_get
+    assert client.current_availability(("1", "2"))[0]["quantity"] == 3
+    assert calls == [
+        {"stockType": "quantity", "filter": "storeId=1,2"},
+        {"stockType": "quantity"},
+    ]
+
+
 def test_builds_read_only_price_for_available_selected_stock(tmp_path):
     destination = tmp_path / "common.xlsx"
     result = build_price_from_moysklad(
