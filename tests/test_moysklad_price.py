@@ -1,8 +1,10 @@
+import gzip
+import json
 from decimal import Decimal
 
 from openpyxl import load_workbook
 
-from moysklad_price import MoySkladError, build_price_from_moysklad
+from moysklad_price import MoySkladClient, MoySkladError, build_price_from_moysklad
 from prices_db import parse_price_file
 
 
@@ -12,7 +14,6 @@ class FakeMoySkladClient:
             {"name": name, "meta": {"href": f"https://api.moysklad.ru/api/remap/1.2/entity/store/{index}"}}
             for index, name in enumerate(("Мордор", "Годзибасы", "Жможики", "Другой"), 1)
         ]
-
     def current_availability(self, store_ids):
         assert store_ids == ("1", "2", "3")
         return [
@@ -55,6 +56,32 @@ class FakeMoySkladClient:
                 "salePrices": prices,
             },
         ]
+
+
+class FakeGzipResponse:
+    headers = {"Content-Encoding": "gzip"}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def read(self):
+        return gzip.compress(json.dumps({"rows": []}).encode("utf-8"))
+
+
+def test_api_requests_gzip_and_uses_get_only():
+    captured = {}
+
+    def opener(request, **kwargs):
+        captured["method"] = request.get_method()
+        captured["accept_encoding"] = request.get_header("Accept-encoding")
+        return FakeGzipResponse()
+
+    client = MoySkladClient("test-token", opener=opener)
+    assert client.stores() == []
+    assert captured == {"method": "GET", "accept_encoding": "gzip"}
 
 
 def test_builds_read_only_price_for_available_selected_stock(tmp_path):

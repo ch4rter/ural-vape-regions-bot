@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import gzip
 import ssl
 from dataclasses import dataclass
 from datetime import date
@@ -80,7 +81,7 @@ class MoySkladClient:
             headers={
                 "Authorization": f"Bearer {self._token}",
                 "Accept": "application/json",
-                "Accept-Encoding": "identity",
+                "Accept-Encoding": "gzip",
                 "User-Agent": "UralVapeRegionsBot/1.0 (read-only)",
             },
             method="GET",
@@ -88,7 +89,10 @@ class MoySkladClient:
         try:
             response = self._opener(request, timeout=self._timeout, context=self._ssl_context)
             with response:
-                return json.loads(response.read().decode("utf-8"))
+                body = response.read()
+                if str(response.headers.get("Content-Encoding", "")).casefold() == "gzip":
+                    body = gzip.decompress(body)
+                return json.loads(body.decode("utf-8"))
         except MoySkladError:
             raise
         except Exception as error:
