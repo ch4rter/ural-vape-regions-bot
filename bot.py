@@ -39,6 +39,7 @@ from crm_bot import configure_crm, router as crm_router
 from crm_db import CRMDatabase
 from google_crm import GoogleCRM
 from materials_db import Material, MaterialsDB
+from moysklad_price import MoySkladError, build_price_from_moysklad
 from prices_db import (
     PRICE_SOURCE,
     WAREHOUSES,
@@ -3697,6 +3698,10 @@ def price_admin_keyboard() -> InlineKeyboardMarkup:
         text=f"{marker} Загрузить общий прайс",
         callback_data=f"adm:price_wh:{PRICE_SOURCE}",
     )]]
+    rows.append([InlineKeyboardButton(
+        text="🔄 Сформировать из МоегоСклада",
+        callback_data="adm:moysklad_price",
+    )])
     rows.append(compact_nav("main:admin"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -3706,7 +3711,8 @@ def price_status_text() -> str:
     lines = [
         "💰 <b>Управление общим прайсом</b>",
         "",
-        "Загрузите один актуальный файл с наименованием и базовыми ценами нал/безнал.", "",
+        "Загрузите готовый файл либо отдельно выгрузите тестовый прайс из МоегоСклада. "
+        "Тестовая выгрузка не заменяет действующий прайс.", "",
     ]
     status = statuses.get(PRICE_SOURCE)
     if status:
@@ -3725,6 +3731,107 @@ async def admin_prices(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await callback.message.edit_text(price_status_text(), reply_markup=price_admin_keyboard())
     await callback.answer()
+
+
+def moysklad_settings() -> tuple[str, tuple[str, ...], str, str]:
+    token = os.getenv("MOYSKLAD_TOKEN", "").strip()
+    stores = tuple(
+        value.strip()
+        for value in os.getenv("MOYSKLAD_STORES", "Мордор,Годзибасы,Жможики").split(",")
+        if value.strip()
+    )
+    if not stores:
+        stores = ("Мордор", "Годзибасы", "Жможики")
+    return (
+        token,
+        stores,
+        os.getenv("MOYSKLAD_CASH_PRICE_TYPE", "").strip(),
+        os.getenv("MOYSKLAD_CASHLESS_PRICE_TYPE", "").strip(),
+    )
+
+
+@router.callback_query(F.data == "adm:moysklad_price")
+async def generate_moysklad_price(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin(callback):
+        return
+    token, stores, cash_type, cashless_type = moysklad_settings()
+    if not token:
+        await callback.answer("Сначала добавьте MOYSKLAD_TOKEN в .env.", show_alert=True)
+        return
+    if PRICE_SOURCE in price_updates_in_progress:
+        await callback.answer("Прайс уже обновляется. Дождитесь завершения.", show_alert=True)
+        return
+    price_updates_in_progress.add(PRICE_SOURCE)
+    await state.clear()
+    await callback.answer("Начинаю формирование прайса…")
+    await edit_or_answer(
+        callback.message,
+        "⏳ <b>Формирую общий прайс из МоегоСклада</b>\n\n"
+        "Получаю ассортимент, цены и значение «Доступно» по складам: "
+        f"<b>{html.escape(', '.join(stores))}</b>.\n\n"
+        "Это может занять несколько минут. Повторно нажимать кнопку не нужно.",
+    )
+    pending_dir = price_storage_path / "pending"
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    today = datetime.now().strftime("%d.%m.%Y")
+    pending_path = pending_dir / f"moysklad_common_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    file_name = f"Общий прайс {today}.xlsx"
+    try:
+        generated = await asyncio.to_thread(
+            build_price_from_moysklad,
+            token,
+            pending_path,
+            store_names=stores,
+            cash_price_type=cash_type,
+            cashless_price_type=cashless_type,
+        )
+    except MoySkladError as error:
+        pending_path.unlink(missing_ok=True)
+        logging.warning("Не удалось сформировать прайс из МоегоСклада: %s", error)
+        await edit_or_answer(
+            callback.message,
+            "❌ <b>Не удалось сформировать прайс</b>\n\n"
+            f"{html.escape(str(error))}\n\nДействующий прайс не изменён.",
+            reply_markup=price_admin_keyboard(),
+        )
+        return
+    except Exception:
+        pending_path.unlink(missing_ok=True)
+        logging.exception("Не удалось сформировать прайс из МоегоСклада")
+        await edit_or_answer(
+            callback.message,
+            "❌ <b>Не удалось сформировать прайс</b>\n\n"
+            "Действующий прайс не изменён. Подробности записаны в журнал.",
+            reply_markup=price_admin_keyboard(),
+        )
+        return
+    finally:
+        price_updates_in_progress.discard(PRICE_SOURCE)
+
+    await edit_or_answer(
+        callback.message,
+        "✅ <b>Тестовый прайс сформирован</b>\n\n"
+        f"Дата: <b>{today}</b>\n"
+        f"Товарных групп: <b>{generated.group_count}</b>\n"
+        f"Доступных позиций: <b>{generated.item_count}</b>\n"
+        f"Склады: <b>{html.escape(', '.join(generated.store_names))}</b>\n"
+        f"Цена нал: <b>{html.escape(generated.cash_price_type)}</b>\n"
+        f"Цена безнал: <b>{html.escape(generated.cashless_price_type)}</b>\n\n"
+        "Действующий прайс в боте <b>не изменён</b>.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            compact_nav("adm:prices"),
+        ]),
+    )
+    try:
+        await callback.message.answer_document(
+            FSInputFile(pending_path, filename=file_name),
+            caption=(
+                "📄 <b>Тестовый общий прайс из МоегоСклада</b>\n\n"
+                "Действующие данные бота не изменены."
+            ),
+        )
+    finally:
+        pending_path.unlink(missing_ok=True)
 
 
 @router.callback_query(F.data.startswith("adm:price_wh:"))
