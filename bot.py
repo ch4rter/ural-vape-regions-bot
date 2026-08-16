@@ -39,7 +39,11 @@ from crm_bot import configure_crm, router as crm_router
 from crm_db import CRMDatabase
 from google_crm import GoogleCRM
 from materials_db import Material, MaterialsDB
-from moysklad_price import MoySkladError, build_price_from_moysklad
+from moysklad_price import (
+    MoySkladError,
+    build_price_from_moysklad,
+    validate_price_template,
+)
 from prices_db import (
     PRICE_SOURCE,
     WAREHOUSES,
@@ -77,6 +81,7 @@ crm_beta_ids: set[int] = {5533726476}
 active_excel_path: Path
 managed_excel_path: Path
 price_storage_path: Path
+moysklad_template_path: Path
 price_updates_in_progress: set[str] = set()
 broadcasts_in_progress: set[int] = set()
 PRICE_MESSAGE_SETTING = "price_command_message"
@@ -123,6 +128,7 @@ class AdminState(StatesGroup):
     excel_confirmation = State()
     price_upload = State()
     price_confirmation = State()
+    moysklad_template_upload = State()
     access_user = State()
     price_message = State()
     price_attachment = State()
@@ -3702,6 +3708,11 @@ def price_admin_keyboard() -> InlineKeyboardMarkup:
         text="🔄 Сформировать из МоегоСклада",
         callback_data="adm:moysklad_price",
     )])
+    template_marker = "✅" if moysklad_template_path.is_file() else "➕"
+    rows.append([InlineKeyboardButton(
+        text=f"{template_marker} Шаблон SR 50-50-2",
+        callback_data="adm:moysklad_template",
+    )])
     rows.append(compact_nav("main:admin"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -3733,6 +3744,69 @@ async def admin_prices(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
+@router.callback_query(F.data == "adm:moysklad_template")
+async def start_moysklad_template_upload(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin(callback):
+        return
+    await state.clear()
+    await state.set_state(AdminState.moysklad_template_upload)
+    await callback.message.edit_text(
+        "🎨 <b>Шаблон прайса SR 50-50-2</b>\n\n"
+        "Выгрузите актуальный файл через <b>Склад → Остатки → "
+        "Прайс-Лист SR 50-50-2</b> и отправьте его сюда документом в формате "
+        "<code>.xlsx</code>.\n\n"
+        "Бот проверит структуру и сохранит предыдущую версию. Действующий прайс "
+        "и база цен не изменятся.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[compact_nav("adm:prices")]),
+    )
+    await callback.answer()
+
+
+@router.message(AdminState.moysklad_template_upload)
+async def receive_moysklad_template(message: Message, state: FSMContext, bot: Bot) -> None:
+    if not is_admin(message.from_user.id) or message.chat.type != "private":
+        return
+    if not message.document or not (message.document.file_name or "").lower().endswith(".xlsx"):
+        await message.answer("⚠️ Отправьте шаблон как документ в формате <code>.xlsx</code>.")
+        return
+    pending_dir = moysklad_template_path.parent / "pending"
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    pending_path = pending_dir / f"template_{message.document.file_unique_id}.xlsx"
+    await message.answer("⏳ Проверяю структуру и оформление шаблона…")
+    try:
+        await bot.download(message.document.file_id, destination=pending_path)
+        details = await asyncio.to_thread(validate_price_template, pending_path)
+        moysklad_template_path.parent.mkdir(parents=True, exist_ok=True)
+        backup = None
+        if moysklad_template_path.exists():
+            backup_dir = moysklad_template_path.parent / "backups"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            backup = backup_dir / (
+                f"moysklad_template_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.xlsx"
+            )
+            await asyncio.to_thread(shutil.copy2, moysklad_template_path, backup)
+        os.replace(pending_path, moysklad_template_path)
+    except Exception as error:
+        pending_path.unlink(missing_ok=True)
+        logging.warning("Отклонён шаблон прайса МоегоСклада: %s", error)
+        await message.answer(
+            "❌ <b>Шаблон не принят</b>\n\n"
+            f"{html.escape(str(error))}\n\nПредыдущий шаблон сохранён."
+        )
+        return
+    await state.clear()
+    backup_note = "\nПредыдущая версия сохранена в резервной копии." if backup else ""
+    await message.answer(
+        "✅ <b>Шаблон SR 50-50-2 обновлён</b>\n\n"
+        f"Лист: <b>{html.escape(details['sheet_name'])}</b>\n"
+        f"Строка заголовков: <b>{details['header_row']}</b>\n"
+        f"Колонок: <b>{details['columns']}</b>"
+        f"{backup_note}\n\n"
+        "Следующая тестовая выгрузка из МоегоСклада будет сформирована по этому шаблону.",
+        reply_markup=price_admin_keyboard(),
+    )
+
+
 def moysklad_settings() -> tuple[str, tuple[str, ...], str, str]:
     token = os.getenv("MOYSKLAD_TOKEN", "").strip()
     stores = tuple(
@@ -3757,6 +3831,11 @@ async def generate_moysklad_price(callback: CallbackQuery, state: FSMContext) ->
     token, stores, cash_type, cashless_type = moysklad_settings()
     if not token:
         await callback.answer("Сначала добавьте MOYSKLAD_TOKEN в .env.", show_alert=True)
+        return
+    if not moysklad_template_path.is_file():
+        await callback.answer(
+            "Сначала загрузите шаблон SR 50-50-2 отдельной кнопкой.", show_alert=True
+        )
         return
     if PRICE_SOURCE in price_updates_in_progress:
         await callback.answer("Прайс уже обновляется. Дождитесь завершения.", show_alert=True)
@@ -3784,6 +3863,7 @@ async def generate_moysklad_price(callback: CallbackQuery, state: FSMContext) ->
             store_names=stores,
             cash_price_type=cash_type,
             cashless_price_type=cashless_type,
+            template_path=moysklad_template_path,
         )
     except MoySkladError as error:
         pending_path.unlink(missing_ok=True)
@@ -4735,7 +4815,7 @@ async def outside_mode(message: Message) -> None:
 async def main() -> None:
     global catalog, materials_db, prices_db, crm_database, admin_ids
     global crm_beta_ids
-    global active_excel_path, managed_excel_path, price_storage_path
+    global active_excel_path, managed_excel_path, price_storage_path, moysklad_template_path
     load_dotenv(BASE_DIR / ".env")
     token = os.getenv("BOT_TOKEN", "").strip()
     if not token:
@@ -4745,11 +4825,15 @@ async def main() -> None:
     db_path = Path(os.getenv("MATERIALS_DB", "data/materials.sqlite3"))
     prices_db_path = Path(os.getenv("PRICES_DB", "data/prices.sqlite3"))
     price_storage_path = Path(os.getenv("PRICE_STORAGE", "data/prices"))
+    moysklad_template_path = Path(
+        os.getenv("MOYSKLAD_TEMPLATE", "data/moysklad_price_template.xlsx")
+    )
     if not excel_path.is_absolute(): excel_path = BASE_DIR / excel_path
     if not managed_excel_path.is_absolute(): managed_excel_path = BASE_DIR / managed_excel_path
     if not db_path.is_absolute(): db_path = BASE_DIR / db_path
     if not prices_db_path.is_absolute(): prices_db_path = BASE_DIR / prices_db_path
     if not price_storage_path.is_absolute(): price_storage_path = BASE_DIR / price_storage_path
+    if not moysklad_template_path.is_absolute(): moysklad_template_path = BASE_DIR / moysklad_template_path
     admin_ids = {int(value.strip()) for value in os.getenv("ADMIN_IDS", "5533726476").split(",") if value.strip()}
     crm_beta_ids = {
         int(value.strip())
