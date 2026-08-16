@@ -76,12 +76,17 @@ def test_api_requests_gzip_and_uses_get_only():
 
     def opener(request, **kwargs):
         captured["method"] = request.get_method()
+        captured["accept"] = request.get_header("Accept")
         captured["accept_encoding"] = request.get_header("Accept-encoding")
         return FakeGzipResponse()
 
     client = MoySkladClient("test-token", opener=opener)
     assert client.stores() == []
-    assert captured == {"method": "GET", "accept_encoding": "gzip"}
+    assert captured == {
+        "method": "GET",
+        "accept": "application/json;charset=utf-8",
+        "accept_encoding": "gzip",
+    }
 
 
 def test_current_availability_retries_without_store_filter_on_400():

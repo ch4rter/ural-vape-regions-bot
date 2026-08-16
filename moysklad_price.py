@@ -83,7 +83,7 @@ class MoySkladClient:
             url,
             headers={
                 "Authorization": f"Bearer {self._token}",
-                "Accept": "application/json",
+                "Accept": "application/json;charset=utf-8",
                 "Accept-Encoding": "gzip",
                 "User-Agent": "UralVapeRegionsBot/1.0 (read-only)",
             },
