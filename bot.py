@@ -3201,6 +3201,20 @@ async def require_admin(callback: CallbackQuery) -> bool:
     return False
 
 
+async def require_bonus_report_access(callback: CallbackQuery) -> bool:
+    user = callback.from_user
+    if (
+        user
+        and callback.message.chat.type == "private"
+        and (is_admin(user.id) or is_junior_admin(user.id, user.username))
+    ):
+        return True
+    await callback.answer(
+        "Премиальные отчёты доступны администраторам.", show_alert=True
+    )
+    return False
+
+
 async def require_broadcaster(callback: CallbackQuery) -> bool:
     if can_broadcast(callback.from_user.id, callback.from_user.username) and callback.message.chat.type == "private":
         return True
@@ -3792,18 +3806,20 @@ def bonus_months_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def bonus_month_keyboard(month: str) -> InlineKeyboardMarkup:
+def bonus_month_keyboard(month: str, *, allow_configuration: bool = True) -> InlineKeyboardMarkup:
     configured = bonus_classification_path(month).exists()
-    rows = [
-        [InlineKeyboardButton(
+    rows = []
+    if allow_configuration:
+        rows.extend([
+            [InlineKeyboardButton(
             text="⬇️ Скачать таблицу категорий",
             callback_data=f"bonus:export:{month}",
-        )],
-        [InlineKeyboardButton(
+            )],
+            [InlineKeyboardButton(
             text="⬆️ Загрузить таблицу категорий",
             callback_data=f"bonus:upload:{month}",
-        )],
-    ]
+            )],
+        ])
     if configured:
         rows.append([InlineKeyboardButton(
             text="📊 Сформировать отчёт",
@@ -3824,13 +3840,15 @@ async def show_bonus_month(callback: CallbackQuery, month: str) -> None:
         f"{status}\n\n"
         "Классификация хранится отдельно для каждого месяца. Таблица содержит только "
         "конечные товарные папки МоегоСклада.",
-        reply_markup=bonus_month_keyboard(month),
+        reply_markup=bonus_month_keyboard(
+            month, allow_configuration=is_admin(callback.from_user.id)
+        ),
     )
 
 
 @router.callback_query(F.data == "bonus:menu")
 async def bonus_menu(callback: CallbackQuery, state: FSMContext) -> None:
-    if not await require_admin(callback):
+    if not await require_bonus_report_access(callback):
         return
     await state.clear()
     await edit_or_answer(
@@ -3844,7 +3862,7 @@ async def bonus_menu(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data.startswith("bonus:m:"))
 async def bonus_open_month(callback: CallbackQuery, state: FSMContext) -> None:
-    if not await require_admin(callback):
+    if not await require_bonus_report_access(callback):
         return
     month = callback.data.rsplit(":", 1)[1]
     await state.clear()
@@ -3965,7 +3983,7 @@ async def bonus_receive_classification(message: Message, state: FSMContext, bot:
 
 @router.callback_query(F.data.startswith("bonus:channels:"))
 async def bonus_choose_channel(callback: CallbackQuery, state: FSMContext) -> None:
-    if not await require_admin(callback):
+    if not await require_bonus_report_access(callback):
         return
     month = callback.data.rsplit(":", 1)[1]
     token, _, _, _ = moysklad_settings()
@@ -3987,14 +4005,18 @@ async def bonus_choose_channel(callback: CallbackQuery, state: FSMContext) -> No
         await edit_or_answer(
             callback.message,
             "❌ <b>Не удалось получить каналы продаж</b>\n\n" + html.escape(str(error)),
-            reply_markup=bonus_month_keyboard(month),
+            reply_markup=bonus_month_keyboard(
+                month, allow_configuration=is_admin(callback.from_user.id)
+            ),
         )
         return
     if not channels:
         await edit_or_answer(
             callback.message,
             "В МоемСкладе не найдены доступные каналы продаж.",
-            reply_markup=bonus_month_keyboard(month),
+            reply_markup=bonus_month_keyboard(
+                month, allow_configuration=is_admin(callback.from_user.id)
+            ),
         )
         return
     choices = [
@@ -4017,7 +4039,7 @@ async def bonus_choose_channel(callback: CallbackQuery, state: FSMContext) -> No
 
 @router.callback_query(F.data.startswith("bonus:run:"))
 async def bonus_generate_report(callback: CallbackQuery, state: FSMContext) -> None:
-    if not await require_admin(callback):
+    if not await require_bonus_report_access(callback):
         return
     data = await state.get_data()
     month = str(data.get("bonus_month", ""))
@@ -4073,7 +4095,9 @@ async def bonus_generate_report(callback: CallbackQuery, state: FSMContext) -> N
             await edit_or_answer(
                 callback.message,
                 "❌ <b>Не удалось сформировать отчёт</b>\n\n" + html.escape(str(error)),
-                reply_markup=bonus_month_keyboard(month),
+                reply_markup=bonus_month_keyboard(
+                    month, allow_configuration=is_admin(callback.from_user.id)
+                ),
             )
             return
         finally:
@@ -4393,6 +4417,7 @@ async def admin_menu(callback: CallbackQuery, state: FSMContext) -> None:
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="✏️ Текст /прайс", callback_data="adm:price_message")],
                 [InlineKeyboardButton(text="📝 Анкеты клиентов", callback_data="adm:leads")],
+                [InlineKeyboardButton(text="📈 Премиальный отчёт", callback_data="bonus:menu")],
                 compact_nav(),
             ]),
         )
