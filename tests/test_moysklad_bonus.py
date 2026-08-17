@@ -4,7 +4,9 @@ from decimal import Decimal
 from openpyxl import Workbook, load_workbook
 
 from moysklad_bonus import (
+    ALL_CHANNELS,
     build_bonus_report,
+    fetch_month_documents,
     leaf_folders,
     read_classification,
     save_classification,
@@ -43,6 +45,23 @@ def test_leaf_folders_excludes_parents_and_archived():
         {"name": "Старое", "pathName": "", "archived": True},
     ]
     assert [row["name"] for row in leaf_folders(folders)] == ["Жидкости"]
+
+
+def test_channel_discovery_does_not_expand_positions():
+    class HeaderClient:
+        def __init__(self):
+            self.calls = []
+
+        def _rows(self, endpoint, params):
+            self.calls.append((endpoint, params["expand"]))
+            return []
+
+    client = HeaderClient()
+    assert fetch_month_documents(client, "2026-08") == ([], [])
+    assert client.calls == [
+        ("entity/demand", "agent,state,salesChannel"),
+        ("entity/salesreturn", "agent,state,demand.salesChannel"),
+    ]
 
 
 def test_old_full_tree_classification_is_normalized_to_leaves(tmp_path):
@@ -149,3 +168,10 @@ def test_build_bonus_report_splits_categories_and_returns(tmp_path):
     assert Decimal(str(sheet.cell(4, headers["Прочее"]).value)) == Decimal("600")
     assert Decimal(str(sheet.cell(5, headers["OGGO Аромы/жижи"]).value)) == Decimal("-500")
     workbook.close()
+
+    common_destination = tmp_path / "common-report.xlsx"
+    common = build_bonus_report(
+        "token", "2026-08", ALL_CHANNELS, classification, common_destination,
+        client=FakeBonusClient(), raw_documents=([demand], [returned]),
+    )
+    assert common.document_count == 2

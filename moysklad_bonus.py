@@ -17,6 +17,7 @@ from moysklad_price import BONUS_CATEGORIES, MoySkladClient, MoySkladError, _can
 OTHER_CATEGORY = "Прочее"
 UNCLASSIFIED_CATEGORY = "Не классифицировано"
 EXCLUDED_CATEGORY = "Не учитывать"
+ALL_CHANNELS = "Все менеджеры"
 MAX_BONUS_CATEGORIES = 20
 
 
@@ -219,8 +220,11 @@ def _expanded_rows(client: MoySkladClient, endpoint: str, start: str, end: str, 
 
 def fetch_month_documents(client: MoySkladClient, month: str) -> tuple[list[dict], list[dict]]:
     start, end = month_bounds(month)
-    demands = _expanded_rows(client, "entity/demand", start, end, "agent,state,salesChannel,positions")
-    returns = _expanded_rows(client, "entity/salesreturn", start, end, "agent,state,demand.salesChannel,positions")
+    # Positions are intentionally not expanded here. This first, lightweight
+    # request is used to choose a sales channel. Position rows are fetched only
+    # for documents included in the requested report.
+    demands = _expanded_rows(client, "entity/demand", start, end, "agent,state,salesChannel")
+    returns = _expanded_rows(client, "entity/salesreturn", start, end, "agent,state,demand.salesChannel")
     return demands, returns
 
 
@@ -297,7 +301,7 @@ def prepare_documents(
     for kind, rows, sign in (("Отгрузка", raw[0], Decimal(1)), ("Возврат", raw[1], Decimal(-1))):
         for document in rows:
             document_channel = _channel(document)
-            if document_channel.casefold() != channel.casefold():
+            if channel != ALL_CHANNELS and document_channel.casefold() != channel.casefold():
                 continue
             amounts = {category: Decimal(0) for category in report_categories}
             amounts[OTHER_CATEGORY] = Decimal(0)

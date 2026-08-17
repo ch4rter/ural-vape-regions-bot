@@ -97,6 +97,21 @@ def test_api_requests_gzip_and_uses_get_only():
     }
 
 
+def test_api_retries_temporary_timeout(monkeypatch):
+    attempts = {"count": 0}
+
+    def opener(request, **kwargs):
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            raise TimeoutError("read operation timed out")
+        return FakeGzipResponse()
+
+    monkeypatch.setattr("moysklad_price.time.sleep", lambda seconds: None)
+    client = MoySkladClient("test-token", opener=opener)
+    assert client.stores() == []
+    assert attempts["count"] == 3
+
+
 def test_current_availability_retries_without_store_filter_on_400():
     client = MoySkladClient("test-token", opener=lambda *args, **kwargs: None)
     calls = []

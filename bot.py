@@ -46,6 +46,7 @@ from moysklad_price import (
     build_product_folder_mapping,
 )
 from moysklad_bonus import (
+    ALL_CHANNELS,
     BonusClassification,
     build_bonus_report,
     fetch_month_documents,
@@ -3998,14 +3999,17 @@ async def bonus_choose_channel(callback: CallbackQuery, state: FSMContext) -> No
             reply_markup=bonus_month_keyboard(month),
         )
         return
-    await state.update_data(bonus_month=month, bonus_channels=list(channels))
-    rows = [[InlineKeyboardButton(text=name, callback_data=f"bonus:run:{index}")]
-            for index, name in enumerate(channels)]
+    choices = [ALL_CHANNELS, *channels]
+    await state.update_data(bonus_month=month, bonus_channels=choices)
+    rows = [[InlineKeyboardButton(
+        text=("📊 " if name == ALL_CHANNELS else "👤 ") + name,
+        callback_data=f"bonus:run:{index}",
+    )] for index, name in enumerate(choices)]
     rows.append([InlineKeyboardButton(text="⬅️", callback_data=f"bonus:m:{month}")])
     await edit_or_answer(
         callback.message,
         "👤 <b>Выберите менеджера</b>\n\n"
-        "Список получен из поля «Канал продаж» в проведённых документах.",
+        "Можно сформировать общий отчёт или выбрать отдельное значение поля «Канал продаж».",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
 

@@ -5,13 +5,14 @@ from __future__ import annotations
 import json
 import gzip
 import ssl
+import time
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urlencode, urlparse
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from openpyxl import Workbook
@@ -70,7 +71,7 @@ class MoySkladClient:
         self,
         token: str,
         *,
-        timeout: int = 45,
+        timeout: int = 90,
         opener: Callable = urlopen,
     ) -> None:
         token = token.strip()
@@ -99,14 +100,29 @@ class MoySkladClient:
             },
             method="GET",
         )
-        try:
-            response = self._opener(request, timeout=self._timeout, context=self._ssl_context)
-            with response:
-                body = response.read()
-                if str(response.headers.get("Content-Encoding", "")).casefold() == "gzip":
-                    body = gzip.decompress(body)
-                return json.loads(body.decode("utf-8"))
-        except HTTPError as error:
+        error: Exception | None = None
+        for attempt in range(3):
+            try:
+                response = self._opener(request, timeout=self._timeout, context=self._ssl_context)
+                with response:
+                    body = response.read()
+                    if str(response.headers.get("Content-Encoding", "")).casefold() == "gzip":
+                        body = gzip.decompress(body)
+                    return json.loads(body.decode("utf-8"))
+            except HTTPError as current_error:
+                error = current_error
+                if current_error.code not in {429, 500, 502, 503, 504} or attempt == 2:
+                    break
+            except (TimeoutError, URLError) as current_error:
+                error = current_error
+                if attempt == 2:
+                    break
+            except Exception as current_error:
+                error = current_error
+                if "timed out" not in str(current_error).casefold() or attempt == 2:
+                    break
+            time.sleep(2 ** attempt)
+        if isinstance(error, HTTPError):
             try:
                 body = error.read()
                 if str(error.headers.get("Content-Encoding", "")).casefold() == "gzip":
@@ -125,10 +141,9 @@ class MoySkladClient:
             if details:
                 message += f" — {details}"
             raise MoySkladError(message, status=error.code) from error
-        except MoySkladError:
-            raise
-        except Exception as error:
-            raise MoySkladError(f"Ошибка чтения API МоегоСклада: {error}") from error
+        raise MoySkladError(
+            f"Ошибка чтения API МоегоСклада после 3 попыток: {error}"
+        ) from error
 
     def _rows(self, endpoint: str, params: dict | None = None) -> list[dict]:
         url = f"{API_ROOT}/{endpoint.lstrip('/')}"
