@@ -49,11 +49,56 @@ def test_old_full_tree_classification_is_normalized_to_leaves(tmp_path):
     source = tmp_path / "mapping.xlsx"
     classification_xlsx(source)
     mapping = read_classification(source)
-    assert "эс" not in mapping
-    assert mapping["эс/жидкости/oggo"] == "OGGO Аромы/жижи"
+    assert "эс" not in mapping.folders
+    assert mapping.folders["эс/жидкости/oggo"] == "OGGO Аромы/жижи"
     destination = tmp_path / "2026-08.json"
     assert save_classification(source, destination) == 2
     assert len(json.loads(destination.read_text(encoding="utf-8"))["folders"]) == 2
+
+
+def test_custom_month_categories_are_saved_and_used(tmp_path):
+    source = tmp_path / "custom.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Полный путь папки", "Категория"])
+    sheet.append(["ЭС/Жидкости/OGGO", "Новинки месяца"])
+    guide = workbook.create_sheet("Справочник")
+    guide.append(["Допустимые категории"])
+    guide.append(["Новинки месяца"])
+    guide.append(["Не учитывать"])
+    workbook.save(source)
+    workbook.close()
+    destination = tmp_path / "2026-09.json"
+    save_classification(source, destination)
+    payload = json.loads(destination.read_text(encoding="utf-8"))
+    assert payload["categories"] == ["Новинки месяца", "Не учитывать"]
+    assert payload["folders"]["эс/жидкости/oggo"] == "Новинки месяца"
+    demand = {
+        "moment": "2026-09-10 10:00:00",
+        "name": "0002",
+        "agent": {"name": "Клиент"},
+        "state": {"name": "Отгружено"},
+        "salesChannel": {"name": "Валера"},
+        "sum": 50000,
+        "payedSum": 50000,
+        "positions": {"rows": [{
+            "assortment": {"meta": {
+                "href": "https://api.moysklad.ru/api/remap/1.2/entity/product/oggo"
+            }},
+            "quantity": 1,
+            "price": 50000,
+        }]},
+    }
+    report = tmp_path / "custom-report.xlsx"
+    build_bonus_report(
+        "token", "2026-09", "Валера", destination, report,
+        client=FakeBonusClient(), raw_documents=([demand], []),
+    )
+    workbook = load_workbook(report, read_only=True)
+    headers = [cell.value for cell in workbook["Отчёт"][3]]
+    assert "Новинки месяца" in headers
+    assert "OGGO Аромы/жижи" not in headers
+    workbook.close()
 
 
 def test_build_bonus_report_splits_categories_and_returns(tmp_path):

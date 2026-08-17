@@ -46,6 +46,7 @@ from moysklad_price import (
     build_product_folder_mapping,
 )
 from moysklad_bonus import (
+    BonusClassification,
     build_bonus_report,
     fetch_month_documents,
     load_classification,
@@ -93,6 +94,8 @@ price_storage_path: Path
 bonus_storage_path: Path
 price_updates_in_progress: set[str] = set()
 broadcasts_in_progress: set[int] = set()
+bonus_reports_in_progress: set[int] = set()
+bonus_documents_cache: dict[tuple[int, str], tuple[datetime, tuple[list[dict], list[dict]]]] = {}
 PRICE_MESSAGE_SETTING = "price_command_message"
 PRICE_ATTACHMENT_KIND_SETTING = "price_command_attachment_kind"
 PRICE_ATTACHMENT_ID_SETTING = "price_command_attachment_id"
@@ -3850,7 +3853,7 @@ async def bonus_open_month(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
-def previous_bonus_mapping(month: str) -> dict[str, str]:
+def previous_bonus_mapping(month: str) -> BonusClassification | None:
     current_path = bonus_classification_path(month)
     if current_path.exists():
         return load_classification(current_path)
@@ -3859,7 +3862,7 @@ def previous_bonus_mapping(month: str) -> dict[str, str]:
         (path for path in directory.glob("????-??.json") if path.stem < month),
         reverse=True,
     ) if directory.exists() else []
-    return load_classification(candidates[0]) if candidates else {}
+    return load_classification(candidates[0]) if candidates else None
 
 
 @router.callback_query(F.data.startswith("bonus:export:"))
@@ -3880,19 +3883,24 @@ async def bonus_export_classification(callback: CallbackQuery) -> None:
     with tempfile.TemporaryDirectory() as temporary:
         destination = Path(temporary) / f"Категории {month}.xlsx"
         try:
-            mapping = previous_bonus_mapping(month)
+            previous = previous_bonus_mapping(month)
+            options = {}
+            if previous:
+                options = {
+                    "categories": previous.folders,
+                    "category_choices": previous.categories,
+                }
             count = await asyncio.to_thread(
-                build_product_folder_mapping,
-                token,
-                destination,
-                categories=mapping,
+                build_product_folder_mapping, token, destination, **options
             )
             await callback.message.answer_document(
                 FSInputFile(destination, filename=destination.name),
                 caption=(
                     f"📂 <b>Классификация за {html.escape(month_title(month))}</b>\n\n"
-                    f"Конечных папок: <b>{count}</b>. Проверьте категории и загрузите файл обратно. "
-                    "Если это новый месяц, значения перенесены из последней сохранённой классификации."
+                    f"Конечных папок: <b>{count}</b>. На листе «Справочник» можно изменить "
+                    "названия и количество премиальных категорий; значение «Не учитывать» удалять нельзя. "
+                    "После этого проверьте категории папок и загрузите файл обратно. Если это новый месяц, "
+                    "значения перенесены из последней сохранённой классификации."
                 ),
             )
         except Exception as error:
@@ -3974,6 +3982,7 @@ async def bonus_choose_channel(callback: CallbackQuery, state: FSMContext) -> No
     try:
         raw = await asyncio.to_thread(fetch_month_documents, MoySkladClient(token), month)
         channels = sales_channels(raw)
+        bonus_documents_cache[(callback.from_user.id, month)] = (datetime.now(), raw)
     except Exception as error:
         logging.exception("Не удалось получить каналы продаж")
         await edit_or_answer(
@@ -4014,6 +4023,10 @@ async def bonus_generate_report(callback: CallbackQuery, state: FSMContext) -> N
         await callback.answer("Список устарел. Выберите месяц заново.", show_alert=True)
         return
     token, _, _, _ = moysklad_settings()
+    if callback.from_user.id in bonus_reports_in_progress:
+        await callback.answer("Отчёт уже формируется. Дождитесь завершения.", show_alert=True)
+        return
+    bonus_reports_in_progress.add(callback.from_user.id)
     await callback.answer("Формирую отчёт…")
     await edit_or_answer(
         callback.message,
@@ -4025,6 +4038,10 @@ async def bonus_generate_report(callback: CallbackQuery, state: FSMContext) -> N
     with tempfile.TemporaryDirectory() as temporary:
         destination = Path(temporary) / f"Премиальный отчёт {channel} {month}.xlsx"
         try:
+            cached = bonus_documents_cache.get((callback.from_user.id, month))
+            raw_documents = None
+            if cached and (datetime.now() - cached[0]).total_seconds() <= 900:
+                raw_documents = cached[1]
             result = await asyncio.to_thread(
                 build_bonus_report,
                 token,
@@ -4032,6 +4049,7 @@ async def bonus_generate_report(callback: CallbackQuery, state: FSMContext) -> N
                 channel,
                 bonus_classification_path(month),
                 destination,
+                raw_documents=raw_documents,
             )
             warning = (
                 f"\n⚠️ Неклассифицированных папок: <b>{len(result.unclassified_paths)}</b>. "
@@ -4055,6 +4073,9 @@ async def bonus_generate_report(callback: CallbackQuery, state: FSMContext) -> N
                 reply_markup=bonus_month_keyboard(month),
             )
             return
+        finally:
+            bonus_reports_in_progress.discard(callback.from_user.id)
+            bonus_documents_cache.pop((callback.from_user.id, month), None)
     await show_bonus_month(callback, month)
 
 

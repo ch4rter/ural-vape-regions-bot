@@ -29,6 +29,7 @@ BONUS_CATEGORIES = (
     "Железо",
     "Не учитывать",
 )
+MAX_BONUS_CATEGORY_CHOICES = 21
 
 
 class MoySkladError(RuntimeError):
@@ -181,6 +182,7 @@ def build_product_folder_mapping(
     *,
     client: MoySkladClient | None = None,
     categories: dict[str, str] | None = None,
+    category_choices: tuple[str, ...] = BONUS_CATEGORIES,
 ) -> int:
     """Export only terminal MoySklad folders for manual category mapping."""
     client = client or MoySkladClient(token)
@@ -232,12 +234,14 @@ def build_product_folder_mapping(
     guide.append(["Допустимые категории"])
     guide["A1"].font = Font(bold=True, color="FFFFFF")
     guide["A1"].fill = PatternFill("solid", fgColor="2F5597")
-    for category in BONUS_CATEGORIES:
+    for category in category_choices:
         guide.append([category])
     guide.column_dimensions["A"].width = 35
     validation = DataValidation(
         type="list",
-        formula1=f"'Справочник'!$A$2:$A${len(BONUS_CATEGORIES) + 1}",
+        # Keep spare rows in the source range so an administrator can add new
+        # monthly categories without losing the dropdown in the main sheet.
+        formula1=f"'Справочник'!$A$2:$A${MAX_BONUS_CATEGORY_CHOICES + 1}",
         allow_blank=True,
     )
     validation.error = "Выберите категорию из списка."

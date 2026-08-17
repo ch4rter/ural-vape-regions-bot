@@ -16,6 +16,14 @@ from moysklad_price import BONUS_CATEGORIES, MoySkladClient, MoySkladError, _can
 
 OTHER_CATEGORY = "Прочее"
 UNCLASSIFIED_CATEGORY = "Не классифицировано"
+EXCLUDED_CATEGORY = "Не учитывать"
+MAX_BONUS_CATEGORIES = 20
+
+
+@dataclass(frozen=True)
+class BonusClassification:
+    categories: tuple[str, ...]
+    folders: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -80,9 +88,44 @@ def leaf_folders(folders: list[dict]) -> list[dict]:
     return sorted(result, key=lambda folder: _full_folder_path(folder).casefold())
 
 
-def read_classification(path: Path) -> dict[str, str]:
+def _validate_categories(values: list[str]) -> tuple[str, ...]:
+    categories = []
+    seen = set()
+    for value in values:
+        category = str(value or "").strip()
+        if not category:
+            continue
+        key = category.casefold()
+        if key == EXCLUDED_CATEGORY.casefold() and category != EXCLUDED_CATEGORY:
+            raise MoySkladError(f"Служебную категорию нужно оставить точно как «{EXCLUDED_CATEGORY}».")
+        if key in seen:
+            raise MoySkladError(f"В справочнике категория «{category}» указана повторно.")
+        if len(category) > 60:
+            raise MoySkladError(f"Название категории «{category}» длиннее 60 символов.")
+        seen.add(key)
+        categories.append(category)
+    if EXCLUDED_CATEGORY.casefold() not in seen:
+        raise MoySkladError(f"В справочнике должна оставаться служебная категория «{EXCLUDED_CATEGORY}».")
+    if len(categories) < 2:
+        raise MoySkladError("Добавьте в справочник хотя бы одну премиальную категорию.")
+    if len(categories) > MAX_BONUS_CATEGORIES + 1:
+        raise MoySkladError(f"Допускается не более {MAX_BONUS_CATEGORIES} премиальных категорий.")
+    return tuple(categories)
+
+
+def read_classification(path: Path) -> BonusClassification:
     workbook = load_workbook(path, read_only=True, data_only=True)
     sheet = workbook.worksheets[0]
+    if len(workbook.worksheets) > 1:
+        category_values = [
+            str(row[0].value or "").strip()
+            for row in workbook.worksheets[1].iter_rows(
+                min_row=2, min_col=1, max_col=1
+            )
+        ]
+        categories = _validate_categories(category_values)
+    else:
+        categories = tuple(BONUS_CATEGORIES)
     headers = {
         str(cell.value).strip().casefold(): index
         for index, cell in enumerate(sheet[1])
@@ -95,7 +138,7 @@ def read_classification(path: Path) -> dict[str, str]:
         raise MoySkladError("В таблице нужны колонки «Полный путь папки» и «Категория».")
     entered: dict[str, str] = {}
     errors = []
-    allowed = set(BONUS_CATEGORIES)
+    allowed = set(categories)
     for row_number, values in enumerate(sheet.iter_rows(min_row=2, values_only=True), 2):
         folder_path = str(values[path_index] or "").strip(" /\t")
         category = str(values[category_index] or "").strip()
@@ -126,27 +169,41 @@ def read_classification(path: Path) -> dict[str, str]:
         for key, category in entered.items()
         if not any(other.startswith(key + "/") for other in entered)
     }
-    return mapping
+    return BonusClassification(categories=categories, folders=mapping)
 
 
 def save_classification(source: Path, destination: Path) -> int:
-    mapping = read_classification(source)
+    classification = read_classification(source)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"version": 1, "folders": mapping}
+    payload = {
+        "version": 2,
+        "categories": list(classification.categories),
+        "folders": classification.folders,
+    }
     temporary = destination.with_suffix(".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(destination)
-    return len(mapping)
+    return len(classification.folders)
 
 
-def load_classification(path: Path) -> dict[str, str]:
+def load_classification(path: Path) -> BonusClassification:
     if not path.exists():
         raise MoySkladError("Для выбранного месяца ещё не загружена классификация товарных папок.")
     payload = json.loads(path.read_text(encoding="utf-8"))
     folders = payload.get("folders", {})
     if not isinstance(folders, dict) or not folders:
         raise MoySkladError("Сохранённая классификация товарных папок повреждена или пуста.")
-    return {str(key).casefold(): str(value) for key, value in folders.items()}
+    raw_categories = payload.get("categories")
+    if isinstance(raw_categories, list):
+        categories = _validate_categories([str(value) for value in raw_categories])
+    else:
+        # Version 1 stored only folder mappings and used the original fixed list.
+        categories = _validate_categories(list(BONUS_CATEGORIES))
+    normalized = {str(key).casefold(): str(value) for key, value in folders.items()}
+    unknown = sorted(set(normalized.values()) - set(categories))
+    if unknown:
+        raise MoySkladError("В сохранённой классификации неизвестные категории: " + ", ".join(unknown) + ".")
+    return BonusClassification(categories=categories, folders=normalized)
 
 
 def _expanded_rows(client: MoySkladClient, endpoint: str, start: str, end: str, expand: str) -> list[dict]:
@@ -227,29 +284,33 @@ def _document_positions(document: dict, client: MoySkladClient) -> list[dict]:
 def prepare_documents(
     client: MoySkladClient,
     raw: tuple[list[dict], list[dict]],
-    classification: dict[str, str],
+    classification: BonusClassification,
     channel: str,
 ) -> tuple[list[BonusDocument], set[str]]:
     assortment_paths = _assortment_paths(client)
     result: list[BonusDocument] = []
     unknown: set[str] = set()
+    report_categories = tuple(
+        category for category in classification.categories
+        if category != EXCLUDED_CATEGORY
+    )
     for kind, rows, sign in (("Отгрузка", raw[0], Decimal(1)), ("Возврат", raw[1], Decimal(-1))):
         for document in rows:
             document_channel = _channel(document)
             if document_channel.casefold() != channel.casefold():
                 continue
-            amounts = {category: Decimal(0) for category in BONUS_CATEGORIES[:-1]}
+            amounts = {category: Decimal(0) for category in report_categories}
             amounts[OTHER_CATEGORY] = Decimal(0)
             amounts[UNCLASSIFIED_CATEGORY] = Decimal(0)
             for position in _document_positions(document, client):
                 assortment = position.get("assortment", {})
                 href = _canonical_href(str(assortment.get("meta", {}).get("href", "")))
                 folder_path = assortment_paths.get(href, "")
-                category = classification.get(folder_path.casefold()) if folder_path else None
+                category = classification.folders.get(folder_path.casefold()) if folder_path else None
                 value = _position_sum(position) * sign
                 if category in amounts:
                     amounts[category] += value
-                elif category == "Не учитывать":
+                elif category == EXCLUDED_CATEGORY:
                     amounts[OTHER_CATEGORY] += value
                 else:
                     amounts[UNCLASSIFIED_CATEGORY] += value
@@ -291,7 +352,10 @@ def build_bonus_report(
     sheet.title = "Отчёт"
     sheet.append(["Отчёт по премиальным категориям", month_title(month), channel])
     sheet.append([])
-    category_headers = list(BONUS_CATEGORIES[:-1])
+    category_headers = [
+        category for category in classification.categories
+        if category != EXCLUDED_CATEGORY
+    ]
     headers = [
         "Тип", "Дата", "Документ", "Контрагент", "Статус", "Канал продаж",
         "Сумма документа", "Оплачено", *category_headers, OTHER_CATEGORY,
@@ -338,7 +402,8 @@ def build_bonus_report(
             sheet.cell(row, column).number_format = '#,##0.00'
     sheet.freeze_panes = "A4"
     sheet.auto_filter.ref = f"A3:{sheet.cell(3, len(headers)).column_letter}{total_row - 1}"
-    widths = [13, 13, 18, 38, 22, 24, 19, 16, 22, 27, 15, 22, 15, 21, 23, 23]
+    fixed_widths = [13, 13, 18, 38, 22, 24, 19, 16]
+    widths = fixed_widths + [24] * len(category_headers) + [15, 23, 23]
     for index, width in enumerate(widths, 1):
         sheet.column_dimensions[sheet.cell(1, index).column_letter].width = width
 
