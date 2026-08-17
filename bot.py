@@ -48,11 +48,10 @@ from moysklad_price import (
 from moysklad_bonus import (
     ALL_CHANNELS,
     BonusClassification,
+    available_sales_channels,
     build_bonus_report,
-    fetch_month_documents,
     load_classification,
     month_title,
-    sales_channels,
     save_classification,
 )
 from prices_db import (
@@ -96,7 +95,6 @@ bonus_storage_path: Path
 price_updates_in_progress: set[str] = set()
 broadcasts_in_progress: set[int] = set()
 bonus_reports_in_progress: set[int] = set()
-bonus_documents_cache: dict[tuple[int, str], tuple[datetime, tuple[list[dict], list[dict]]]] = {}
 PRICE_MESSAGE_SETTING = "price_command_message"
 PRICE_ATTACHMENT_KIND_SETTING = "price_command_attachment_kind"
 PRICE_ATTACHMENT_ID_SETTING = "price_command_attachment_id"
@@ -3977,34 +3975,37 @@ async def bonus_choose_channel(callback: CallbackQuery, state: FSMContext) -> No
     await callback.answer("Получаю каналы продаж…")
     await edit_or_answer(
         callback.message,
-        "⏳ <b>Читаю проведённые документы</b>\n\n"
-        f"Период: {html.escape(month_title(month))}.",
+        "⏳ <b>Получаю каналы продаж</b>\n\n"
+        "Отгрузки и их позиции на этом этапе ещё не загружаются.",
     )
     try:
-        raw = await asyncio.to_thread(fetch_month_documents, MoySkladClient(token), month)
-        channels = sales_channels(raw)
-        bonus_documents_cache[(callback.from_user.id, month)] = (datetime.now(), raw)
+        channels = await asyncio.to_thread(
+            available_sales_channels, MoySkladClient(token)
+        )
     except Exception as error:
         logging.exception("Не удалось получить каналы продаж")
         await edit_or_answer(
             callback.message,
-            "❌ <b>Не удалось прочитать отгрузки</b>\n\n" + html.escape(str(error)),
+            "❌ <b>Не удалось получить каналы продаж</b>\n\n" + html.escape(str(error)),
             reply_markup=bonus_month_keyboard(month),
         )
         return
     if not channels:
         await edit_or_answer(
             callback.message,
-            "За выбранный месяц у проведённых документов не найдены каналы продаж.",
+            "В МоемСкладе не найдены доступные каналы продаж.",
             reply_markup=bonus_month_keyboard(month),
         )
         return
-    choices = [ALL_CHANNELS, *channels]
+    choices = [
+        {"name": ALL_CHANNELS, "href": ""},
+        *({"name": option.name, "href": option.href} for option in channels),
+    ]
     await state.update_data(bonus_month=month, bonus_channels=choices)
     rows = [[InlineKeyboardButton(
-        text=("📊 " if name == ALL_CHANNELS else "👤 ") + name,
+        text=("📊 " if choice["name"] == ALL_CHANNELS else "👤 ") + choice["name"],
         callback_data=f"bonus:run:{index}",
-    )] for index, name in enumerate(choices)]
+    )] for index, choice in enumerate(choices)]
     rows.append([InlineKeyboardButton(text="⬅️", callback_data=f"bonus:m:{month}")])
     await edit_or_answer(
         callback.message,
@@ -4022,8 +4023,10 @@ async def bonus_generate_report(callback: CallbackQuery, state: FSMContext) -> N
     month = str(data.get("bonus_month", ""))
     channels = data.get("bonus_channels", [])
     try:
-        channel = str(channels[int(callback.data.rsplit(":", 1)[1])])
-    except (ValueError, IndexError, TypeError):
+        choice = channels[int(callback.data.rsplit(":", 1)[1])]
+        channel = str(choice["name"])
+        channel_href = str(choice.get("href", ""))
+    except (ValueError, IndexError, TypeError, KeyError):
         await callback.answer("Список устарел. Выберите месяц заново.", show_alert=True)
         return
     token, _, _, _ = moysklad_settings()
@@ -4037,15 +4040,12 @@ async def bonus_generate_report(callback: CallbackQuery, state: FSMContext) -> N
         "⏳ <b>Формирую отчёт</b>\n\n"
         f"Период: <b>{html.escape(month_title(month))}</b>\n"
         f"Канал продаж: <b>{html.escape(channel)}</b>\n\n"
-        "Читаю позиции отгрузок и возвратов. Повторно нажимать кнопку не нужно.",
+        "Читаю отгрузки выбранного месяца и позиции нужного канала продаж. "
+        "Повторно нажимать кнопку не нужно.",
     )
     with tempfile.TemporaryDirectory() as temporary:
         destination = Path(temporary) / f"Премиальный отчёт {channel} {month}.xlsx"
         try:
-            cached = bonus_documents_cache.get((callback.from_user.id, month))
-            raw_documents = None
-            if cached and (datetime.now() - cached[0]).total_seconds() <= 900:
-                raw_documents = cached[1]
             result = await asyncio.to_thread(
                 build_bonus_report,
                 token,
@@ -4053,7 +4053,7 @@ async def bonus_generate_report(callback: CallbackQuery, state: FSMContext) -> N
                 channel,
                 bonus_classification_path(month),
                 destination,
-                raw_documents=raw_documents,
+                sales_channel_href=channel_href,
             )
             warning = (
                 f"\n⚠️ Неклассифицированных папок: <b>{len(result.unclassified_paths)}</b>. "
@@ -4064,8 +4064,7 @@ async def bonus_generate_report(callback: CallbackQuery, state: FSMContext) -> N
                 FSInputFile(destination, filename=destination.name),
                 caption=(
                     "📊 <b>Премиальный отчёт готов</b>\n\n"
-                    f"Отгрузок: <b>{result.shipment_count}</b>\n"
-                    f"Возвратов: <b>{result.return_count}</b>"
+                    f"Отгрузок: <b>{result.shipment_count}</b>"
                     + warning
                 ),
             )
@@ -4079,7 +4078,6 @@ async def bonus_generate_report(callback: CallbackQuery, state: FSMContext) -> N
             return
         finally:
             bonus_reports_in_progress.discard(callback.from_user.id)
-            bonus_documents_cache.pop((callback.from_user.id, month), None)
     await show_bonus_month(callback, month)
 
 

@@ -5,12 +5,14 @@ from openpyxl import Workbook, load_workbook
 
 from moysklad_bonus import (
     ALL_CHANNELS,
+    available_sales_channels,
     build_bonus_report,
     fetch_month_documents,
     leaf_folders,
     read_classification,
     save_classification,
 )
+from moysklad_price import MoySkladError
 
 
 class FakeBonusClient:
@@ -53,15 +55,60 @@ def test_channel_discovery_does_not_expand_positions():
             self.calls = []
 
         def _rows(self, endpoint, params):
-            self.calls.append((endpoint, params["expand"]))
+            self.calls.append((endpoint, params["expand"], params["filter"]))
             return []
 
     client = HeaderClient()
     assert fetch_month_documents(client, "2026-08") == ([], [])
     assert client.calls == [
-        ("entity/demand", "agent,state,salesChannel"),
-        ("entity/salesreturn", "agent,state,demand.salesChannel"),
+        (
+            "entity/demand",
+            "agent,state,salesChannel",
+            "moment>=2026-08-01 00:00:00;moment<2026-09-01 00:00:00;applicable=true",
+        ),
     ]
+    client.calls.clear()
+    fetch_month_documents(
+        client,
+        "2026-08",
+        "https://api.moysklad.ru/api/remap/1.2/entity/saleschannel/manager",
+    )
+    assert client.calls[0][2].endswith(
+        ";salesChannel=https://api.moysklad.ru/api/remap/1.2/entity/saleschannel/manager"
+    )
+
+
+def test_sales_channel_filter_falls_back_to_local_filter_on_400():
+    class FallbackClient:
+        def __init__(self):
+            self.filters = []
+
+        def _rows(self, endpoint, params):
+            self.filters.append(params["filter"])
+            if "salesChannel=" in params["filter"]:
+                raise MoySkladError("unsupported", status=400)
+            return [{"name": "shipment"}]
+
+    client = FallbackClient()
+    documents = fetch_month_documents(
+        client, "2026-08", "https://api.moysklad.ru/api/remap/1.2/entity/saleschannel/1"
+    )
+    assert documents == ([{"name": "shipment"}], [])
+    assert len(client.filters) == 2
+
+
+def test_sales_channels_are_loaded_without_shipments():
+    class ChannelClient:
+        def sales_channels(self):
+            return [
+                {"name": "Валера", "meta": {"href": "https://api.moysklad.ru/api/remap/1.2/entity/saleschannel/1"}},
+                {"name": " Андрей ", "meta": {"href": "https://api.moysklad.ru/api/remap/1.2/entity/saleschannel/2"}},
+                {"name": "Архив", "archived": True, "meta": {"href": "https://api.moysklad.ru/api/remap/1.2/entity/saleschannel/3"}},
+            ]
+
+    options = available_sales_channels(ChannelClient())
+    assert [option.name for option in options] == ["Андрей", "Валера"]
+    assert options[0].href.endswith("/2")
 
 
 def test_old_full_tree_classification_is_normalized_to_leaves(tmp_path):
@@ -120,7 +167,7 @@ def test_custom_month_categories_are_saved_and_used(tmp_path):
     workbook.close()
 
 
-def test_build_bonus_report_splits_categories_and_returns(tmp_path):
+def test_build_bonus_report_splits_categories(tmp_path):
     source = tmp_path / "mapping.xlsx"
     classification_xlsx(source)
     classification = tmp_path / "2026-08.json"
@@ -141,37 +188,24 @@ def test_build_bonus_report_splits_categories_and_returns(tmp_path):
             {"assortment": assortment("other"), "quantity": 1, "price": 60000, "discount": 0},
         ]},
     }
-    returned = {
-        "moment": "2026-08-11 10:00:00",
-        "name": "В-1",
-        "agent": {"name": "Клиент"},
-        "state": {"name": "Проведено"},
-        "demand": {"salesChannel": {"name": "Валера"}},
-        "sum": 50000,
-        "payedSum": 50000,
-        "positions": {"rows": [
-            {"assortment": assortment("oggo"), "quantity": 1, "price": 50000, "discount": 0},
-        ]},
-    }
     destination = tmp_path / "report.xlsx"
     result = build_bonus_report(
         "token", "2026-08", "Валера", classification, destination,
-        client=FakeBonusClient(), raw_documents=([demand], [returned]),
+        client=FakeBonusClient(), raw_documents=([demand], []),
     )
     assert result.shipment_count == 1
-    assert result.return_count == 1
+    assert result.return_count == 0
     assert result.unclassified_paths == ()
     workbook = load_workbook(destination, data_only=False)
     sheet = workbook["Отчёт"]
     headers = {cell.value: cell.column for cell in sheet[3]}
     assert Decimal(str(sheet.cell(4, headers["OGGO Аромы/жижи"]).value)) == Decimal("900")
     assert Decimal(str(sheet.cell(4, headers["Прочее"]).value)) == Decimal("600")
-    assert Decimal(str(sheet.cell(5, headers["OGGO Аромы/жижи"]).value)) == Decimal("-500")
     workbook.close()
 
     common_destination = tmp_path / "common-report.xlsx"
     common = build_bonus_report(
         "token", "2026-08", ALL_CHANNELS, classification, common_destination,
-        client=FakeBonusClient(), raw_documents=([demand], [returned]),
+        client=FakeBonusClient(), raw_documents=([demand], []),
     )
-    assert common.document_count == 2
+    assert common.document_count == 1

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -25,6 +26,12 @@ MAX_BONUS_CATEGORIES = 20
 class BonusClassification:
     categories: tuple[str, ...]
     folders: dict[str, str]
+
+
+@dataclass(frozen=True)
+class SalesChannelOption:
+    name: str
+    href: str
 
 
 @dataclass(frozen=True)
@@ -207,25 +214,74 @@ def load_classification(path: Path) -> BonusClassification:
     return BonusClassification(categories=categories, folders=normalized)
 
 
-def _expanded_rows(client: MoySkladClient, endpoint: str, start: str, end: str, expand: str) -> list[dict]:
+def _expanded_rows(
+    client: MoySkladClient,
+    endpoint: str,
+    start: str,
+    end: str,
+    expand: str,
+    sales_channel_href: str = "",
+) -> list[dict]:
+    filters = f"moment>={start};moment<{end};applicable=true"
+    if sales_channel_href:
+        filters += f";salesChannel={sales_channel_href}"
     return client._rows(
         endpoint,
         {
             "limit": 100,
-            "filter": f"moment>={start};moment<{end};applicable=true",
+            "filter": filters,
             "expand": expand,
         },
     )
 
 
-def fetch_month_documents(client: MoySkladClient, month: str) -> tuple[list[dict], list[dict]]:
+def fetch_month_documents(
+    client: MoySkladClient,
+    month: str,
+    sales_channel_href: str = "",
+) -> tuple[list[dict], list[dict]]:
     start, end = month_bounds(month)
     # Positions are intentionally not expanded here. This first, lightweight
     # request is used to choose a sales channel. Position rows are fetched only
     # for documents included in the requested report.
-    demands = _expanded_rows(client, "entity/demand", start, end, "agent,state,salesChannel")
-    returns = _expanded_rows(client, "entity/salesreturn", start, end, "agent,state,demand.salesChannel")
-    return demands, returns
+    try:
+        demands = _expanded_rows(
+            client,
+            "entity/demand",
+            start,
+            end,
+            "agent,state,salesChannel",
+            sales_channel_href,
+        )
+    except MoySkladError as error:
+        # Some account revisions may not accept filtering demands by a sales
+        # channel. Fall back to lightweight headers and filter locally; product
+        # positions are still fetched only for the selected manager.
+        if not sales_channel_href or error.status != 400:
+            raise
+        demands = _expanded_rows(
+            client, "entity/demand", start, end, "agent,state,salesChannel"
+        )
+    # The API user may intentionally have no permission to view customer
+    # returns. Bonus reports therefore operate on shipments only.
+    return demands, []
+
+
+def available_sales_channels(client: MoySkladClient) -> tuple[SalesChannelOption, ...]:
+    options = {
+        (
+            str(row.get("name", "")).strip(),
+            _canonical_href(str(row.get("meta", {}).get("href", ""))),
+        )
+        for row in client.sales_channels()
+        if not row.get("archived")
+        and str(row.get("name", "")).strip()
+        and str(row.get("meta", {}).get("href", "")).strip()
+    }
+    return tuple(
+        SalesChannelOption(name=name, href=href)
+        for name, href in sorted(options, key=lambda row: row[0].casefold())
+    )
 
 
 def _name(value: object, default: str = "—") -> str:
@@ -298,38 +354,46 @@ def prepare_documents(
         category for category in classification.categories
         if category != EXCLUDED_CATEGORY
     )
-    for kind, rows, sign in (("Отгрузка", raw[0], Decimal(1)), ("Возврат", raw[1], Decimal(-1))):
-        for document in rows:
-            document_channel = _channel(document)
-            if channel != ALL_CHANNELS and document_channel.casefold() != channel.casefold():
-                continue
-            amounts = {category: Decimal(0) for category in report_categories}
-            amounts[OTHER_CATEGORY] = Decimal(0)
-            amounts[UNCLASSIFIED_CATEGORY] = Decimal(0)
-            for position in _document_positions(document, client):
-                assortment = position.get("assortment", {})
-                href = _canonical_href(str(assortment.get("meta", {}).get("href", "")))
-                folder_path = assortment_paths.get(href, "")
-                category = classification.folders.get(folder_path.casefold()) if folder_path else None
-                value = _position_sum(position) * sign
-                if category in amounts:
-                    amounts[category] += value
-                elif category == EXCLUDED_CATEGORY:
-                    amounts[OTHER_CATEGORY] += value
-                else:
-                    amounts[UNCLASSIFIED_CATEGORY] += value
-                    unknown.add(folder_path or "Без папки")
-            result.append(BonusDocument(
-                kind=kind,
-                moment=str(document.get("moment", "")),
-                name=str(document.get("name", "")),
-                agent=_name(document.get("agent")),
-                state=_name(document.get("state")),
-                sales_channel=document_channel,
-                total=_minor_money(document.get("sum")) * sign,
-                paid=_minor_money(document.get("payedSum")) * sign,
-                categories=amounts,
-            ))
+    selected = []
+    for document in raw[0]:
+        document_channel = _channel(document)
+        if channel == ALL_CHANNELS or document_channel.casefold() == channel.casefold():
+            selected.append(document)
+    # Position endpoints are independent. A small bounded pool considerably
+    # reduces report time without creating an aggressive burst against the API.
+    with ThreadPoolExecutor(max_workers=min(4, max(1, len(selected)))) as executor:
+        position_sets = list(executor.map(
+            lambda document: _document_positions(document, client), selected
+        ))
+    for document, positions in zip(selected, position_sets):
+        document_channel = _channel(document)
+        amounts = {category: Decimal(0) for category in report_categories}
+        amounts[OTHER_CATEGORY] = Decimal(0)
+        amounts[UNCLASSIFIED_CATEGORY] = Decimal(0)
+        for position in positions:
+            assortment = position.get("assortment", {})
+            href = _canonical_href(str(assortment.get("meta", {}).get("href", "")))
+            folder_path = assortment_paths.get(href, "")
+            category = classification.folders.get(folder_path.casefold()) if folder_path else None
+            value = _position_sum(position)
+            if category in amounts:
+                amounts[category] += value
+            elif category == EXCLUDED_CATEGORY:
+                amounts[OTHER_CATEGORY] += value
+            else:
+                amounts[UNCLASSIFIED_CATEGORY] += value
+                unknown.add(folder_path or "Без папки")
+        result.append(BonusDocument(
+            kind="Отгрузка",
+            moment=str(document.get("moment", "")),
+            name=str(document.get("name", "")),
+            agent=_name(document.get("agent")),
+            state=_name(document.get("state")),
+            sales_channel=document_channel,
+            total=_minor_money(document.get("sum")),
+            paid=_minor_money(document.get("payedSum")),
+            categories=amounts,
+        ))
     result.sort(key=lambda row: (row.moment, row.kind, row.name))
     return result, unknown
 
@@ -341,12 +405,13 @@ def build_bonus_report(
     classification_path: Path,
     destination: Path,
     *,
+    sales_channel_href: str = "",
     client: MoySkladClient | None = None,
     raw_documents: tuple[list[dict], list[dict]] | None = None,
 ) -> BonusReportResult:
     client = client or MoySkladClient(token)
     classification = load_classification(classification_path)
-    raw = raw_documents or fetch_month_documents(client, month)
+    raw = raw_documents or fetch_month_documents(client, month, sales_channel_href)
     documents, unknown = prepare_documents(client, raw, classification, channel)
     if not documents:
         raise MoySkladError(f"За {month_title(month)} по каналу продаж «{channel}» проведённых документов не найдено.")
@@ -367,7 +432,6 @@ def build_bonus_report(
     ]
     sheet.append(headers)
     blue = PatternFill("solid", fgColor="2F5597")
-    return_fill = PatternFill("solid", fgColor="FCE4D6")
     total_fill = PatternFill("solid", fgColor="D9EAD3")
     for cell in sheet[3]:
         cell.font = Font(bold=True, color="FFFFFF")
@@ -389,9 +453,6 @@ def build_bonus_report(
             float(document.categories[UNCLASSIFIED_CATEGORY]),
             float(document.total - categorized),
         ])
-        if document.kind == "Возврат":
-            for cell in sheet[sheet.max_row]:
-                cell.fill = return_fill
     first_data_row = 4
     total_row = sheet.max_row + 1
     sheet.cell(total_row, 1, "ИТОГО")

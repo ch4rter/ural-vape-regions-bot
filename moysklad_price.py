@@ -190,6 +190,9 @@ class MoySkladClient:
     def product_folders(self) -> list[dict]:
         return self._rows("entity/productfolder")
 
+    def sales_channels(self) -> list[dict]:
+        return self._rows("entity/saleschannel")
+
 
 def build_product_folder_mapping(
     token: str,
