@@ -40,9 +40,18 @@ from crm_db import CRMDatabase
 from google_crm import GoogleCRM
 from materials_db import Material, MaterialsDB
 from moysklad_price import (
+    MoySkladClient,
     MoySkladError,
     build_price_from_moysklad,
     build_product_folder_mapping,
+)
+from moysklad_bonus import (
+    build_bonus_report,
+    fetch_month_documents,
+    load_classification,
+    month_title,
+    sales_channels,
+    save_classification,
 )
 from prices_db import (
     PRICE_SOURCE,
@@ -81,6 +90,7 @@ crm_beta_ids: set[int] = {5533726476}
 active_excel_path: Path
 managed_excel_path: Path
 price_storage_path: Path
+bonus_storage_path: Path
 price_updates_in_progress: set[str] = set()
 broadcasts_in_progress: set[int] = set()
 PRICE_MESSAGE_SETTING = "price_command_message"
@@ -133,6 +143,7 @@ class AdminState(StatesGroup):
     region_territory = State()
     region_location = State()
     region_manager = State()
+    bonus_classification_upload = State()
 
 
 class BroadcastState(StatesGroup):
@@ -3043,6 +3054,7 @@ def products_keyboard(
             InlineKeyboardButton(text="🗺 Регионы", callback_data="adm:regions"),
             InlineKeyboardButton(text="✏️ Текст /прайс", callback_data="adm:price_message"),
             InlineKeyboardButton(text="📝 Анкеты клиентов", callback_data="adm:leads"),
+            InlineKeyboardButton(text="📈 Премиальный отчёт", callback_data="bonus:menu"),
         ]))
         rows.append([InlineKeyboardButton(text="💾 Скачать резервную копию", callback_data="adm:backup")])
     if include_navigation:
@@ -3706,10 +3718,6 @@ def price_admin_keyboard() -> InlineKeyboardMarkup:
         text="🔄 Сформировать из МоегоСклада",
         callback_data="adm:moysklad_price",
     )])
-    rows.append([InlineKeyboardButton(
-        text="📂 Папки для классификации",
-        callback_data="adm:moysklad_folders",
-    )])
     rows.append(compact_nav("main:admin"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -3756,6 +3764,298 @@ def moysklad_settings() -> tuple[str, tuple[str, ...], str, str]:
         os.getenv("MOYSKLAD_CASH_PRICE_TYPE", "").strip(),
         os.getenv("MOYSKLAD_CASHLESS_PRICE_TYPE", "").strip(),
     )
+
+
+def bonus_classification_path(month: str) -> Path:
+    return bonus_storage_path / "classifications" / f"{month}.json"
+
+
+def bonus_months_keyboard() -> InlineKeyboardMarkup:
+    current = datetime.now().replace(day=1)
+    buttons = []
+    year, number = current.year, current.month
+    for _ in range(12):
+        month = f"{year:04d}-{number:02d}"
+        marker = "✅ " if bonus_classification_path(month).exists() else ""
+        buttons.append(InlineKeyboardButton(
+            text=marker + month_title(month).capitalize(),
+            callback_data=f"bonus:m:{month}",
+        ))
+        number -= 1
+        if number == 0:
+            year -= 1
+            number = 12
+    rows = button_grid(buttons)
+    rows.append(compact_nav("main:admin"))
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def bonus_month_keyboard(month: str) -> InlineKeyboardMarkup:
+    configured = bonus_classification_path(month).exists()
+    rows = [
+        [InlineKeyboardButton(
+            text="⬇️ Скачать таблицу категорий",
+            callback_data=f"bonus:export:{month}",
+        )],
+        [InlineKeyboardButton(
+            text="⬆️ Загрузить таблицу категорий",
+            callback_data=f"bonus:upload:{month}",
+        )],
+    ]
+    if configured:
+        rows.append([InlineKeyboardButton(
+            text="📊 Сформировать отчёт",
+            callback_data=f"bonus:channels:{month}",
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️", callback_data="bonus:menu")])
+    rows.append(compact_nav("main:admin"))
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def show_bonus_month(callback: CallbackQuery, month: str) -> None:
+    configured = bonus_classification_path(month).exists()
+    status = "✅ Категории загружены" if configured else "⚠️ Категории ещё не загружены"
+    await edit_or_answer(
+        callback.message,
+        "📈 <b>Премиальный отчёт</b>\n\n"
+        f"Период: <b>{html.escape(month_title(month))}</b>\n"
+        f"{status}\n\n"
+        "Классификация хранится отдельно для каждого месяца. Таблица содержит только "
+        "конечные товарные папки МоегоСклада.",
+        reply_markup=bonus_month_keyboard(month),
+    )
+
+
+@router.callback_query(F.data == "bonus:menu")
+async def bonus_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin(callback):
+        return
+    await state.clear()
+    await edit_or_answer(
+        callback.message,
+        "📈 <b>Премиальные отчёты</b>\n\n"
+        "Выберите месяц. Галочка означает, что для него уже сохранена классификация товаров.",
+        reply_markup=bonus_months_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("bonus:m:"))
+async def bonus_open_month(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin(callback):
+        return
+    month = callback.data.rsplit(":", 1)[1]
+    await state.clear()
+    await show_bonus_month(callback, month)
+    await callback.answer()
+
+
+def previous_bonus_mapping(month: str) -> dict[str, str]:
+    current_path = bonus_classification_path(month)
+    if current_path.exists():
+        return load_classification(current_path)
+    directory = current_path.parent
+    candidates = sorted(
+        (path for path in directory.glob("????-??.json") if path.stem < month),
+        reverse=True,
+    ) if directory.exists() else []
+    return load_classification(candidates[0]) if candidates else {}
+
+
+@router.callback_query(F.data.startswith("bonus:export:"))
+async def bonus_export_classification(callback: CallbackQuery) -> None:
+    if not await require_admin(callback):
+        return
+    month = callback.data.rsplit(":", 1)[1]
+    token, _, _, _ = moysklad_settings()
+    if not token:
+        await callback.answer("Сначала добавьте MOYSKLAD_TOKEN в .env.", show_alert=True)
+        return
+    await callback.answer("Получаю конечные папки из МоегоСклада…")
+    await edit_or_answer(
+        callback.message,
+        "⏳ <b>Готовлю таблицу категорий</b>\n\n"
+        "Читаю актуальные конечные папки товаров. Это может занять некоторое время.",
+    )
+    with tempfile.TemporaryDirectory() as temporary:
+        destination = Path(temporary) / f"Категории {month}.xlsx"
+        try:
+            mapping = previous_bonus_mapping(month)
+            count = await asyncio.to_thread(
+                build_product_folder_mapping,
+                token,
+                destination,
+                categories=mapping,
+            )
+            await callback.message.answer_document(
+                FSInputFile(destination, filename=destination.name),
+                caption=(
+                    f"📂 <b>Классификация за {html.escape(month_title(month))}</b>\n\n"
+                    f"Конечных папок: <b>{count}</b>. Проверьте категории и загрузите файл обратно. "
+                    "Если это новый месяц, значения перенесены из последней сохранённой классификации."
+                ),
+            )
+        except Exception as error:
+            logging.exception("Не удалось сформировать помесячную классификацию")
+            await edit_or_answer(
+                callback.message,
+                "❌ <b>Не удалось получить папки</b>\n\n" + html.escape(str(error)),
+                reply_markup=bonus_month_keyboard(month),
+            )
+            return
+    await show_bonus_month(callback, month)
+
+
+@router.callback_query(F.data.startswith("bonus:upload:"))
+async def bonus_start_classification_upload(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin(callback):
+        return
+    month = callback.data.rsplit(":", 1)[1]
+    await state.set_state(AdminState.bonus_classification_upload)
+    await state.update_data(bonus_month=month)
+    await edit_or_answer(
+        callback.message,
+        "⬆️ <b>Загрузка классификации</b>\n\n"
+        f"Отправьте заполненный файл <code>.xlsx</code> за {html.escape(month_title(month))}. "
+        "Существующая классификация этого месяца будет заменена только после успешной проверки.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"bonus:m:{month}")]
+        ]),
+    )
+    await callback.answer()
+
+
+@router.message(AdminState.bonus_classification_upload)
+async def bonus_receive_classification(message: Message, state: FSMContext, bot: Bot) -> None:
+    if not is_admin(message.from_user.id) or message.chat.type != "private":
+        return
+    data = await state.get_data()
+    month = str(data.get("bonus_month", ""))
+    if not message.document or not (message.document.file_name or "").lower().endswith(".xlsx"):
+        await message.answer("⚠️ Отправьте таблицу как документ в формате <code>.xlsx</code>.")
+        return
+    with tempfile.TemporaryDirectory() as temporary:
+        source = Path(temporary) / "classification.xlsx"
+        try:
+            await bot.download(message.document.file_id, destination=source)
+            count = await asyncio.to_thread(
+                save_classification, source, bonus_classification_path(month)
+            )
+        except Exception as error:
+            logging.warning("Отклонена классификация за %s: %s", month, error)
+            await message.answer(
+                "❌ <b>Таблица не прошла проверку</b>\n\n" + html.escape(str(error))
+            )
+            return
+    await state.clear()
+    await message.answer(
+        "✅ <b>Классификация сохранена</b>\n\n"
+        f"Период: <b>{html.escape(month_title(month))}</b>\n"
+        f"Размечено конечных папок: <b>{count}</b>.",
+        reply_markup=bonus_month_keyboard(month),
+    )
+
+
+@router.callback_query(F.data.startswith("bonus:channels:"))
+async def bonus_choose_channel(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin(callback):
+        return
+    month = callback.data.rsplit(":", 1)[1]
+    token, _, _, _ = moysklad_settings()
+    if not token:
+        await callback.answer("Сначала добавьте MOYSKLAD_TOKEN в .env.", show_alert=True)
+        return
+    await callback.answer("Получаю каналы продаж…")
+    await edit_or_answer(
+        callback.message,
+        "⏳ <b>Читаю проведённые документы</b>\n\n"
+        f"Период: {html.escape(month_title(month))}.",
+    )
+    try:
+        raw = await asyncio.to_thread(fetch_month_documents, MoySkladClient(token), month)
+        channels = sales_channels(raw)
+    except Exception as error:
+        logging.exception("Не удалось получить каналы продаж")
+        await edit_or_answer(
+            callback.message,
+            "❌ <b>Не удалось прочитать отгрузки</b>\n\n" + html.escape(str(error)),
+            reply_markup=bonus_month_keyboard(month),
+        )
+        return
+    if not channels:
+        await edit_or_answer(
+            callback.message,
+            "За выбранный месяц у проведённых документов не найдены каналы продаж.",
+            reply_markup=bonus_month_keyboard(month),
+        )
+        return
+    await state.update_data(bonus_month=month, bonus_channels=list(channels))
+    rows = [[InlineKeyboardButton(text=name, callback_data=f"bonus:run:{index}")]
+            for index, name in enumerate(channels)]
+    rows.append([InlineKeyboardButton(text="⬅️", callback_data=f"bonus:m:{month}")])
+    await edit_or_answer(
+        callback.message,
+        "👤 <b>Выберите менеджера</b>\n\n"
+        "Список получен из поля «Канал продаж» в проведённых документах.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.callback_query(F.data.startswith("bonus:run:"))
+async def bonus_generate_report(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin(callback):
+        return
+    data = await state.get_data()
+    month = str(data.get("bonus_month", ""))
+    channels = data.get("bonus_channels", [])
+    try:
+        channel = str(channels[int(callback.data.rsplit(":", 1)[1])])
+    except (ValueError, IndexError, TypeError):
+        await callback.answer("Список устарел. Выберите месяц заново.", show_alert=True)
+        return
+    token, _, _, _ = moysklad_settings()
+    await callback.answer("Формирую отчёт…")
+    await edit_or_answer(
+        callback.message,
+        "⏳ <b>Формирую отчёт</b>\n\n"
+        f"Период: <b>{html.escape(month_title(month))}</b>\n"
+        f"Канал продаж: <b>{html.escape(channel)}</b>\n\n"
+        "Читаю позиции отгрузок и возвратов. Повторно нажимать кнопку не нужно.",
+    )
+    with tempfile.TemporaryDirectory() as temporary:
+        destination = Path(temporary) / f"Премиальный отчёт {channel} {month}.xlsx"
+        try:
+            result = await asyncio.to_thread(
+                build_bonus_report,
+                token,
+                month,
+                channel,
+                bonus_classification_path(month),
+                destination,
+            )
+            warning = (
+                f"\n⚠️ Неклассифицированных папок: <b>{len(result.unclassified_paths)}</b>. "
+                "Они вынесены на отдельный лист."
+                if result.unclassified_paths else "\n✅ Все товарные папки классифицированы."
+            )
+            await callback.message.answer_document(
+                FSInputFile(destination, filename=destination.name),
+                caption=(
+                    "📊 <b>Премиальный отчёт готов</b>\n\n"
+                    f"Отгрузок: <b>{result.shipment_count}</b>\n"
+                    f"Возвратов: <b>{result.return_count}</b>"
+                    + warning
+                ),
+            )
+        except Exception as error:
+            logging.exception("Не удалось сформировать премиальный отчёт")
+            await edit_or_answer(
+                callback.message,
+                "❌ <b>Не удалось сформировать отчёт</b>\n\n" + html.escape(str(error)),
+                reply_markup=bonus_month_keyboard(month),
+            )
+            return
+    await show_bonus_month(callback, month)
 
 
 @router.callback_query(F.data == "adm:moysklad_folders")
@@ -4786,7 +5086,7 @@ async def outside_mode(message: Message) -> None:
 async def main() -> None:
     global catalog, materials_db, prices_db, crm_database, admin_ids
     global crm_beta_ids
-    global active_excel_path, managed_excel_path, price_storage_path
+    global active_excel_path, managed_excel_path, price_storage_path, bonus_storage_path
     load_dotenv(BASE_DIR / ".env")
     token = os.getenv("BOT_TOKEN", "").strip()
     if not token:
@@ -4796,11 +5096,14 @@ async def main() -> None:
     db_path = Path(os.getenv("MATERIALS_DB", "data/materials.sqlite3"))
     prices_db_path = Path(os.getenv("PRICES_DB", "data/prices.sqlite3"))
     price_storage_path = Path(os.getenv("PRICE_STORAGE", "data/prices"))
+    bonus_storage_path = Path(os.getenv("MOYSKLAD_BONUS_STORAGE", "data/moysklad_bonus"))
     if not excel_path.is_absolute(): excel_path = BASE_DIR / excel_path
     if not managed_excel_path.is_absolute(): managed_excel_path = BASE_DIR / managed_excel_path
     if not db_path.is_absolute(): db_path = BASE_DIR / db_path
     if not prices_db_path.is_absolute(): prices_db_path = BASE_DIR / prices_db_path
     if not price_storage_path.is_absolute(): price_storage_path = BASE_DIR / price_storage_path
+    if not bonus_storage_path.is_absolute(): bonus_storage_path = BASE_DIR / bonus_storage_path
+    bonus_storage_path.mkdir(parents=True, exist_ok=True)
     admin_ids = {int(value.strip()) for value in os.getenv("ADMIN_IDS", "5533726476").split(",") if value.strip()}
     crm_beta_ids = {
         int(value.strip())

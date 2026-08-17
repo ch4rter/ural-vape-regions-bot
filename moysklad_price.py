@@ -180,11 +180,12 @@ def build_product_folder_mapping(
     destination: Path,
     *,
     client: MoySkladClient | None = None,
+    categories: dict[str, str] | None = None,
 ) -> int:
-    """Export the MoySklad folder tree for manual bonus-category mapping."""
+    """Export only terminal MoySklad folders for manual category mapping."""
     client = client or MoySkladClient(token)
     folders = client.product_folders()
-    rows = []
+    active_rows = []
     for folder in folders:
         if folder.get("archived") is True:
             continue
@@ -193,7 +194,12 @@ def build_product_folder_mapping(
         if not name:
             continue
         full_path = f"{parent_path}/{name}" if parent_path else name
-        rows.append((full_path, str(folder.get("id", "")).strip()))
+        active_rows.append((full_path, str(folder.get("id", "")).strip()))
+    all_paths = {row[0].casefold() for row in active_rows}
+    rows = [
+        row for row in active_rows
+        if not any(path.startswith(row[0].casefold() + "/") for path in all_paths)
+    ]
     rows = sorted(set(rows), key=lambda row: row[0].casefold())
     if not rows:
         raise MoySkladError("В МоемСкладе не найдены активные папки товаров.")
@@ -204,7 +210,6 @@ def build_product_folder_mapping(
     headers = [
         "Полный путь папки",
         "Категория",
-        "Включать вложенные папки",
         "Комментарий",
         "ID папки МоегоСклада",
     ]
@@ -214,14 +219,14 @@ def build_product_folder_mapping(
         cell.fill = PatternFill("solid", fgColor="2F5597")
         cell.alignment = Alignment(horizontal="center", vertical="center")
     for full_path, folder_id in rows:
-        sheet.append([full_path, "", "Да", "", folder_id])
+        category = (categories or {}).get(full_path.casefold(), "")
+        sheet.append([full_path, category, "", folder_id])
     sheet.freeze_panes = "A2"
-    sheet.auto_filter.ref = f"A1:E{sheet.max_row}"
+    sheet.auto_filter.ref = f"A1:D{sheet.max_row}"
     sheet.column_dimensions["A"].width = 85
     sheet.column_dimensions["B"].width = 32
-    sheet.column_dimensions["C"].width = 28
-    sheet.column_dimensions["D"].width = 45
-    sheet.column_dimensions["E"].width = 40
+    sheet.column_dimensions["C"].width = 45
+    sheet.column_dimensions["D"].width = 40
 
     guide = workbook.create_sheet("Справочник")
     guide.append(["Допустимые категории"])
@@ -241,10 +246,6 @@ def build_product_folder_mapping(
     validation.promptTitle = "Категория"
     sheet.add_data_validation(validation)
     validation.add(f"B2:B{sheet.max_row}")
-    yes_no = DataValidation(type="list", formula1='"Да,Нет"', allow_blank=False)
-    sheet.add_data_validation(yes_no)
-    yes_no.add(f"C2:C{sheet.max_row}")
-
     destination.parent.mkdir(parents=True, exist_ok=True)
     workbook.save(destination)
     workbook.close()

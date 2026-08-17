@@ -165,14 +165,13 @@ def test_builds_product_folder_mapping_from_moysklad(tmp_path):
         "test-token", destination, client=FakeFolderClient()
     )
 
-    assert count == 2
+    assert count == 1
     workbook = load_workbook(destination)
     sheet = workbook["Классификация папок"]
     values = list(sheet.iter_rows(min_row=2, values_only=True))
-    assert ("ЭС", None, "Да", None, "root") in values
-    assert ("ЭС/Жидкости", None, "Да", None, "liquids") in values
+    assert values == [("ЭС/Жидкости", None, None, "liquids")]
     assert sheet.freeze_panes == "A2"
-    assert len(sheet.data_validations.dataValidation) == 2
+    assert len(sheet.data_validations.dataValidation) == 1
     guide_values = [cell.value for cell in workbook["Справочник"]["A"]][1:]
     assert guide_values == list(BONUS_CATEGORIES)
     workbook.close()
