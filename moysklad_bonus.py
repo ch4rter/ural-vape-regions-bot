@@ -10,7 +10,9 @@ from decimal import Decimal
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.chart import BarChart, Reference
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 
 from moysklad_price import BONUS_CATEGORIES, MoySkladClient, MoySkladError, _canonical_href
 
@@ -450,7 +452,7 @@ def _fill_detail_sheet(
     total_row = sheet.max_row + 1
     sheet.cell(total_row, 1, "ИТОГО")
     for column in range(7, len(headers) + 1):
-        letter = sheet.cell(1, column).column_letter
+        letter = get_column_letter(column)
         sheet.cell(total_row, column, f"=SUM({letter}{first_data_row}:{letter}{total_row - 1})")
     for cell in sheet[total_row]:
         cell.font = Font(bold=True)
@@ -483,56 +485,220 @@ def _fill_summary_sheet(
     documents: list[BonusDocument],
     category_headers: list[str],
     month: str,
+    channel: str,
 ) -> None:
-    headers = [
-        "Менеджер", "Отгрузок", "Сумма отгрузок", "Оплачено",
-        *category_headers, OTHER_CATEGORY, UNCLASSIFIED_CATEGORY,
-        "Контрольное расхождение",
+    dark_blue = PatternFill("solid", fgColor="1F4E78")
+    blue = PatternFill("solid", fgColor="5B9BD5")
+    light_blue = PatternFill("solid", fgColor="DDEBF7")
+    green = PatternFill("solid", fgColor="E2F0D9")
+    white_font = Font(bold=True, color="FFFFFF")
+    thin_gray = Side(style="thin", color="D9E1F2")
+    table_border = Border(bottom=thin_gray)
+    money_format = '#,##0.00'
+
+    total = sum((row.total for row in documents), Decimal(0))
+    paid = sum((row.paid for row in documents), Decimal(0))
+    agents = {row.agent.casefold() for row in documents if row.agent and row.agent != "—"}
+    average = total / len(documents) if documents else Decimal(0)
+    report_name = "Все менеджеры" if channel == ALL_CHANNELS else channel
+
+    last_column = max(8, 7 + len(category_headers))
+    last_letter = sheet.cell(1, last_column).column_letter
+    sheet.merge_cells(f"A1:{last_letter}1")
+    sheet["A1"] = "ПРЕМИАЛЬНЫЙ ОТЧЁТ"
+    sheet["A1"].font = Font(bold=True, color="FFFFFF", size=16)
+    sheet["A1"].fill = dark_blue
+    sheet["A1"].alignment = Alignment(horizontal="center", vertical="center")
+    sheet.row_dimensions[1].height = 30
+    sheet["A2"] = "Период"
+    sheet["B2"] = month_title(month).capitalize()
+    sheet["D2"] = "Канал продаж"
+    sheet["E2"] = report_name
+    for coordinate in ("A2", "D2"):
+        sheet[coordinate].font = Font(bold=True, color="1F4E78")
+
+    metrics = [
+        ("Отгрузок", len(documents), "0"),
+        ("Контрагентов", len(agents), "0"),
+        ("Сумма отгрузок", float(total), money_format),
+        ("Оплачено", float(paid), money_format),
+        ("Задолженность", float(total - paid), money_format),
+        ("Средний чек", float(average), money_format),
     ]
-    sheet.append(["Сводка по менеджерам", month_title(month)])
-    sheet.append([])
-    sheet.append(headers)
-    blue = PatternFill("solid", fgColor="2F5597")
-    green = PatternFill("solid", fgColor="D9EAD3")
-    for cell in sheet[3]:
-        cell.font = Font(bold=True, color="FFFFFF")
+    for index, (label, value, number_format) in enumerate(metrics, 1):
+        cell = sheet.cell(4, index)
+        cell.value = label
+        cell.font = white_font
         cell.fill = blue
+        cell.alignment = Alignment(horizontal="center")
+        value_cell = sheet.cell(5, index)
+        value_cell.value = value
+        value_cell.font = Font(bold=True, color="1F4E78", size=12)
+        value_cell.fill = light_blue
+        value_cell.alignment = Alignment(horizontal="center")
+        value_cell.number_format = number_format
+
+    manager_headers = [
+        "Менеджер", "Контрагентов", "Отгрузок", "Сумма", "Оплачено", "Задолженность",
+        "Средний чек", *category_headers, OTHER_CATEGORY, UNCLASSIFIED_CATEGORY,
+    ]
+    manager_start = 8
+    sheet.cell(manager_start, 1, "Сводка по менеджерам")
+    sheet.cell(manager_start, 1).font = Font(bold=True, color="1F4E78", size=12)
+    manager_header_row = manager_start + 1
+    for column, header in enumerate(manager_headers, 1):
+        cell = sheet.cell(manager_header_row, column, header)
+        cell.font = white_font
+        cell.fill = dark_blue
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
     grouped: dict[str, list[BonusDocument]] = {}
     for document in documents:
         grouped.setdefault(document.sales_channel or "Без канала", []).append(document)
+    manager_first_row = manager_header_row + 1
     for manager in sorted(grouped, key=str.casefold):
         rows = grouped[manager]
-        category_totals = {
-            category: sum((row.categories[category] for row in rows), Decimal(0))
+        manager_total = sum((row.total for row in rows), Decimal(0))
+        manager_paid = sum((row.paid for row in rows), Decimal(0))
+        category_totals = [
+            sum((row.categories[category] for row in rows), Decimal(0))
             for category in category_headers
-        }
-        other = sum((row.categories[OTHER_CATEGORY] for row in rows), Decimal(0))
-        unclassified = sum((row.categories[UNCLASSIFIED_CATEGORY] for row in rows), Decimal(0))
-        total = sum((row.total for row in rows), Decimal(0))
-        categorized = sum(category_totals.values(), Decimal(0)) + other + unclassified
+        ]
         sheet.append([
-            manager, len(rows), float(total),
-            float(sum((row.paid for row in rows), Decimal(0))),
-            *(float(category_totals[category]) for category in category_headers),
-            float(other), float(unclassified), float(total - categorized),
+            manager,
+            len({row.agent.casefold() for row in rows if row.agent and row.agent != "—"}),
+            len(rows), float(manager_total), float(manager_paid),
+            float(manager_total - manager_paid),
+            float(manager_total / len(rows) if rows else 0),
+            *(float(value) for value in category_totals),
+            float(sum((row.categories[OTHER_CATEGORY] for row in rows), Decimal(0))),
+            float(sum((row.categories[UNCLASSIFIED_CATEGORY] for row in rows), Decimal(0))),
         ])
-    total_row = sheet.max_row + 1
-    sheet.cell(total_row, 1, "ИТОГО")
-    for column in range(2, len(headers) + 1):
-        letter = sheet.cell(1, column).column_letter
-        sheet.cell(total_row, column, f"=SUM({letter}4:{letter}{total_row - 1})")
-    for cell in sheet[total_row]:
+    manager_total_row = sheet.max_row + 1
+    sheet.cell(manager_total_row, 1, "ИТОГО")
+    sheet.cell(manager_total_row, 2, len(agents))
+    for column in range(3, len(manager_headers) + 1):
+        letter = get_column_letter(column)
+        sheet.cell(manager_total_row, column, f"=SUM({letter}{manager_first_row}:{letter}{manager_total_row - 1})")
+    sheet.cell(manager_total_row, 7, f"=IFERROR(D{manager_total_row}/C{manager_total_row},0)")
+    for cell in sheet[manager_total_row]:
         cell.font = Font(bold=True)
         cell.fill = green
-    for row in range(4, total_row + 1):
-        for column in range(3, len(headers) + 1):
-            sheet.cell(row, column).number_format = '#,##0.00'
-    sheet.freeze_panes = "A4"
-    sheet.auto_filter.ref = f"A3:{sheet.cell(3, len(headers)).column_letter}{total_row - 1}"
-    widths = [28, 13, 20, 18] + [24] * len(category_headers) + [15, 23, 23]
+
+    category_start = manager_total_row + 3
+    sheet.cell(category_start, 1, "Продажи по категориям")
+    sheet.cell(category_start, 1).font = Font(bold=True, color="1F4E78", size=12)
+    category_header_row = category_start + 1
+    for column, header in enumerate(("Категория", "Сумма", "Доля продаж", "Контрагентов"), 1):
+        cell = sheet.cell(category_header_row, column, header)
+        cell.font = white_font
+        cell.fill = dark_blue
+        cell.alignment = Alignment(horizontal="center")
+    all_categories = [*category_headers, OTHER_CATEGORY, UNCLASSIFIED_CATEGORY]
+    category_first_row = category_header_row + 1
+    for category in all_categories:
+        amount = sum((row.categories[category] for row in documents), Decimal(0))
+        buyers = {
+            (row.sales_channel.casefold(), row.agent.casefold())
+            for row in documents
+            if row.categories[category] != 0
+        }
+        sheet.append([
+            category, float(amount), float(amount / total if total else 0), len(buyers)
+        ])
+
+    counterparty_start = sheet.max_row + 3
+    sheet.cell(counterparty_start, 1, "Статистика по контрагентам")
+    sheet.cell(counterparty_start, 1).font = Font(bold=True, color="1F4E78", size=12)
+    include_manager = channel == ALL_CHANNELS
+    counterparty_headers = ["Контрагент"]
+    if include_manager:
+        counterparty_headers.append("Менеджер")
+    counterparty_headers.extend([
+        "Отгрузок", "Сумма", "Оплачено", "Задолженность", "Средний чек",
+        *category_headers, OTHER_CATEGORY, UNCLASSIFIED_CATEGORY,
+    ])
+    counterparty_header_row = counterparty_start + 1
+    for column, header in enumerate(counterparty_headers, 1):
+        cell = sheet.cell(counterparty_header_row, column, header)
+        cell.font = white_font
+        cell.fill = dark_blue
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    counterparties: dict[tuple[str, str], list[BonusDocument]] = {}
+    for document in documents:
+        key = (document.sales_channel.casefold() if include_manager else "", document.agent.casefold())
+        counterparties.setdefault(key, []).append(document)
+    ordered_counterparties = sorted(
+        counterparties.values(),
+        key=lambda rows: (-sum((row.total for row in rows), Decimal(0)), rows[0].agent.casefold()),
+    )
+    counterparty_first_row = counterparty_header_row + 1
+    for rows in ordered_counterparties:
+        client_total = sum((row.total for row in rows), Decimal(0))
+        client_paid = sum((row.paid for row in rows), Decimal(0))
+        values: list[object] = [rows[0].agent]
+        if include_manager:
+            values.append(rows[0].sales_channel or "Без канала")
+        values.extend([
+            len(rows), float(client_total), float(client_paid), float(client_total - client_paid),
+            float(client_total / len(rows) if rows else 0),
+            *(float(sum((row.categories[category] for row in rows), Decimal(0))) for category in category_headers),
+            float(sum((row.categories[OTHER_CATEGORY] for row in rows), Decimal(0))),
+            float(sum((row.categories[UNCLASSIFIED_CATEGORY] for row in rows), Decimal(0))),
+        ])
+        sheet.append(values)
+    counterparty_total_row = sheet.max_row + 1
+    sheet.cell(counterparty_total_row, 1, "ИТОГО")
+    orders_column = 3 if include_manager else 2
+    for column in range(orders_column, len(counterparty_headers) + 1):
+        letter = get_column_letter(column)
+        sheet.cell(counterparty_total_row, column, f"=SUM({letter}{counterparty_first_row}:{letter}{counterparty_total_row - 1})")
+    average_column = 7 if include_manager else 6
+    sum_column = 4 if include_manager else 3
+    sheet.cell(
+        counterparty_total_row, average_column,
+        f"=IFERROR({sheet.cell(counterparty_total_row, sum_column).coordinate}/{sheet.cell(counterparty_total_row, orders_column).coordinate},0)",
+    )
+    for cell in sheet[counterparty_total_row]:
+        cell.font = Font(bold=True)
+        cell.fill = green
+
+    money_columns_manager = range(4, len(manager_headers) + 1)
+    for row in range(manager_first_row, manager_total_row + 1):
+        for column in money_columns_manager:
+            sheet.cell(row, column).number_format = money_format
+            sheet.cell(row, column).border = table_border
+    for row in range(category_first_row, category_first_row + len(all_categories)):
+        sheet.cell(row, 2).number_format = money_format
+        sheet.cell(row, 3).number_format = "0.0%"
+    for row in range(counterparty_first_row, counterparty_total_row + 1):
+        for column in range(sum_column, len(counterparty_headers) + 1):
+            sheet.cell(row, column).number_format = money_format
+            sheet.cell(row, column).border = table_border
+
+    if all_categories:
+        chart = BarChart()
+        chart.type = "bar"
+        chart.style = 10
+        chart.title = "Продажи по категориям"
+        chart.y_axis.title = "Категория"
+        chart.x_axis.title = "Сумма"
+        chart.height = 7
+        chart.width = 13
+        data = Reference(sheet, min_col=2, min_row=category_header_row, max_row=category_first_row + len(all_categories) - 1)
+        labels = Reference(sheet, min_col=1, min_row=category_first_row, max_row=category_first_row + len(all_categories) - 1)
+        chart.add_data(data, titles_from_data=True)
+        chart.set_categories(labels)
+        sheet.add_chart(chart, "F12")
+
+    sheet.freeze_panes = f"A{counterparty_first_row}"
+    sheet.auto_filter.ref = (
+        f"A{counterparty_header_row}:"
+        f"{sheet.cell(counterparty_header_row, len(counterparty_headers)).column_letter}{counterparty_total_row - 1}"
+    )
+    widths = [38, 25, 13, 18, 18, 18, 18] + [22] * (len(category_headers) + 2)
     for index, width in enumerate(widths, 1):
-        sheet.column_dimensions[sheet.cell(1, index).column_letter].width = width
+        sheet.column_dimensions[get_column_letter(index)].width = width
+    sheet.sheet_view.showGridLines = False
 
 
 def build_bonus_report(
@@ -567,9 +733,10 @@ def build_bonus_report(
         f"Отчёт по премиальным категориям · {channel}", month,
     )
 
+    summary = workbook.create_sheet("Сводка", 0)
+    _fill_summary_sheet(summary, documents, category_headers, month, channel)
+
     if channel == ALL_CHANNELS:
-        summary = workbook.create_sheet("Сводка", 0)
-        _fill_summary_sheet(summary, documents, category_headers, month)
         used_titles = {item.title.casefold() for item in workbook.worksheets}
         grouped: dict[str, list[BonusDocument]] = {}
         for document in documents:

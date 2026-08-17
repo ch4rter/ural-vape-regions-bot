@@ -197,6 +197,14 @@ def test_build_bonus_report_splits_categories(tmp_path):
     assert result.return_count == 0
     assert result.unclassified_paths == ()
     workbook = load_workbook(destination, data_only=False)
+    assert workbook.sheetnames[:2] == ["Сводка", "Отчёт"]
+    personal_summary = workbook["Сводка"]
+    assert personal_summary["A4"].value == "Отгрузок"
+    assert personal_summary["A5"].value == 1
+    assert personal_summary["C5"].value == 1500
+    assert personal_summary["A27"].value == "Клиент"
+    assert personal_summary["B27"].value == 1
+    assert personal_summary["C27"].value == 1500
     sheet = workbook["Отчёт"]
     headers = {cell.value: cell.column for cell in sheet[3]}
     assert Decimal(str(sheet.cell(4, headers["OGGO Аромы/жижи"]).value)) == Decimal("900")
@@ -218,17 +226,30 @@ def test_build_bonus_report_splits_categories(tmp_path):
     )
     assert renamed_result.document_count == 1
 
+    repeat_demand = dict(demand)
+    repeat_demand["name"] = "0003"
+    repeat_demand["moment"] = "2026-08-20 10:00:00"
+    repeat_demand["sum"] = 50000
+    repeat_demand["payedSum"] = 0
+    repeat_demand["positions"] = {"rows": [
+        {"assortment": assortment("oggo"), "quantity": 1, "price": 50000},
+    ]}
     common_destination = tmp_path / "common-report.xlsx"
     common = build_bonus_report(
         "token", "2026-08", ALL_CHANNELS, classification, common_destination,
-        client=FakeBonusClient(), raw_documents=([demand], []),
+        client=FakeBonusClient(), raw_documents=([demand, repeat_demand], []),
     )
-    assert common.document_count == 1
+    assert common.document_count == 2
     workbook = load_workbook(common_destination, data_only=False)
     assert workbook.sheetnames[:3] == ["Сводка", "Отчёт", "Валера"]
     summary = workbook["Сводка"]
-    assert summary["A4"].value == "Валера"
-    assert summary["B4"].value == 1
-    assert summary["C4"].value == 1500
+    assert summary["A10"].value == "Валера"
+    assert summary["B10"].value == 1
+    assert summary["C10"].value == 2
+    assert summary["D10"].value == 2000
+    assert summary["A27"].value == "Клиент"
+    assert summary["B27"].value == "Валера"
+    assert summary["C27"].value == 2
+    assert summary["D27"].value == 2000
     assert workbook["Валера"]["F4"].value == "Валера"
     workbook.close()
