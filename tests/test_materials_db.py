@@ -75,6 +75,10 @@ def test_roles_chat_registry_and_settings(tmp_path):
     assert db.user_role(123456789) == "user"
     db.set_access_role(user.id, "junior_admin")
     assert db.user_role(123456789) == "junior_admin"
+    channel_href = "https://api.moysklad.ru/api/remap/1.2/entity/saleschannel/valera"
+    db.set_access_sales_channel(user.id, "Валера", channel_href)
+    assert db.user_sales_channel(123456789) == ("Валера", channel_href)
+    assert db.get_access_user(user.id).sales_channel_name == "Валера"
 
     db.upsert_client_chat(-100123, "Клиентский чат", "supergroup", True)
     assert db.get_client_chat(-100123).title == "Клиентский чат"
@@ -221,3 +225,4 @@ def test_existing_access_table_gets_role_migration(tmp_path):
 
     db = MaterialsDB(path)
     assert db.user_role(123456789) == "user"
+    assert db.user_sales_channel(123456789) is None

@@ -40,6 +40,30 @@ def test_completed_public_profile_gets_base_price_button(tmp_path):
             delattr(bot, "materials_db")
 
 
+def test_employee_with_sales_channel_gets_my_shipments_button(tmp_path):
+    previous = getattr(bot, "materials_db", None)
+    bot.materials_db = MaterialsDB(tmp_path / "materials.sqlite3")
+    user = bot.materials_db.add_access_user("123456789")
+    bot.materials_db.set_access_sales_channel(
+        user.id,
+        "Валера",
+        "https://api.moysklad.ru/api/remap/1.2/entity/saleschannel/valera",
+    )
+    try:
+        buttons = [
+            button
+            for row in main_menu(123456789).inline_keyboard
+            for button in row
+        ]
+        own = next(button for button in buttons if button.callback_data == "myship:menu")
+        assert own.text == "📈 Мои отгрузки"
+    finally:
+        if previous is not None:
+            bot.materials_db = previous
+        else:
+            delattr(bot, "materials_db")
+
+
 def test_compact_navigation_uses_icon_only_buttons():
     row = compact_nav("section:back", forward_data="section:next", search_data="main:prices")
     assert [button.text for button in row] == ["⬅️", "➡️", "🔎", "🏠"]

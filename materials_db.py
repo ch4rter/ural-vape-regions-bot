@@ -37,6 +37,8 @@ class AccessUser:
     telegram_id: int | None
     username: str | None
     role: str = "user"
+    sales_channel_name: str | None = None
+    sales_channel_href: str | None = None
 
 
 @dataclass(frozen=True)
@@ -216,6 +218,10 @@ class MaterialsDB:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(access_users)")}
             if "role" not in columns:
                 connection.execute("ALTER TABLE access_users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
+            if "sales_channel_name" not in columns:
+                connection.execute("ALTER TABLE access_users ADD COLUMN sales_channel_name TEXT")
+            if "sales_channel_href" not in columns:
+                connection.execute("ALTER TABLE access_users ADD COLUMN sales_channel_href TEXT")
             wait_columns = {row[1] for row in connection.execute("PRAGMA table_info(wait_entries)")}
             if "source_message_id" not in wait_columns:
                 connection.execute("ALTER TABLE wait_entries ADD COLUMN source_message_id INTEGER")
@@ -256,14 +262,18 @@ class MaterialsDB:
     def get_access_user(self, access_id: int) -> AccessUser | None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT id, telegram_id, username, role FROM access_users WHERE id = ?", (access_id,)
+                """SELECT id, telegram_id, username, role,
+                          sales_channel_name, sales_channel_href
+                   FROM access_users WHERE id = ?""", (access_id,)
             ).fetchone()
         return self._access_user(row) if row else None
 
     def list_access_users(self) -> list[AccessUser]:
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT id, telegram_id, username, role FROM access_users ORDER BY created_at, id"
+                """SELECT id, telegram_id, username, role,
+                          sales_channel_name, sales_channel_href
+                   FROM access_users ORDER BY created_at, id"""
             ).fetchall()
         return [self._access_user(row) for row in rows]
 
@@ -322,6 +332,34 @@ class MaterialsDB:
             raise ValueError("Неизвестная роль пользователя.")
         with self._connect() as connection:
             connection.execute("UPDATE access_users SET role = ? WHERE id = ?", (role, access_id))
+
+    def set_access_sales_channel(
+        self, access_id: int, name: str | None, href: str | None
+    ) -> None:
+        if (name is None) != (href is None):
+            raise ValueError("Название и ссылка канала продаж должны задаваться вместе.")
+        with self._connect() as connection:
+            connection.execute(
+                """UPDATE access_users
+                   SET sales_channel_name = ?, sales_channel_href = ?
+                   WHERE id = ?""",
+                (name, href, access_id),
+            )
+
+    def user_sales_channel(
+        self, telegram_id: int, username: str | None = None
+    ) -> tuple[str, str] | None:
+        if not self.authorize_user(telegram_id, username):
+            return None
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT sales_channel_name, sales_channel_href
+                   FROM access_users WHERE telegram_id = ?""",
+                (telegram_id,),
+            ).fetchone()
+        if not row or not row["sales_channel_name"] or not row["sales_channel_href"]:
+            return None
+        return row["sales_channel_name"], row["sales_channel_href"]
 
     def upsert_client_chat(
         self, chat_id: int, title: str, chat_type: str, is_active: bool = True,
@@ -749,7 +787,10 @@ class MaterialsDB:
 
     @staticmethod
     def _access_user(row: sqlite3.Row) -> AccessUser:
-        return AccessUser(row["id"], row["telegram_id"], row["username"], row["role"])
+        return AccessUser(
+            row["id"], row["telegram_id"], row["username"], row["role"],
+            row["sales_channel_name"], row["sales_channel_href"],
+        )
 
     @staticmethod
     def _wait_entry(row: sqlite3.Row) -> WaitEntry:

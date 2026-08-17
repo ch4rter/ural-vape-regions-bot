@@ -451,6 +451,10 @@ def main_menu(user_id: int | None) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📄 Прайсы", callback_data="main:price_files"),
             InlineKeyboardButton(text="📊 Изменения", callback_data="main:price_reports"),
         ]
+        if user_id and materials_db.user_sales_channel(user_id):
+            buttons.append(InlineKeyboardButton(
+                text="📈 Мои отгрузки", callback_data="myship:menu"
+            ))
         buttons.append(InlineKeyboardButton(text="🔔 Ожидания", callback_data="main:waitlist"))
     elif user_id and materials_db.get_lead_profile(user_id):
         buttons.append(InlineKeyboardButton(text="📄 Получить прайсы", callback_data="public:prices"))
@@ -3806,6 +3810,120 @@ def bonus_months_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def my_shipments_months_keyboard() -> InlineKeyboardMarkup:
+    current = datetime.now().replace(day=1)
+    buttons = []
+    year, number = current.year, current.month
+    for _ in range(12):
+        month = f"{year:04d}-{number:02d}"
+        marker = "✅ " if bonus_classification_path(month).exists() else ""
+        buttons.append(InlineKeyboardButton(
+            text=marker + month_title(month).capitalize(),
+            callback_data=f"myship:m:{month}",
+        ))
+        number -= 1
+        if number == 0:
+            year -= 1
+            number = 12
+    rows = button_grid(buttons)
+    rows.append(compact_nav())
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == "myship:menu")
+async def my_shipments_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    channel = materials_db.user_sales_channel(
+        callback.from_user.id, callback.from_user.username
+    )
+    if not channel:
+        await callback.answer(
+            "К вашему профилю ещё не привязан канал продаж.", show_alert=True
+        )
+        return
+    await state.clear()
+    await edit_or_answer(
+        callback.message,
+        "📈 <b>Мои отгрузки</b>\n\n"
+        f"Канал продаж: <b>{html.escape(channel[0])}</b>\n\n"
+        "Выберите месяц. Галочкой отмечены месяцы с настроенной классификацией.",
+        reply_markup=my_shipments_months_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("myship:m:"))
+async def generate_my_shipments(callback: CallbackQuery) -> None:
+    month = callback.data.rsplit(":", 1)[1]
+    channel = materials_db.user_sales_channel(
+        callback.from_user.id, callback.from_user.username
+    )
+    if not channel:
+        await callback.answer("Канал продаж не привязан.", show_alert=True)
+        return
+    classification = bonus_classification_path(month)
+    if not classification.exists():
+        await callback.answer(
+            "Главный администратор ещё не настроил категории этого месяца.",
+            show_alert=True,
+        )
+        return
+    if callback.from_user.id in bonus_reports_in_progress:
+        await callback.answer("Ваш отчёт уже формируется.", show_alert=True)
+        return
+    token, _, _, _ = moysklad_settings()
+    if not token:
+        await callback.answer("Интеграция с МоимСкладом не настроена.", show_alert=True)
+        return
+    bonus_reports_in_progress.add(callback.from_user.id)
+    await callback.answer("Формирую личный отчёт…")
+    await edit_or_answer(
+        callback.message,
+        "⏳ <b>Формирую личный отчёт</b>\n\n"
+        f"Период: <b>{html.escape(month_title(month))}</b>\n"
+        f"Канал продаж: <b>{html.escape(channel[0])}</b>\n\n"
+        "Повторно нажимать кнопку не нужно.",
+    )
+    try:
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / f"Мои отгрузки {month}.xlsx"
+            result = await asyncio.to_thread(
+                build_bonus_report,
+                token,
+                month,
+                channel[0],
+                classification,
+                destination,
+                sales_channel_href=channel[1],
+            )
+            warning = (
+                f"\n⚠️ Неклассифицированных папок: <b>{len(result.unclassified_paths)}</b>."
+                if result.unclassified_paths else "\n✅ Все товарные папки классифицированы."
+            )
+            await callback.message.answer_document(
+                FSInputFile(destination, filename=destination.name),
+                caption=(
+                    "📈 <b>Личный отчёт готов</b>\n\n"
+                    f"Отгрузок: <b>{result.shipment_count}</b>" + warning
+                ),
+            )
+    except Exception as error:
+        logging.exception("Не удалось сформировать личный отчёт")
+        await edit_or_answer(
+            callback.message,
+            "❌ <b>Не удалось сформировать личный отчёт</b>\n\n"
+            + html.escape(str(error)),
+            reply_markup=my_shipments_months_keyboard(),
+        )
+        return
+    finally:
+        bonus_reports_in_progress.discard(callback.from_user.id)
+    await edit_or_answer(
+        callback.message,
+        "✅ Отчёт отправлен. Можно выбрать другой месяц.",
+        reply_markup=my_shipments_months_keyboard(),
+    )
+
+
 def bonus_month_keyboard(month: str, *, allow_configuration: bool = True) -> InlineKeyboardMarkup:
     configured = bonus_classification_path(month).exists()
     rows = []
@@ -4680,7 +4798,7 @@ async def manage_access(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 @router.callback_query(F.data.startswith("adm:access_user:"))
-async def manage_access_user(callback: CallbackQuery) -> None:
+async def manage_access_user(callback: CallbackQuery, state: FSMContext) -> None:
     if not await require_admin(callback): return
     access_id = int(callback.data.rsplit(":", 1)[1])
     user = materials_db.get_access_user(access_id)
@@ -4688,13 +4806,91 @@ async def manage_access_user(callback: CallbackQuery) -> None:
         await callback.answer("Пользователь не найден.", show_alert=True); return
     next_role = "user" if user.role == "junior_admin" else "junior_admin"
     role_text = "Сделать пользователем" if next_role == "user" else "Назначить младшим администратором"
+    channel_text = user.sales_channel_name or "не привязан"
     await callback.message.edit_text(
-        f"👤 <b>{html.escape(access_user_label(user))}</b>\n\nВыберите действие:",
+        f"👤 <b>{html.escape(access_user_label(user))}</b>\n\n"
+        f"Канал продаж: <b>{html.escape(channel_text)}</b>\n\nВыберите действие:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=f"🔑 {role_text}", callback_data=f"adm:set_role:{access_id}:{next_role}")],
+            [InlineKeyboardButton(text="📈 Привязать канал продаж", callback_data=f"adm:access_channel:{access_id}")],
+            *([[InlineKeyboardButton(text="❌ Убрать канал продаж", callback_data=f"adm:clear_channel:{access_id}")]] if user.sales_channel_name else []),
             [InlineKeyboardButton(text="🗑 Закрыть доступ", callback_data=f"adm:confirm_access:{access_id}")],
             compact_nav("adm:access"),
         ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:access_channel:"))
+async def choose_access_sales_channel(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin(callback):
+        return
+    access_id = int(callback.data.rsplit(":", 1)[1])
+    if not materials_db.get_access_user(access_id):
+        await callback.answer("Пользователь не найден.", show_alert=True)
+        return
+    token, _, _, _ = moysklad_settings()
+    if not token:
+        await callback.answer("Не задан MOYSKLAD_TOKEN.", show_alert=True)
+        return
+    await callback.answer("Получаю каналы продаж…")
+    try:
+        channels = await asyncio.to_thread(
+            available_sales_channels, MoySkladClient(token)
+        )
+    except Exception as error:
+        await edit_or_answer(
+            callback.message,
+            "❌ <b>Не удалось получить каналы продаж</b>\n\n" + html.escape(str(error)),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[compact_nav(f"adm:access_user:{access_id}")]),
+        )
+        return
+    await state.update_data(
+        access_channel_user=access_id,
+        access_channel_options=[{"name": item.name, "href": item.href} for item in channels],
+    )
+    rows = [[InlineKeyboardButton(
+        text=item.name, callback_data=f"adm:set_channel:{index}"
+    )] for index, item in enumerate(channels)]
+    rows.append(compact_nav(f"adm:access_user:{access_id}"))
+    await edit_or_answer(
+        callback.message,
+        "📈 <b>Канал продаж сотрудника</b>\n\n"
+        "Выберите значение из МоегоСклада. Сотрудник будет видеть отчёт только по этому каналу.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.callback_query(F.data.startswith("adm:set_channel:"))
+async def set_access_sales_channel(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin(callback):
+        return
+    data = await state.get_data()
+    try:
+        access_id = int(data["access_channel_user"])
+        option = data["access_channel_options"][int(callback.data.rsplit(":", 1)[1])]
+        name, href = str(option["name"]), str(option["href"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        await callback.answer("Список устарел. Откройте пользователя заново.", show_alert=True)
+        return
+    materials_db.set_access_sales_channel(access_id, name, href)
+    await state.clear()
+    await callback.message.edit_text(
+        f"✅ Канал продаж <b>{html.escape(name)}</b> привязан к сотруднику.",
+        reply_markup=access_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:clear_channel:"))
+async def clear_access_sales_channel(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin(callback):
+        return
+    access_id = int(callback.data.rsplit(":", 1)[1])
+    materials_db.set_access_sales_channel(access_id, None, None)
+    await state.clear()
+    await callback.message.edit_text(
+        "✅ Привязка канала продаж удалена.", reply_markup=access_keyboard()
     )
     await callback.answer()
 

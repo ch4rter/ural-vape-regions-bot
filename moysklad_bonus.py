@@ -296,6 +296,13 @@ def _channel(document: dict) -> str:
     return _name(demand.get("salesChannel"), "") if isinstance(demand, dict) else ""
 
 
+def _channel_href(document: dict) -> str:
+    channel = document.get("salesChannel")
+    if isinstance(channel, dict):
+        return _canonical_href(str(channel.get("meta", {}).get("href", "")))
+    return ""
+
+
 def sales_channels(documents: tuple[list[dict], list[dict]]) -> tuple[str, ...]:
     values = {_channel(document) for rows in documents for document in rows}
     return tuple(sorted((value for value in values if value), key=str.casefold))
@@ -346,6 +353,7 @@ def prepare_documents(
     raw: tuple[list[dict], list[dict]],
     classification: BonusClassification,
     channel: str,
+    channel_href: str = "",
 ) -> tuple[list[BonusDocument], set[str]]:
     assortment_paths = _assortment_paths(client)
     result: list[BonusDocument] = []
@@ -357,7 +365,11 @@ def prepare_documents(
     selected = []
     for document in raw[0]:
         document_channel = _channel(document)
-        if channel == ALL_CHANNELS or document_channel.casefold() == channel.casefold():
+        matches = (
+            _channel_href(document) == _canonical_href(channel_href)
+            if channel_href else document_channel.casefold() == channel.casefold()
+        )
+        if channel == ALL_CHANNELS or matches:
             selected.append(document)
     # Position endpoints are independent. A small bounded pool considerably
     # reduces report time without creating an aggressive burst against the API.
@@ -398,38 +410,24 @@ def prepare_documents(
     return result, unknown
 
 
-def build_bonus_report(
-    token: str,
-    month: str,
-    channel: str,
-    classification_path: Path,
-    destination: Path,
-    *,
-    sales_channel_href: str = "",
-    client: MoySkladClient | None = None,
-    raw_documents: tuple[list[dict], list[dict]] | None = None,
-) -> BonusReportResult:
-    client = client or MoySkladClient(token)
-    classification = load_classification(classification_path)
-    raw = raw_documents or fetch_month_documents(client, month, sales_channel_href)
-    documents, unknown = prepare_documents(client, raw, classification, channel)
-    if not documents:
-        raise MoySkladError(f"За {month_title(month)} по каналу продаж «{channel}» проведённых документов не найдено.")
-
-    workbook = Workbook()
-    sheet = workbook.active
-    sheet.title = "Отчёт"
-    sheet.append(["Отчёт по премиальным категориям", month_title(month), channel])
-    sheet.append([])
-    category_headers = [
-        category for category in classification.categories
-        if category != EXCLUDED_CATEGORY
-    ]
-    headers = [
+def _detail_headers(category_headers: list[str]) -> list[str]:
+    return [
         "Тип", "Дата", "Документ", "Контрагент", "Статус", "Канал продаж",
         "Сумма документа", "Оплачено", *category_headers, OTHER_CATEGORY,
         UNCLASSIFIED_CATEGORY, "Контрольное расхождение",
     ]
+
+
+def _fill_detail_sheet(
+    sheet,
+    documents: list[BonusDocument],
+    category_headers: list[str],
+    title: str,
+    month: str,
+) -> None:
+    headers = _detail_headers(category_headers)
+    sheet.append([title, month_title(month)])
+    sheet.append([])
     sheet.append(headers)
     blue = PatternFill("solid", fgColor="2F5597")
     total_fill = PatternFill("solid", fgColor="D9EAD3")
@@ -440,13 +438,8 @@ def build_bonus_report(
     for document in documents:
         categorized = sum(document.categories.values(), Decimal(0))
         sheet.append([
-            document.kind,
-            document.moment[:10],
-            document.name,
-            document.agent,
-            document.state,
-            document.sales_channel,
-            float(document.total),
+            document.kind, document.moment[:10], document.name, document.agent,
+            document.state, document.sales_channel, float(document.total),
             float(document.paid),
             *(float(document.categories[category]) for category in category_headers),
             float(document.categories[OTHER_CATEGORY]),
@@ -467,10 +460,126 @@ def build_bonus_report(
             sheet.cell(row, column).number_format = '#,##0.00'
     sheet.freeze_panes = "A4"
     sheet.auto_filter.ref = f"A3:{sheet.cell(3, len(headers)).column_letter}{total_row - 1}"
-    fixed_widths = [13, 13, 18, 38, 22, 24, 19, 16]
-    widths = fixed_widths + [24] * len(category_headers) + [15, 23, 23]
+    widths = [13, 13, 18, 38, 22, 24, 19, 16] + [24] * len(category_headers) + [15, 23, 23]
     for index, width in enumerate(widths, 1):
         sheet.column_dimensions[sheet.cell(1, index).column_letter].width = width
+
+
+def _safe_sheet_title(value: str, used: set[str]) -> str:
+    cleaned = "".join("_" if char in "[]:*?/\\" else char for char in value).strip() or "Без канала"
+    base = cleaned[:31]
+    candidate = base
+    number = 2
+    while candidate.casefold() in used:
+        suffix = f" {number}"
+        candidate = base[:31 - len(suffix)] + suffix
+        number += 1
+    used.add(candidate.casefold())
+    return candidate
+
+
+def _fill_summary_sheet(
+    sheet,
+    documents: list[BonusDocument],
+    category_headers: list[str],
+    month: str,
+) -> None:
+    headers = [
+        "Менеджер", "Отгрузок", "Сумма отгрузок", "Оплачено",
+        *category_headers, OTHER_CATEGORY, UNCLASSIFIED_CATEGORY,
+        "Контрольное расхождение",
+    ]
+    sheet.append(["Сводка по менеджерам", month_title(month)])
+    sheet.append([])
+    sheet.append(headers)
+    blue = PatternFill("solid", fgColor="2F5597")
+    green = PatternFill("solid", fgColor="D9EAD3")
+    for cell in sheet[3]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = blue
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    grouped: dict[str, list[BonusDocument]] = {}
+    for document in documents:
+        grouped.setdefault(document.sales_channel or "Без канала", []).append(document)
+    for manager in sorted(grouped, key=str.casefold):
+        rows = grouped[manager]
+        category_totals = {
+            category: sum((row.categories[category] for row in rows), Decimal(0))
+            for category in category_headers
+        }
+        other = sum((row.categories[OTHER_CATEGORY] for row in rows), Decimal(0))
+        unclassified = sum((row.categories[UNCLASSIFIED_CATEGORY] for row in rows), Decimal(0))
+        total = sum((row.total for row in rows), Decimal(0))
+        categorized = sum(category_totals.values(), Decimal(0)) + other + unclassified
+        sheet.append([
+            manager, len(rows), float(total),
+            float(sum((row.paid for row in rows), Decimal(0))),
+            *(float(category_totals[category]) for category in category_headers),
+            float(other), float(unclassified), float(total - categorized),
+        ])
+    total_row = sheet.max_row + 1
+    sheet.cell(total_row, 1, "ИТОГО")
+    for column in range(2, len(headers) + 1):
+        letter = sheet.cell(1, column).column_letter
+        sheet.cell(total_row, column, f"=SUM({letter}4:{letter}{total_row - 1})")
+    for cell in sheet[total_row]:
+        cell.font = Font(bold=True)
+        cell.fill = green
+    for row in range(4, total_row + 1):
+        for column in range(3, len(headers) + 1):
+            sheet.cell(row, column).number_format = '#,##0.00'
+    sheet.freeze_panes = "A4"
+    sheet.auto_filter.ref = f"A3:{sheet.cell(3, len(headers)).column_letter}{total_row - 1}"
+    widths = [28, 13, 20, 18] + [24] * len(category_headers) + [15, 23, 23]
+    for index, width in enumerate(widths, 1):
+        sheet.column_dimensions[sheet.cell(1, index).column_letter].width = width
+
+
+def build_bonus_report(
+    token: str,
+    month: str,
+    channel: str,
+    classification_path: Path,
+    destination: Path,
+    *,
+    sales_channel_href: str = "",
+    client: MoySkladClient | None = None,
+    raw_documents: tuple[list[dict], list[dict]] | None = None,
+) -> BonusReportResult:
+    client = client or MoySkladClient(token)
+    classification = load_classification(classification_path)
+    raw = raw_documents or fetch_month_documents(client, month, sales_channel_href)
+    documents, unknown = prepare_documents(
+        client, raw, classification, channel, sales_channel_href
+    )
+    if not documents:
+        raise MoySkladError(f"За {month_title(month)} по каналу продаж «{channel}» проведённых документов не найдено.")
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Отчёт"
+    category_headers = [
+        category for category in classification.categories
+        if category != EXCLUDED_CATEGORY
+    ]
+    _fill_detail_sheet(
+        sheet, documents, category_headers,
+        f"Отчёт по премиальным категориям · {channel}", month,
+    )
+
+    if channel == ALL_CHANNELS:
+        summary = workbook.create_sheet("Сводка", 0)
+        _fill_summary_sheet(summary, documents, category_headers, month)
+        used_titles = {item.title.casefold() for item in workbook.worksheets}
+        grouped: dict[str, list[BonusDocument]] = {}
+        for document in documents:
+            grouped.setdefault(document.sales_channel or "Без канала", []).append(document)
+        for manager in sorted(grouped, key=str.casefold):
+            manager_sheet = workbook.create_sheet(_safe_sheet_title(manager, used_titles))
+            _fill_detail_sheet(
+                manager_sheet, grouped[manager], category_headers,
+                f"Отгрузки · {manager}", month,
+            )
 
     if unknown:
         unknown_sheet = workbook.create_sheet("Не классифицировано")

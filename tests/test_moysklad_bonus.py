@@ -203,9 +203,32 @@ def test_build_bonus_report_splits_categories(tmp_path):
     assert Decimal(str(sheet.cell(4, headers["Прочее"]).value)) == Decimal("600")
     workbook.close()
 
+    renamed = dict(demand)
+    renamed["salesChannel"] = {
+        "name": "Валера — новое название",
+        "meta": {
+            "href": "https://api.moysklad.ru/api/remap/1.2/entity/saleschannel/valera"
+        },
+    }
+    renamed_destination = tmp_path / "renamed-channel.xlsx"
+    renamed_result = build_bonus_report(
+        "token", "2026-08", "Валера", classification, renamed_destination,
+        sales_channel_href="https://api.moysklad.ru/api/remap/1.2/entity/saleschannel/valera",
+        client=FakeBonusClient(), raw_documents=([renamed], []),
+    )
+    assert renamed_result.document_count == 1
+
     common_destination = tmp_path / "common-report.xlsx"
     common = build_bonus_report(
         "token", "2026-08", ALL_CHANNELS, classification, common_destination,
         client=FakeBonusClient(), raw_documents=([demand], []),
     )
     assert common.document_count == 1
+    workbook = load_workbook(common_destination, data_only=False)
+    assert workbook.sheetnames[:3] == ["Сводка", "Отчёт", "Валера"]
+    summary = workbook["Сводка"]
+    assert summary["A4"].value == "Валера"
+    assert summary["B4"].value == 1
+    assert summary["C4"].value == 1500
+    assert workbook["Валера"]["F4"].value == "Валера"
+    workbook.close()
