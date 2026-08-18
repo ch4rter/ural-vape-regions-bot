@@ -54,6 +54,7 @@ from moysklad_bonus import (
     month_title,
     save_classification,
 )
+from order_splitter import ORDER_STORES, split_customer_order
 from prices_db import (
     PRICE_SOURCE,
     WAREHOUSES,
@@ -95,6 +96,7 @@ bonus_storage_path: Path
 price_updates_in_progress: set[str] = set()
 broadcasts_in_progress: set[int] = set()
 bonus_reports_in_progress: set[int] = set()
+order_splits_in_progress: set[int] = set()
 PRICE_MESSAGE_SETTING = "price_command_message"
 PRICE_ATTACHMENT_KIND_SETTING = "price_command_attachment_kind"
 PRICE_ATTACHMENT_ID_SETTING = "price_command_attachment_id"
@@ -146,6 +148,7 @@ class AdminState(StatesGroup):
     region_location = State()
     region_manager = State()
     bonus_classification_upload = State()
+    order_split_upload = State()
 
 
 class BroadcastState(StatesGroup):
@@ -3738,6 +3741,10 @@ def price_admin_keyboard() -> InlineKeyboardMarkup:
         text="🔄 Сформировать из МоегоСклада",
         callback_data="adm:moysklad_price",
     )])
+    rows.append([InlineKeyboardButton(
+        text="🧪 Распределить заказ по складам · БЕТА",
+        callback_data="adm:split_order",
+    )])
     rows.append(compact_nav("main:admin"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -3849,6 +3856,159 @@ async def my_shipments_menu(callback: CallbackQuery, state: FSMContext) -> None:
         reply_markup=my_shipments_months_keyboard(),
     )
     await callback.answer()
+
+
+@router.callback_query(F.data == "adm:split_order")
+async def choose_order_priority(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin(callback):
+        return
+    await cleanup_pending_excel(state)
+    await state.clear()
+    buttons = [
+        InlineKeyboardButton(
+            text=name,
+            callback_data=f"adm:split_priority:{index}",
+        )
+        for index, name in enumerate(ORDER_STORES)
+    ]
+    await callback.message.edit_text(
+        "🧪 <b>Распределение заказа по складам · БЕТА</b>\n\n"
+        "Выберите приоритетный склад. Бот сначала возьмёт максимум доступного товара "
+        "с него, затем оптимально подключит остальные разрешённые склады.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            *button_grid(buttons),
+            compact_nav("adm:prices"),
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:split_priority:"))
+async def start_order_split_upload(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin(callback):
+        return
+    try:
+        priority = ORDER_STORES[int(callback.data.rsplit(":", 1)[1])]
+    except (ValueError, IndexError):
+        await callback.answer("Неизвестный склад.", show_alert=True)
+        return
+    await state.set_state(AdminState.order_split_upload)
+    await state.update_data(order_split_priority=priority)
+    await callback.message.edit_text(
+        "📎 <b>Отправьте заполненный клиентом общий прайс</b>\n\n"
+        "Формат: <code>.xlsx</code>. Заказанное количество должно быть указано в колонке "
+        "«Количество».\n\n"
+        f"Приоритетный склад: <b>{html.escape(priority)}</b>\n"
+        "Используются только склады: <b>Мордор, Годзибасы и Жможики</b>.\n\n"
+        "Бот ничего не создаёт и не изменяет в МоемСкладе — только читает актуальные остатки.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[compact_nav("adm:split_order")]),
+    )
+    await callback.answer()
+
+
+def _quantity_text(value: Decimal) -> str:
+    if value == value.to_integral_value():
+        return format(value.quantize(Decimal(1)), "f")
+    return format(value.normalize(), "f")
+
+
+@router.message(AdminState.order_split_upload)
+async def receive_order_for_split(message: Message, state: FSMContext, bot: Bot) -> None:
+    if not is_admin(message.from_user.id) or message.chat.type != "private":
+        return
+    if not message.document or not (message.document.file_name or "").lower().endswith(".xlsx"):
+        await message.answer("Пришлите заполненный прайс как Excel-файл в формате <code>.xlsx</code>.")
+        return
+    if message.from_user.id in order_splits_in_progress:
+        await message.answer("⏳ Другой заказ уже распределяется. Дождитесь завершения.")
+        return
+    token, _, _, _ = moysklad_settings()
+    if not token:
+        await message.answer("❌ В настройках сервера не задан <code>MOYSKLAD_TOKEN</code>.")
+        return
+    data = await state.get_data()
+    priority = str(data.get("order_split_priority", ""))
+    if priority not in ORDER_STORES:
+        await state.clear()
+        await message.answer("Не удалось определить приоритетный склад. Начните заново.")
+        return
+
+    order_splits_in_progress.add(message.from_user.id)
+    pending_dir = price_storage_path / "pending" / "order_split"
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    source = pending_dir / f"{message.from_user.id}_{message.document.file_unique_id}.xlsx"
+    await message.answer(
+        "⏳ <b>Распределяю заказ</b>\n\n"
+        "Читаю заполненный прайс и одним циклом получаю актуальный ассортимент и остатки "
+        "трёх разрешённых складов. Это может занять несколько минут."
+    )
+    try:
+        await bot.download(message.document.file_id, destination=source)
+        with tempfile.TemporaryDirectory(dir=pending_dir) as temporary:
+            result = await asyncio.to_thread(
+                split_customer_order,
+                token,
+                source,
+                Path(temporary),
+                priority,
+            )
+            used_stores = ", ".join(name for name, _ in result.files) or "нет"
+            completion = (
+                result.allocated_quantity / result.requested_quantity * Decimal(100)
+                if result.requested_quantity else Decimal(0)
+            )
+            shortage_note = (
+                f"\nНе распределено: <b>{_quantity_text(result.shortage_quantity)}</b> "
+                f"ед. · <b>{result.shortage_line_count}</b> позиций"
+                if result.shortage_quantity else "\nЗаказ полностью обеспечен остатками."
+            )
+            unknown_note = (
+                f"\nНе найдены по коду в МоемСкладе: <b>{len(result.unknown_codes)}</b>"
+                if result.unknown_codes else ""
+            )
+            await message.answer(
+                "✅ <b>Заказ распределён</b>\n\n"
+                f"Приоритет: <b>{html.escape(priority)}</b>\n"
+                f"Порядок распределения: <b>{html.escape(' → '.join(result.allocation_order))}</b>\n"
+                f"Заказано: <b>{_quantity_text(result.requested_quantity)}</b> ед. · "
+                f"<b>{result.line_count}</b> позиций\n"
+                f"Распределено: <b>{_quantity_text(result.allocated_quantity)}</b> ед. "
+                f"(<b>{completion.quantize(Decimal('0.1'))}%</b>)\n"
+                f"Использованные склады: <b>{html.escape(used_stores)}</b>"
+                + shortage_note + unknown_note,
+                reply_markup=price_admin_keyboard(),
+            )
+            for store_name, path in result.files:
+                await message.answer_document(
+                    FSInputFile(path, filename=path.name),
+                    caption=f"📦 Заказ со склада <b>{html.escape(store_name)}</b>",
+                )
+            if result.shortage_path:
+                await message.answer_document(
+                    FSInputFile(result.shortage_path, filename=result.shortage_path.name),
+                    caption=(
+                        "⚠️ <b>Не распределено</b>\n\n"
+                        "Этих количеств сейчас недостаточно на трёх разрешённых складах "
+                        "либо код товара не найден в МоемСкладе."
+                    ),
+                )
+        await state.clear()
+    except MoySkladError as error:
+        logging.warning("Не удалось распределить заказ по складам: %s", error)
+        await message.answer(
+            "❌ <b>Не удалось распределить заказ</b>\n\n"
+            f"{html.escape(str(error))}\n\n"
+            "Исправьте файл и отправьте его повторно. Данные МоегоСклада не изменялись."
+        )
+    except Exception:
+        logging.exception("Не удалось распределить заказ по складам")
+        await message.answer(
+            "❌ <b>Не удалось распределить заказ</b>\n\n"
+            "Неожиданная ошибка записана в журнал. Данные МоегоСклада не изменялись."
+        )
+    finally:
+        source.unlink(missing_ok=True)
+        order_splits_in_progress.discard(message.from_user.id)
 
 
 @router.callback_query(F.data.startswith("myship:m:"))
