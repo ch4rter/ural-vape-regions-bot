@@ -16,6 +16,11 @@ def test_public_main_menu_only_shows_public_sections():
     assert [button.text for button in keyboard.inline_keyboard[0]] == [
         "🔎 Менеджеры", "🗃 База данных",
     ]
+    assert all(
+        button.callback_data != "adm:split_order"
+        for row in keyboard.inline_keyboard
+        for button in row
+    )
 
 
 def test_completed_public_profile_gets_base_price_button(tmp_path):
@@ -57,6 +62,8 @@ def test_employee_with_sales_channel_gets_my_shipments_button(tmp_path):
         ]
         own = next(button for button in buttons if button.callback_data == "myship:menu")
         assert own.text == "📈 Мои отгрузки"
+        beta = next(button for button in buttons if button.callback_data == "adm:split_order")
+        assert beta.text == "🧪 Распределить заказ по складам · БЕТА"
     finally:
         if previous is not None:
             bot.materials_db = previous

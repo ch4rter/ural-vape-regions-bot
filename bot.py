@@ -462,6 +462,11 @@ def main_menu(user_id: int | None) -> InlineKeyboardMarkup:
     elif user_id and materials_db.get_lead_profile(user_id):
         buttons.append(InlineKeyboardButton(text="📄 Получить прайсы", callback_data="public:prices"))
     rows = button_grid(buttons)
+    if internal:
+        rows.append([InlineKeyboardButton(
+            text="🧪 Распределить заказ по складам · БЕТА",
+            callback_data="adm:split_order",
+        )])
     extra = []
     if can_broadcast(user_id):
         extra.append(InlineKeyboardButton(text="📣 Рассылки", callback_data="main:broadcasts"))
@@ -3741,10 +3746,6 @@ def price_admin_keyboard() -> InlineKeyboardMarkup:
         text="🔄 Сформировать из МоегоСклада",
         callback_data="adm:moysklad_price",
     )])
-    rows.append([InlineKeyboardButton(
-        text="🧪 Распределить заказ по складам · БЕТА",
-        callback_data="adm:split_order",
-    )])
     rows.append(compact_nav("main:admin"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -3860,7 +3861,11 @@ async def my_shipments_menu(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "adm:split_order")
 async def choose_order_priority(callback: CallbackQuery, state: FSMContext) -> None:
-    if not await require_admin(callback):
+    if (
+        callback.message.chat.type != "private"
+        or not has_internal_access(callback.from_user.id, callback.from_user.username)
+    ):
+        await callback.answer("Функция доступна сотрудникам из белого списка.", show_alert=True)
         return
     await cleanup_pending_excel(state)
     await state.clear()
@@ -3877,7 +3882,7 @@ async def choose_order_priority(callback: CallbackQuery, state: FSMContext) -> N
         "с него, затем оптимально подключит остальные разрешённые склады.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             *button_grid(buttons),
-            compact_nav("adm:prices"),
+            compact_nav(),
         ]),
     )
     await callback.answer()
@@ -3885,7 +3890,11 @@ async def choose_order_priority(callback: CallbackQuery, state: FSMContext) -> N
 
 @router.callback_query(F.data.startswith("adm:split_priority:"))
 async def start_order_split_upload(callback: CallbackQuery, state: FSMContext) -> None:
-    if not await require_admin(callback):
+    if (
+        callback.message.chat.type != "private"
+        or not has_internal_access(callback.from_user.id, callback.from_user.username)
+    ):
+        await callback.answer("Функция доступна сотрудникам из белого списка.", show_alert=True)
         return
     try:
         priority = ORDER_STORES[int(callback.data.rsplit(":", 1)[1])]
@@ -3914,7 +3923,10 @@ def _quantity_text(value: Decimal) -> str:
 
 @router.message(AdminState.order_split_upload)
 async def receive_order_for_split(message: Message, state: FSMContext, bot: Bot) -> None:
-    if not is_admin(message.from_user.id) or message.chat.type != "private":
+    if (
+        message.chat.type != "private"
+        or not has_internal_access(message.from_user.id, message.from_user.username)
+    ):
         return
     if not message.document or not (message.document.file_name or "").lower().endswith(".xlsx"):
         await message.answer("Пришлите заполненный прайс как Excel-файл в формате <code>.xlsx</code>.")
@@ -3976,7 +3988,7 @@ async def receive_order_for_split(message: Message, state: FSMContext, bot: Bot)
                 f"(<b>{completion.quantize(Decimal('0.1'))}%</b>)\n"
                 f"Использованные склады: <b>{html.escape(used_stores)}</b>"
                 + shortage_note + unknown_note,
-                reply_markup=price_admin_keyboard(),
+                reply_markup=main_menu(message.from_user.id),
             )
             for store_name, path in result.files:
                 await message.answer_document(
