@@ -231,11 +231,16 @@ def split_customer_order(
     source: Path,
     destination_dir: Path,
     priority_store: str,
+    secondary_store: str,
     *,
     client: MoySkladClient | None = None,
 ) -> OrderSplitResult:
     if priority_store not in ORDER_STORES:
         raise MoySkladError("Выбран неизвестный приоритетный склад.")
+    if secondary_store not in ORDER_STORES:
+        raise MoySkladError("Выбран неизвестный склад второго приоритета.")
+    if secondary_store == priority_store:
+        raise MoySkladError("Первый и второй приоритет должны быть разными складами.")
     lines = read_customer_order(source)
     client = client or MoySkladClient(token)
     selected_stores = _select_stores(client.stores(), ORDER_STORES)
@@ -251,32 +256,11 @@ def split_customer_order(
     assortment_ids = _assortment_by_requested_code(client.assortment(), requested_codes)
     store_index = {name: index for index, name in enumerate(ORDER_STORES)}
 
-    primary_index = store_index[priority_store]
-    remaining_after_primary: dict[str, Decimal] = {}
-    for line in lines:
-        assortment_id = assortment_ids.get(line.code.casefold(), "")
-        balances = stock.get(assortment_id, (Decimal(0),) * len(ORDER_STORES))
-        remaining_after_primary[line.code.casefold()] = max(
-            Decimal(0), line.quantity - balances[primary_index]
-        )
-
-    secondary = [name for name in ORDER_STORES if name != priority_store]
-    secondary.sort(
-        key=lambda name: (
-            -sum(
-                min(
-                    remaining_after_primary[line.code.casefold()],
-                    stock.get(
-                        assortment_ids.get(line.code.casefold(), ""),
-                        (Decimal(0),) * len(ORDER_STORES),
-                    )[store_index[name]],
-                )
-                for line in lines
-            ),
-            ORDER_STORES.index(name),
-        )
+    final_store = next(
+        name for name in ORDER_STORES
+        if name not in {priority_store, secondary_store}
     )
-    allocation_order = (priority_store, *secondary)
+    allocation_order = (priority_store, secondary_store, final_store)
     allocations: dict[str, list[AllocatedOrderLine]] = {name: [] for name in ORDER_STORES}
     shortages: list[AllocatedOrderLine] = []
     unknown_codes = []

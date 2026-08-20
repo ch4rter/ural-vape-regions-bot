@@ -3878,8 +3878,8 @@ async def choose_order_priority(callback: CallbackQuery, state: FSMContext) -> N
     ]
     await callback.message.edit_text(
         "🧪 <b>Распределение заказа по складам · БЕТА</b>\n\n"
-        "Выберите приоритетный склад. Бот сначала возьмёт максимум доступного товара "
-        "с него, затем оптимально подключит остальные разрешённые склады.",
+        "Выберите склад <b>первого приоритета</b>. Бот сначала возьмёт максимум "
+        "доступного товара с него.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             *button_grid(buttons),
             compact_nav(),
@@ -3889,7 +3889,7 @@ async def choose_order_priority(callback: CallbackQuery, state: FSMContext) -> N
 
 
 @router.callback_query(F.data.startswith("adm:split_priority:"))
-async def start_order_split_upload(callback: CallbackQuery, state: FSMContext) -> None:
+async def choose_order_secondary_priority(callback: CallbackQuery, state: FSMContext) -> None:
     if (
         callback.message.chat.type != "private"
         or not has_internal_access(callback.from_user.id, callback.from_user.username)
@@ -3901,13 +3901,60 @@ async def start_order_split_upload(callback: CallbackQuery, state: FSMContext) -
     except (ValueError, IndexError):
         await callback.answer("Неизвестный склад.", show_alert=True)
         return
+    first_index = ORDER_STORES.index(priority)
+    buttons = [
+        InlineKeyboardButton(
+            text=name,
+            callback_data=f"adm:split_secondary:{first_index}:{index}",
+        )
+        for index, name in enumerate(ORDER_STORES)
+        if name != priority
+    ]
+    await callback.message.edit_text(
+        "🧪 <b>Распределение заказа по складам · БЕТА</b>\n\n"
+        f"Первый приоритет: <b>{html.escape(priority)}</b>\n\n"
+        "Теперь выберите склад <b>второго приоритета</b>. Оставшийся склад "
+        "автоматически станет третьим.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            *button_grid(buttons),
+            compact_nav("adm:split_order"),
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:split_secondary:"))
+async def start_order_split_upload(callback: CallbackQuery, state: FSMContext) -> None:
+    if (
+        callback.message.chat.type != "private"
+        or not has_internal_access(callback.from_user.id, callback.from_user.username)
+    ):
+        await callback.answer("Функция доступна сотрудникам из белого списка.", show_alert=True)
+        return
+    try:
+        _, _, first_raw, second_raw = callback.data.split(":")
+        priority = ORDER_STORES[int(first_raw)]
+        secondary = ORDER_STORES[int(second_raw)]
+    except (ValueError, IndexError):
+        await callback.answer("Неизвестная очередность складов.", show_alert=True)
+        return
+    if priority == secondary:
+        await callback.answer("Выберите разные склады.", show_alert=True)
+        return
+    final_store = next(
+        name for name in ORDER_STORES if name not in {priority, secondary}
+    )
     await state.set_state(AdminState.order_split_upload)
-    await state.update_data(order_split_priority=priority)
+    await state.update_data(
+        order_split_priority=priority,
+        order_split_secondary=secondary,
+    )
     await callback.message.edit_text(
         "📎 <b>Отправьте заполненный клиентом общий прайс</b>\n\n"
         "Формат: <code>.xlsx</code>. Заказанное количество должно быть указано в колонке "
         "«Количество».\n\n"
-        f"Приоритетный склад: <b>{html.escape(priority)}</b>\n"
+        f"Очередность: <b>{html.escape(priority)} → {html.escape(secondary)} → "
+        f"{html.escape(final_store)}</b>\n"
         "Используются только склады: <b>Мордор, Годзибасы и Жможики</b>.\n\n"
         "Бот ничего не создаёт и не изменяет в МоемСкладе — только читает актуальные остатки.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[compact_nav("adm:split_order")]),
@@ -3940,9 +3987,14 @@ async def receive_order_for_split(message: Message, state: FSMContext, bot: Bot)
         return
     data = await state.get_data()
     priority = str(data.get("order_split_priority", ""))
-    if priority not in ORDER_STORES:
+    secondary = str(data.get("order_split_secondary", ""))
+    if (
+        priority not in ORDER_STORES
+        or secondary not in ORDER_STORES
+        or priority == secondary
+    ):
         await state.clear()
-        await message.answer("Не удалось определить приоритетный склад. Начните заново.")
+        await message.answer("Не удалось определить очередность складов. Начните заново.")
         return
 
     order_splits_in_progress.add(message.from_user.id)
@@ -3963,6 +4015,7 @@ async def receive_order_for_split(message: Message, state: FSMContext, bot: Bot)
                 source,
                 Path(temporary),
                 priority,
+                secondary,
             )
             used_stores = ", ".join(name for name, _ in result.files) or "нет"
             completion = (
@@ -3980,7 +4033,6 @@ async def receive_order_for_split(message: Message, state: FSMContext, bot: Bot)
             )
             await message.answer(
                 "✅ <b>Заказ распределён</b>\n\n"
-                f"Приоритет: <b>{html.escape(priority)}</b>\n"
                 f"Порядок распределения: <b>{html.escape(' → '.join(result.allocation_order))}</b>\n"
                 f"Заказано: <b>{_quantity_text(result.requested_quantity)}</b> ед. · "
                 f"<b>{result.line_count}</b> позиций\n"

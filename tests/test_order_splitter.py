@@ -74,7 +74,8 @@ def test_splits_order_with_priority_and_compact_outputs(tmp_path):
     source = tmp_path / "customer.xlsx"
     customer_price(source)
     result = split_customer_order(
-        "token", source, tmp_path / "result", "Мордор", client=FakeOrderClient()
+        "token", source, tmp_path / "result", "Мордор", "Жможики",
+        client=FakeOrderClient(),
     )
 
     assert result.allocation_order == ("Мордор", "Жможики", "Годзибасы")
@@ -106,3 +107,23 @@ def test_splits_order_with_priority_and_compact_outputs(tmp_path):
     assert shortage.active["A2"].value == "003"
     assert shortage.active["E2"].value == 2
     shortage.close()
+
+
+def test_respects_explicit_second_priority(tmp_path):
+    source = tmp_path / "customer.xlsx"
+    customer_price(source)
+    result = split_customer_order(
+        "token", source, tmp_path / "second-priority", "Мордор", "Годзибасы",
+        client=FakeOrderClient(),
+    )
+
+    assert result.allocation_order == ("Мордор", "Годзибасы", "Жможики")
+    assert [name for name, _ in result.files] == ["Мордор", "Годзибасы", "Жможики"]
+    godzipasy = load_workbook(result.files[1][1], data_only=True)
+    assert godzipasy.active["A2"].value == "001"
+    assert godzipasy.active["E2"].value == 2
+    godzipasy.close()
+    zhmozhiki = load_workbook(result.files[2][1], data_only=True)
+    assert zhmozhiki.active["A2"].value == "001"
+    assert zhmozhiki.active["E2"].value == 4
+    zhmozhiki.close()
