@@ -72,7 +72,7 @@ def test_access_by_id_and_username_binding(tmp_path):
 def test_roles_chat_registry_and_settings(tmp_path):
     db = MaterialsDB(tmp_path / "materials.sqlite3")
     user = db.add_access_user("123456789")
-    assert db.user_role(123456789) == "user"
+    assert db.user_role(123456789) == "employee"
     db.set_access_role(user.id, "junior_admin")
     assert db.user_role(123456789) == "junior_admin"
     channel_href = "https://api.moysklad.ru/api/remap/1.2/entity/saleschannel/valera"
@@ -224,5 +224,44 @@ def test_existing_access_table_gets_role_migration(tmp_path):
     connection.close()
 
     db = MaterialsDB(path)
-    assert db.user_role(123456789) == "user"
+    assert db.user_role(123456789) == "employee"
     assert db.user_sales_channel(123456789) is None
+
+
+def test_employee_permissions_and_sales_teams(tmp_path):
+    db = MaterialsDB(tmp_path / "materials.sqlite3")
+    manager_one = db.add_access_user("100000001")
+    manager_two = db.add_access_user("100000002")
+    assistant = db.add_access_user("100000003")
+    db.set_access_role(manager_one.id, "manager")
+    db.set_access_role(manager_two.id, "manager")
+    db.set_access_role(assistant.id, "assistant")
+    db.set_access_sales_channel(manager_one.id, "Валера", "https://api.moysklad.ru/api/remap/1.2/entity/saleschannel/1")
+    db.set_access_sales_channel(manager_two.id, "Андрей", "https://api.moysklad.ru/api/remap/1.2/entity/saleschannel/2")
+    db.set_team_assistant(manager_one.id, assistant.id)
+    db.set_team_assistant(manager_two.id, assistant.id)
+
+    assert db.team_assistant(manager_one.id).telegram_id == 100000003
+    assert db.team_assistant(manager_two.id).telegram_id == 100000003
+    assert len(db.list_sales_teams()) == 2
+    assert db.access_user_by_channel(
+        "https://api.moysklad.ru/api/remap/1.2/entity/saleschannel/1?expand=x"
+    ).id == manager_one.id
+
+    db.set_access_permission(assistant.id, "manage_prices", True)
+    assert db.user_permissions(100000003) == {"manage_prices"}
+    db.set_access_permission(assistant.id, "manage_prices", False)
+    assert db.user_permissions(100000003) == set()
+
+
+def test_legacy_junior_permissions_are_seeded_only_once(tmp_path):
+    path = tmp_path / "legacy.sqlite3"
+    db = MaterialsDB(path)
+    user = db.add_access_user("100000004")
+    db.set_access_role(user.id, "junior_admin")
+    # The migration already ran before this user was promoted, so permissions
+    # remain explicitly controlled rather than being silently restored.
+    db.set_access_permission(user.id, "broadcasts", True)
+    db.set_access_permission(user.id, "broadcasts", False)
+    reopened = MaterialsDB(path)
+    assert reopened.permissions_for_access(user.id) == set()

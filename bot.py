@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import suppress
 import html
 import logging
 import os
@@ -9,7 +10,7 @@ import tempfile
 import zipfile
 from typing import Any, Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from difflib import SequenceMatcher
 from itertools import chain
@@ -55,6 +56,12 @@ from moysklad_bonus import (
     save_classification,
 )
 from order_splitter import ORDER_STORES, split_customer_order
+from order_notifications import (
+    OrderNotice,
+    checked_notification_targets,
+    fetch_changed_orders,
+    review_notification_targets,
+)
 from prices_db import (
     PRICE_SOURCE,
     WAREHOUSES,
@@ -106,6 +113,22 @@ DEFAULT_PRICE_COMMAND_MESSAGE = (
     "📄 <b>Актуальный прайс</b>\n\n"
     "Ниже представлена последняя загруженная версия с базовыми ценами."
 )
+PERMISSION_LABELS = {
+    "broadcasts": "Рассылки",
+    "price_message": "Текст и вложение /прайс",
+    "bonus_reports": "Общие премиальные отчёты",
+    "manage_prices": "Управление прайсами",
+    "manage_regions": "Регионы и Excel",
+    "manage_materials": "База материалов",
+    "view_leads": "Анкеты клиентов",
+    "manage_order_routing": "Команды и уведомления заказов",
+}
+ROLE_LABELS = {
+    "employee": "Сотрудник",
+    "junior_admin": "Младший администратор",
+    "manager": "Менеджер",
+    "assistant": "Помощник",
+}
 LEGACY_DEFAULT_PRICE_COMMAND_MESSAGE = (
     "📄 <b>Актуальные прайсы</b>\n\n"
     "<b>Центр</b> — Москва\n"
@@ -403,12 +426,34 @@ def is_junior_admin(user_id: int | None, username: str | None = None) -> bool:
     return bool(user_id and materials_db.user_role(user_id, username) == "junior_admin")
 
 
+def has_permission(
+    user_id: int | None, permission: str, username: str | None = None
+) -> bool:
+    return bool(
+        user_id
+        and (
+            is_admin(user_id)
+            or permission in materials_db.user_permissions(user_id, username)
+        )
+    )
+
+
 def can_broadcast(user_id: int | None, username: str | None = None) -> bool:
-    return is_admin(user_id) or is_junior_admin(user_id, username)
+    return has_permission(user_id, "broadcasts", username)
 
 
 def can_manage_price_message(user_id: int | None, username: str | None = None) -> bool:
-    return is_admin(user_id) or is_junior_admin(user_id, username)
+    return has_permission(user_id, "price_message", username)
+
+
+def has_management_access(user_id: int | None, username: str | None = None) -> bool:
+    return bool(
+        user_id
+        and (
+            is_admin(user_id)
+            or materials_db.user_permissions(user_id, username)
+        )
+    )
 
 
 def has_internal_access(user_id: int | None, username: str | None = None) -> bool:
@@ -470,7 +515,7 @@ def main_menu(user_id: int | None) -> InlineKeyboardMarkup:
     extra = []
     if can_broadcast(user_id):
         extra.append(InlineKeyboardButton(text="📣 Рассылки", callback_data="main:broadcasts"))
-    if can_manage_price_message(user_id):
+    if has_management_access(user_id):
         extra.append(InlineKeyboardButton(text="⚙️ Управление", callback_data="main:admin"))
     rows.extend(button_grid(extra))
     if user_id in crm_beta_ids:
@@ -3046,12 +3091,18 @@ async def show_price_variants(callback: CallbackQuery) -> None:
 
 
 def products_keyboard(
-    admin: bool = False, public_only: bool = False, include_navigation: bool = True
+    admin: bool = False, public_only: bool = False, include_navigation: bool = True,
+    actor_id: int | None = None, actor_username: str | None = None,
 ) -> InlineKeyboardMarkup:
+    can_edit_materials = not admin or actor_id is None or has_permission(
+        actor_id, "manage_materials", actor_username
+    )
     products = (
         materials_db.list_public_products()
         if public_only
         else materials_db.list_products(visible_only=not admin)
+        if can_edit_materials
+        else []
     )
     rows = []
     for product in products:
@@ -3060,17 +3111,32 @@ def products_keyboard(
         prefix = "adm:p" if admin else "db:p"
         rows.append([InlineKeyboardButton(text=text, callback_data=f"{prefix}:{product.id}")])
     if admin:
-        rows.extend(button_grid([
-            InlineKeyboardButton(text="➕ Товар", callback_data="adm:add_product"),
-            InlineKeyboardButton(text="💰 Прайсы", callback_data="adm:prices"),
-            InlineKeyboardButton(text="👥 Доступ", callback_data="adm:access"),
-            InlineKeyboardButton(text="📊 Excel", callback_data="adm:excel"),
-            InlineKeyboardButton(text="🗺 Регионы", callback_data="adm:regions"),
-            InlineKeyboardButton(text="✏️ Текст /прайс", callback_data="adm:price_message"),
-            InlineKeyboardButton(text="📝 Анкеты клиентов", callback_data="adm:leads"),
-            InlineKeyboardButton(text="📈 Премиальный отчёт", callback_data="bonus:menu"),
-        ]))
-        rows.append([InlineKeyboardButton(text="💾 Скачать резервную копию", callback_data="adm:backup")])
+        admin_buttons = []
+        allowed = lambda permission: actor_id is None or has_permission(
+            actor_id, permission, actor_username
+        )
+        if allowed("manage_materials"):
+            admin_buttons.append(InlineKeyboardButton(text="➕ Товар", callback_data="adm:add_product"))
+        if allowed("manage_prices"):
+            admin_buttons.append(InlineKeyboardButton(text="💰 Прайсы", callback_data="adm:prices"))
+        if actor_id is None or is_admin(actor_id):
+            admin_buttons.append(InlineKeyboardButton(text="👥 Сотрудники и команды", callback_data="adm:access"))
+        elif allowed("manage_order_routing"):
+            admin_buttons.append(InlineKeyboardButton(text="🤝 Команды", callback_data="adm:teams"))
+        if allowed("manage_regions"):
+            admin_buttons.extend([
+                InlineKeyboardButton(text="📊 Excel", callback_data="adm:excel"),
+                InlineKeyboardButton(text="🗺 Регионы", callback_data="adm:regions"),
+            ])
+        if allowed("price_message"):
+            admin_buttons.append(InlineKeyboardButton(text="✏️ Текст /прайс", callback_data="adm:price_message"))
+        if allowed("view_leads"):
+            admin_buttons.append(InlineKeyboardButton(text="📝 Анкеты клиентов", callback_data="adm:leads"))
+        if allowed("bonus_reports"):
+            admin_buttons.append(InlineKeyboardButton(text="📈 Премиальный отчёт", callback_data="bonus:menu"))
+        rows.extend(button_grid(admin_buttons))
+        if actor_id is None or is_admin(actor_id):
+            rows.append([InlineKeyboardButton(text="💾 Скачать резервную копию", callback_data="adm:backup")])
     if include_navigation:
         rows.append(compact_nav())
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -3209,6 +3275,40 @@ async def deliver_section(callback: CallbackQuery, bot: Bot) -> None:
 async def require_admin(callback: CallbackQuery) -> bool:
     if is_admin(callback.from_user.id) and callback.message.chat.type == "private":
         return True
+    data = callback.data or ""
+    permission = None
+    permission_prefixes = {
+        "manage_prices": (
+            "adm:prices", "adm:price_wh:", "adm:moysklad_price",
+            "adm:apply_price", "adm:cancel_price",
+        ),
+        "manage_regions": (
+            "adm:regions", "adm:missing_regions:", "adm:missing_region:",
+            "adm:add_region", "adm:add_missing_region:", "adm:ignore_missing_region:",
+            "adm:region_manager:", "adm:download_regions", "adm:excel",
+            "adm:apply_excel", "adm:cancel_excel",
+        ),
+        "manage_materials": (
+            "adm:p:", "adm:s:", "adm:add_product", "adm:add_section:",
+            "adm:add_material:", "adm:rename_product:", "adm:rename_section:",
+            "adm:toggle_product:", "adm:toggle_section_public:", "adm:preview:",
+            "adm:finish_upload", "adm:confirm_product:",
+            "adm:delete_product:", "adm:confirm_section:", "adm:delete_section:",
+            "adm:confirm_material:", "adm:delete_material:",
+        ),
+        "view_leads": ("adm:leads",),
+        "manage_order_routing": ("adm:teams", "adm:team_", "adm:reviewer"),
+    }
+    for candidate, prefixes in permission_prefixes.items():
+        if any(data == prefix or data.startswith(prefix) for prefix in prefixes):
+            permission = candidate
+            break
+    if (
+        permission
+        and callback.message.chat.type == "private"
+        and has_permission(callback.from_user.id, permission, callback.from_user.username)
+    ):
+        return True
     await callback.answer("Этот раздел доступен только администратору.", show_alert=True)
     return False
 
@@ -3218,7 +3318,7 @@ async def require_bonus_report_access(callback: CallbackQuery) -> bool:
     if (
         user
         and callback.message.chat.type == "private"
-        and (is_admin(user.id) or is_junior_admin(user.id, user.username))
+        and has_permission(user.id, "bonus_reports", user.username)
     ):
         return True
     await callback.answer(
@@ -3428,7 +3528,7 @@ async def start_add_missing_region(callback: CallbackQuery, state: FSMContext) -
 
 @router.message(AdminState.region_territory, F.text)
 async def receive_region_territory(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id) or not valid_lead_answer(message.text):
+    if not has_permission(message.from_user.id, "manage_regions", message.from_user.username) or not valid_lead_answer(message.text):
         await message.answer("Введите корректное название территории.")
         return
     await state.update_data(region_territory=message.text.strip())
@@ -3441,7 +3541,7 @@ async def receive_region_territory(message: Message, state: FSMContext) -> None:
 
 @router.message(AdminState.region_location, F.text)
 async def receive_region_location(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id) or not valid_lead_answer(message.text):
+    if not has_permission(message.from_user.id, "manage_regions", message.from_user.username) or not valid_lead_answer(message.text):
         await message.answer("Введите корректное местоположение.")
         return
     managers = sorted({entry.manager for entry in catalog.entries} | {"Валера"})
@@ -3629,7 +3729,7 @@ async def start_excel_upload(callback: CallbackQuery, state: FSMContext) -> None
 
 @router.message(AdminState.excel_upload)
 async def receive_excel(message: Message, state: FSMContext, bot: Bot) -> None:
-    if not is_admin(message.from_user.id) or message.chat.type != "private":
+    if not has_permission(message.from_user.id, "manage_regions", message.from_user.username) or message.chat.type != "private":
         return
     if not message.document or not (message.document.file_name or "").lower().endswith(".xlsx"):
         await message.answer(
@@ -4294,7 +4394,7 @@ async def bonus_start_classification_upload(callback: CallbackQuery, state: FSMC
 
 @router.message(AdminState.bonus_classification_upload)
 async def bonus_receive_classification(message: Message, state: FSMContext, bot: Bot) -> None:
-    if not is_admin(message.from_user.id) or message.chat.type != "private":
+    if not has_permission(message.from_user.id, "manage_regions", message.from_user.username) or message.chat.type != "private":
         return
     data = await state.get_data()
     month = str(data.get("bonus_month", ""))
@@ -4598,7 +4698,7 @@ async def start_price_upload(callback: CallbackQuery, state: FSMContext) -> None
 
 @router.message(AdminState.price_upload)
 async def receive_price_file(message: Message, state: FSMContext, bot: Bot) -> None:
-    if not is_admin(message.from_user.id) or message.chat.type != "private":
+    if not has_permission(message.from_user.id, "manage_prices", message.from_user.username) or message.chat.type != "private":
         return
     data = await state.get_data()
     warehouse = data.get("price_warehouse")
@@ -4749,27 +4849,21 @@ async def cancel_price(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "main:admin")
 async def admin_menu(callback: CallbackQuery, state: FSMContext) -> None:
-    if not await require_price_message_admin(callback):
+    if (
+        callback.message.chat.type != "private"
+        or not has_management_access(callback.from_user.id, callback.from_user.username)
+    ):
+        await callback.answer("У вас нет доступных настроек.", show_alert=True)
         return
     await state.clear()
-    if not is_admin(callback.from_user.id):
-        await callback.message.edit_text(
-            "⚙️ <b>Управление</b>\n\n"
-            "Здесь можно настроить сообщение, которое бот отправляет перед актуальными прайсами.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✏️ Текст /прайс", callback_data="adm:price_message")],
-                [InlineKeyboardButton(text="📝 Анкеты клиентов", callback_data="adm:leads")],
-                [InlineKeyboardButton(text="📈 Премиальный отчёт", callback_data="bonus:menu")],
-                compact_nav(),
-            ]),
-        )
-        await callback.answer()
-        return
     await callback.message.edit_text(
-        "⚙️ <b>Управление базой</b>\n\n"
-        "Создавайте товары, добавляйте разделы и наполняйте их материалами. "
-        "Скрытые товары видны здесь, но недоступны пользователям.",
-        reply_markup=products_keyboard(admin=True),
+        "⚙️ <b>Управление</b>\n\n"
+        "Здесь показаны только те разделы, которые доступны вашему сотруднику.",
+        reply_markup=products_keyboard(
+            admin=True,
+            actor_id=callback.from_user.id,
+            actor_username=callback.from_user.username,
+        ),
     )
     await callback.answer()
 
@@ -4810,7 +4904,7 @@ def build_leads_excel(destination: Path) -> int:
 
 @router.callback_query(F.data == "adm:leads")
 async def export_lead_profiles(callback: CallbackQuery) -> None:
-    if not await require_price_message_admin(callback):
+    if not await require_admin(callback):
         return
     profiles = materials_db.list_lead_profiles()
     if not profiles:
@@ -4983,22 +5077,31 @@ def access_user_label(user) -> str:
         parts.append(f"@{user.username}")
     if user.telegram_id:
         parts.append(f"ID {user.telegram_id}")
-    role = "младший администратор" if user.role == "junior_admin" else "пользователь"
+    role = ROLE_LABELS.get(user.role, user.role)
     return f"{' · '.join(parts)} · {role}"
+
+
+def compact_access_user_label(user, limit: int = 58) -> str:
+    """Keep employee labels inside Telegram's button text limit."""
+    label = access_user_label(user)
+    return label if len(label) <= limit else f"{label[:limit - 1]}…"
 
 
 def access_keyboard() -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton(
-                text=f"👤 {access_user_label(user)}",
+                text=f"👤 {compact_access_user_label(user, 56)}",
                 callback_data=f"adm:access_user:{user.id}",
             )
         ]
         for user in materials_db.list_access_users()
     ]
     rows.extend([
-        [InlineKeyboardButton(text="➕ Добавить пользователя", callback_data="adm:add_access")],
+        [
+            InlineKeyboardButton(text="➕ Добавить сотрудника", callback_data="adm:add_access"),
+            InlineKeyboardButton(text="🤝 Команды", callback_data="adm:teams"),
+        ],
         compact_nav("main:admin"),
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -5011,11 +5114,11 @@ async def manage_access(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     users = materials_db.list_access_users()
     await callback.message.edit_text(
-        "👥 <b>Белый список</b>\n\n"
-        f"Пользователей с доступом: <b>{len(users)}</b>\n\n"
+        "👥 <b>Сотрудники и команды</b>\n\n"
+        f"Активных сотрудников: <b>{len(users)}</b>\n\n"
         "Добавьте Telegram ID или @username. Username будет привязан к постоянному ID "
         "при первом обращении пользователя к боту.\n\n"
-        "Нажмите пользователя, чтобы изменить его роль или закрыть доступ.",
+        "В карточке сотрудника можно выбрать роль, канал продаж и индивидуальные разрешения.",
         reply_markup=access_keyboard(),
     )
     await callback.answer()
@@ -5028,16 +5131,28 @@ async def manage_access_user(callback: CallbackQuery, state: FSMContext) -> None
     user = materials_db.get_access_user(access_id)
     if not user:
         await callback.answer("Пользователь не найден.", show_alert=True); return
-    next_role = "user" if user.role == "junior_admin" else "junior_admin"
-    role_text = "Сделать пользователем" if next_role == "user" else "Назначить младшим администратором"
     channel_text = user.sales_channel_name or "не привязан"
+    permissions = materials_db.permissions_for_access(access_id)
+    assistant = materials_db.team_assistant(access_id) if user.role == "manager" else None
+    reviewer_id = materials_db.get_setting("order_review_reviewer_access_id") or ""
+    team_line = (
+        f"\nПомощник: <b>{html.escape(access_user_label(assistant)) if assistant else 'не назначен'}</b>"
+        if user.role == "manager" else ""
+    )
     await callback.message.edit_text(
         f"👤 <b>{html.escape(access_user_label(user))}</b>\n\n"
-        f"Канал продаж: <b>{html.escape(channel_text)}</b>\n\nВыберите действие:",
+        f"Роль: <b>{html.escape(ROLE_LABELS.get(user.role, user.role))}</b>\n"
+        f"Канал продаж: <b>{html.escape(channel_text)}</b>{team_line}\n"
+        f"Индивидуальных разрешений: <b>{len(permissions)}</b>\n"
+        f"Проверяющий руководитель: <b>{'да' if reviewer_id == str(access_id) else 'нет'}</b>\n\n"
+        "Выберите действие:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"🔑 {role_text}", callback_data=f"adm:set_role:{access_id}:{next_role}")],
-            [InlineKeyboardButton(text="📈 Привязать канал продаж", callback_data=f"adm:access_channel:{access_id}")],
+            [InlineKeyboardButton(text="👔 Изменить роль", callback_data=f"adm:roles:{access_id}")],
+            [InlineKeyboardButton(text="🔐 Разрешения", callback_data=f"adm:permissions:{access_id}")],
+            *([[InlineKeyboardButton(text="🤝 Назначить помощника", callback_data=f"adm:team_choose:{access_id}")]] if user.role == "manager" else []),
+            *([[InlineKeyboardButton(text="📈 Привязать канал продаж", callback_data=f"adm:access_channel:{access_id}")]] if user.role == "manager" else []),
             *([[InlineKeyboardButton(text="❌ Убрать канал продаж", callback_data=f"adm:clear_channel:{access_id}")]] if user.sales_channel_name else []),
+            [InlineKeyboardButton(text="🔎 Назначить проверяющим", callback_data=f"adm:reviewer_set:{access_id}")],
             [InlineKeyboardButton(text="🗑 Закрыть доступ", callback_data=f"adm:confirm_access:{access_id}")],
             compact_nav("adm:access"),
         ]),
@@ -5119,12 +5234,163 @@ async def clear_access_sales_channel(callback: CallbackQuery, state: FSMContext)
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("adm:roles:"))
+async def choose_access_role(callback: CallbackQuery) -> None:
+    if not await require_admin(callback): return
+    access_id = int(callback.data.rsplit(":", 1)[1])
+    rows = [[InlineKeyboardButton(
+        text=label, callback_data=f"adm:set_role:{access_id}:{role}"
+    )] for role, label in ROLE_LABELS.items()]
+    rows.append(compact_nav(f"adm:access_user:{access_id}"))
+    await callback.message.edit_text(
+        "👔 <b>Роль сотрудника</b>\n\n"
+        "Роль определяет место сотрудника в команде. Доступ младшего администратора "
+        "к настройкам задаётся отдельными разрешениями.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("adm:set_role:"))
 async def set_access_role(callback: CallbackQuery) -> None:
     if not await require_admin(callback): return
     _, _, raw_id, role = callback.data.split(":", 3)
     materials_db.set_access_role(int(raw_id), role)
-    await callback.message.edit_text("✅ Роль пользователя обновлена.", reply_markup=access_keyboard())
+    await callback.message.edit_text(
+        "✅ Роль сотрудника обновлена.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[compact_nav(f"adm:access_user:{raw_id}")]),
+    )
+    await callback.answer()
+
+
+def permissions_keyboard(access_id: int) -> InlineKeyboardMarkup:
+    enabled = materials_db.permissions_for_access(access_id)
+    rows = [[InlineKeyboardButton(
+        text=f"{'✅' if key in enabled else '◻️'} {label}",
+        callback_data=f"adm:permission:{access_id}:{key}",
+    )] for key, label in PERMISSION_LABELS.items()]
+    rows.append(compact_nav(f"adm:access_user:{access_id}"))
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("adm:permissions:"))
+async def access_permissions_menu(callback: CallbackQuery) -> None:
+    if not await require_admin(callback): return
+    access_id = int(callback.data.rsplit(":", 1)[1])
+    await callback.message.edit_text(
+        "🔐 <b>Индивидуальные разрешения</b>\n\n"
+        "Главный администратор всегда имеет полный доступ. Эти галочки управляют "
+        "разделами остальных сотрудников.",
+        reply_markup=permissions_keyboard(access_id),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:permission:"))
+async def toggle_access_permission(callback: CallbackQuery) -> None:
+    if not await require_admin(callback): return
+    _, _, raw_id, permission = callback.data.split(":", 3)
+    if permission not in PERMISSION_LABELS:
+        await callback.answer("Неизвестное разрешение.", show_alert=True); return
+    access_id = int(raw_id)
+    enabled = permission in materials_db.permissions_for_access(access_id)
+    materials_db.set_access_permission(access_id, permission, not enabled)
+    await callback.message.edit_reply_markup(reply_markup=permissions_keyboard(access_id))
+    await callback.answer("Доступ отключён" if enabled else "Доступ включён")
+
+
+def teams_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for team in materials_db.list_sales_teams():
+        assistant = compact_access_user_label(team.assistant, 24) if team.assistant else "не назначен"
+        rows.append([InlineKeyboardButton(
+            text=f"{compact_access_user_label(team.manager, 30)} → {assistant}",
+            callback_data=f"adm:team_choose:{team.manager.id}",
+        )])
+    rows.append([InlineKeyboardButton(text="🔎 Выбрать проверяющего", callback_data="adm:reviewer_choose")])
+    rows.append(compact_nav("main:admin"))
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == "adm:teams")
+async def manage_sales_teams(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin(callback): return
+    await state.clear()
+    reviewer_raw = materials_db.get_setting("order_review_reviewer_access_id") or ""
+    reviewer = materials_db.get_access_user(int(reviewer_raw)) if reviewer_raw.isdigit() else None
+    await callback.message.edit_text(
+        "🤝 <b>Команды и уведомления заказов</b>\n\n"
+        f"Проверяющий руководитель: <b>{html.escape(access_user_label(reviewer)) if reviewer else 'не назначен'}</b>\n\n"
+        "У каждого менеджера может быть один помощник. Один помощник может обслуживать "
+        "нескольких менеджеров.",
+        reply_markup=teams_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:team_choose:"))
+async def choose_team_assistant(callback: CallbackQuery) -> None:
+    if not await require_admin(callback): return
+    manager_id = int(callback.data.rsplit(":", 1)[1])
+    manager = materials_db.get_access_user(manager_id)
+    if not manager or manager.role != "manager":
+        await callback.answer("Сначала назначьте сотруднику роль менеджера.", show_alert=True); return
+    assistants = [user for user in materials_db.list_access_users() if user.role == "assistant"]
+    rows = [[InlineKeyboardButton(
+        text=compact_access_user_label(user),
+        callback_data=f"adm:team_set:{manager_id}:{user.id}",
+    )] for user in assistants]
+    rows.append([InlineKeyboardButton(
+        text="❌ Без помощника", callback_data=f"adm:team_set:{manager_id}:0"
+    )])
+    rows.append(compact_nav("adm:teams"))
+    await callback.message.edit_text(
+        "🤝 <b>Помощник менеджера</b>\n\n"
+        f"Менеджер: <b>{html.escape(access_user_label(manager))}</b>\n\n"
+        "Выберите помощника. Если Telegram не сможет доставить ему уведомление, "
+        "бот автоматически отправит его менеджеру.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:team_set:"))
+async def set_team_assistant(callback: CallbackQuery) -> None:
+    if not await require_admin(callback): return
+    _, _, manager_raw, assistant_raw = callback.data.split(":")
+    try:
+        materials_db.set_team_assistant(
+            int(manager_raw), int(assistant_raw) if int(assistant_raw) else None
+        )
+    except ValueError as error:
+        await callback.answer(str(error), show_alert=True); return
+    await callback.message.edit_text("✅ Команда обновлена.", reply_markup=teams_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adm:reviewer_choose")
+async def choose_order_reviewer(callback: CallbackQuery) -> None:
+    if not await require_admin(callback): return
+    rows = [[InlineKeyboardButton(
+        text=compact_access_user_label(user), callback_data=f"adm:reviewer_set:{user.id}"
+    )] for user in materials_db.list_access_users()]
+    rows.append(compact_nav("adm:teams"))
+    await callback.message.edit_text(
+        "🔎 <b>Проверяющий руководитель</b>\n\n"
+        "Он будет получать новые заказы в статусе «Ожидает проверки».",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:reviewer_set:"))
+async def set_order_reviewer(callback: CallbackQuery) -> None:
+    if not await require_admin(callback): return
+    access_id = int(callback.data.rsplit(":", 1)[1])
+    if not materials_db.get_access_user(access_id):
+        await callback.answer("Сотрудник не найден.", show_alert=True); return
+    materials_db.set_setting("order_review_reviewer_access_id", str(access_id))
+    await callback.message.edit_text("✅ Проверяющий руководитель назначен.", reply_markup=teams_keyboard())
     await callback.answer()
 
 
@@ -5211,7 +5477,7 @@ async def admin_add_product(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(AdminState.product_name, F.text)
 async def save_product(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
+    if not has_permission(message.from_user.id, "manage_materials", message.from_user.username):
         return
     try:
         product = materials_db.add_product(message.text)
@@ -5280,7 +5546,7 @@ async def admin_add_section(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(AdminState.section_name, F.text)
 async def save_section(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id): return
+    if not has_permission(message.from_user.id, "manage_materials", message.from_user.username): return
     product_id = (await state.get_data())["product_id"]
     try:
         section = materials_db.add_section(product_id, message.text)
@@ -5389,7 +5655,7 @@ async def start_upload(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(AdminState.material_upload)
 async def save_material(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id): return
+    if not has_permission(message.from_user.id, "manage_materials", message.from_user.username): return
     section_id = (await state.get_data())["section_id"]
     if message.text:
         materials_db.add_material(section_id, "text", text=message.text)
@@ -5448,7 +5714,7 @@ async def ask_product_rename(callback: CallbackQuery, state: FSMContext) -> None
 
 @router.message(AdminState.product_rename, F.text)
 async def save_product_rename(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id): return
+    if not has_permission(message.from_user.id, "manage_materials", message.from_user.username): return
     product_id = (await state.get_data())["product_id"]
     try: materials_db.rename_product(product_id, message.text)
     except sqlite3.IntegrityError:
@@ -5466,7 +5732,7 @@ async def ask_section_rename(callback: CallbackQuery, state: FSMContext) -> None
 
 @router.message(AdminState.section_rename, F.text)
 async def save_section_rename(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id): return
+    if not has_permission(message.from_user.id, "manage_materials", message.from_user.username): return
     section_id = (await state.get_data())["section_id"]
     try: materials_db.rename_section(section_id, message.text)
     except sqlite3.IntegrityError:
@@ -5549,6 +5815,127 @@ async def outside_mode(message: Message) -> None:
         "Чтобы продолжить, выберите нужный раздел:",
         reply_markup=main_menu(message.from_user.id if message.from_user else None),
     )
+
+
+def order_notice_text(notice: OrderNotice, *, checked: bool) -> str:
+    heading = "✅ <b>Заказ проверен</b>" if checked else "🔎 <b>Заказ ожидает проверки</b>"
+    purpose = (
+        "Заказ проверен руководителем и готов к дальнейшему оформлению."
+        if checked else
+        "Заказ передан на проверку руководителю."
+    )
+    money = f"{notice.total:,.2f}".replace(",", " ")
+    return (
+        f"{heading}\n\n"
+        f"Заказ: <b>{html.escape(notice.name)}</b>\n"
+        f"Контрагент: <b>{html.escape(notice.agent)}</b>\n"
+        f"Канал продаж: <b>{html.escape(notice.channel_name)}</b>\n"
+        f"Сумма: <b>{money} ₽</b>\n"
+        f"Дата заказа: <b>{html.escape(notice.moment[:16] or 'не указана')}</b>\n\n"
+        f"{purpose}"
+    )
+
+
+async def deliver_order_notice(
+    bot: Bot,
+    notice: OrderNotice,
+    recipients: tuple[int, ...],
+    *,
+    checked: bool,
+) -> int | None:
+    markup = None
+    if notice.web_url:
+        markup = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🔗 Открыть заказ в МоемСкладе", url=notice.web_url)
+        ]])
+    for recipient in recipients:
+        try:
+            await bot.send_message(
+                recipient,
+                order_notice_text(notice, checked=checked),
+                reply_markup=markup,
+            )
+            return recipient
+        except Exception as error:
+            logging.warning(
+                "Не удалось доставить уведомление о заказе %s пользователю %s: %s",
+                notice.name, recipient, error,
+            )
+    return None
+
+
+async def order_status_monitor(bot: Bot) -> None:
+    token = os.getenv("MOYSKLAD_TOKEN", "").strip()
+    if not token:
+        logging.warning("Мониторинг заказов отключён: не задан MOYSKLAD_TOKEN")
+        return
+    interval = max(30, min(600, int(os.getenv("MOYSKLAD_ORDER_POLL_SECONDS", "120"))))
+    pending_name = os.getenv(
+        "MOYSKLAD_REVIEW_PENDING_STATE", "Ожидает проверки"
+    ).strip().casefold()
+    checked_name = os.getenv("MOYSKLAD_REVIEWED_STATE", "Проверено").strip().casefold()
+    client = MoySkladClient(token)
+    cursor_key = "order_status_monitor_cursor"
+    if not materials_db.get_setting(cursor_key):
+        materials_db.set_setting(cursor_key, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        logging.info(
+            "Мониторинг заказов инициализирован без рассылки исторических заказов"
+        )
+    while True:
+        try:
+            cursor = materials_db.get_setting(cursor_key) or datetime.now().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            try:
+                cursor_dt = datetime.strptime(cursor[:19], "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                cursor_dt = datetime.now()
+            updated_from = (cursor_dt - timedelta(seconds=5)).strftime("%Y-%m-%d %H:%M:%S")
+            next_cursor = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            notices = await asyncio.to_thread(fetch_changed_orders, client, updated_from)
+            delivery_failed = False
+            for notice in sorted(notices, key=lambda item: (item.updated, item.order_id)):
+                previous = materials_db.order_watch_state(notice.order_id)
+                state_key = notice.state_name.casefold()
+                checked = state_key == checked_name
+                tracked = checked or state_key == pending_name
+                should_notify = tracked and (
+                    previous is None
+                    or previous["state_href"] != notice.state_href
+                    or previous["notified_state_href"] != notice.state_href
+                )
+                delivered = None
+                if should_notify:
+                    recipients = (
+                        checked_notification_targets(
+                            materials_db, notice.channel_href, admin_ids
+                        )
+                        if checked else
+                        review_notification_targets(materials_db, admin_ids)
+                    )
+                    delivered = await deliver_order_notice(
+                        bot, notice, recipients, checked=checked
+                    )
+                    if delivered is None:
+                        delivery_failed = True
+                        logging.error(
+                            "Уведомление о заказе %s не доставлено ни одному получателю",
+                            notice.name,
+                        )
+                materials_db.save_order_watch_state(
+                    notice.order_id,
+                    notice.state_href,
+                    notice.state_name,
+                    notice.updated,
+                    notified=delivered is not None,
+                )
+            if not delivery_failed:
+                materials_db.set_setting(cursor_key, next_cursor)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception("Ошибка фонового мониторинга статусов заказов")
+        await asyncio.sleep(interval)
 
 
 async def main() -> None:
@@ -5637,7 +6024,13 @@ async def main() -> None:
             )
             await asyncio.sleep(retry_delay)
             retry_delay = min(retry_delay * 2, 30)
-    await dispatcher.start_polling(bot)
+    monitor_task = asyncio.create_task(order_status_monitor(bot))
+    try:
+        await dispatcher.start_polling(bot)
+    finally:
+        monitor_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await monitor_task
 
 
 if __name__ == "__main__":

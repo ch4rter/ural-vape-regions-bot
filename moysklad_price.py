@@ -193,6 +193,17 @@ class MoySkladClient:
     def sales_channels(self) -> list[dict]:
         return self._rows("entity/saleschannel")
 
+    def changed_customer_orders(self, updated_from: str) -> list[dict]:
+        """Return recently changed customer orders without modifying MoySklad."""
+        return self._rows(
+            "entity/customerorder",
+            {
+                "limit": 100,
+                "filter": f"updated>={updated_from}",
+                "expand": "agent,state,salesChannel",
+            },
+        )
+
 
 def build_product_folder_mapping(
     token: str,

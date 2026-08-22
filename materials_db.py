@@ -42,6 +42,12 @@ class AccessUser:
 
 
 @dataclass(frozen=True)
+class SalesTeam:
+    manager: AccessUser
+    assistant: AccessUser | None
+
+
+@dataclass(frozen=True)
 class ClientChat:
     chat_id: int
     title: str
@@ -213,6 +219,28 @@ class MaterialsDB:
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY(wait_id, item_signature)
                 );
+                CREATE TABLE IF NOT EXISTS access_permissions (
+                    access_id INTEGER NOT NULL REFERENCES access_users(id) ON DELETE CASCADE,
+                    permission TEXT NOT NULL,
+                    PRIMARY KEY(access_id, permission)
+                );
+                CREATE TABLE IF NOT EXISTS sales_teams (
+                    manager_access_id INTEGER PRIMARY KEY
+                        REFERENCES access_users(id) ON DELETE CASCADE,
+                    assistant_access_id INTEGER
+                        REFERENCES access_users(id) ON DELETE SET NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    CHECK(manager_access_id != assistant_access_id)
+                );
+                CREATE TABLE IF NOT EXISTS order_status_watch (
+                    order_id TEXT PRIMARY KEY,
+                    state_href TEXT NOT NULL,
+                    state_name TEXT NOT NULL,
+                    order_updated_at TEXT NOT NULL DEFAULT '',
+                    notified_state_href TEXT,
+                    notified_updated_at TEXT,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
                 """
             )
             columns = {row[1] for row in connection.execute("PRAGMA table_info(access_users)")}
@@ -222,6 +250,32 @@ class MaterialsDB:
                 connection.execute("ALTER TABLE access_users ADD COLUMN sales_channel_name TEXT")
             if "sales_channel_href" not in columns:
                 connection.execute("ALTER TABLE access_users ADD COLUMN sales_channel_href TEXT")
+            connection.execute(
+                """UPDATE access_users SET role = 'manager'
+                   WHERE role = 'user' AND sales_channel_href IS NOT NULL"""
+            )
+            connection.execute(
+                "UPDATE access_users SET role = 'employee' WHERE role = 'user'"
+            )
+            permission_migration = connection.execute(
+                "SELECT value FROM settings WHERE key = 'permissions_migration_v1'"
+            ).fetchone()
+            if not permission_migration:
+                legacy_permissions = ("broadcasts", "price_message", "bonus_reports")
+                junior_ids = connection.execute(
+                    "SELECT id FROM access_users WHERE role = 'junior_admin'"
+                ).fetchall()
+                for row in junior_ids:
+                    for permission in legacy_permissions:
+                        connection.execute(
+                            """INSERT OR IGNORE INTO access_permissions(access_id, permission)
+                               VALUES (?, ?)""",
+                            (row["id"], permission),
+                        )
+                connection.execute(
+                    """INSERT INTO settings(key, value)
+                       VALUES ('permissions_migration_v1', '1')"""
+                )
             wait_columns = {row[1] for row in connection.execute("PRAGMA table_info(wait_entries)")}
             if "source_message_id" not in wait_columns:
                 connection.execute("ALTER TABLE wait_entries ADD COLUMN source_message_id INTEGER")
@@ -252,7 +306,7 @@ class MaterialsDB:
                 raise ValueError("Username должен содержать 5–32 латинских символа, цифры или _. ")
         with self._connect() as connection:
             cursor = connection.execute(
-                "INSERT INTO access_users(telegram_id, username) VALUES (?, ?)",
+                "INSERT INTO access_users(telegram_id, username, role) VALUES (?, ?, 'employee')",
                 (telegram_id, username),
             )
             access_id = cursor.lastrowid
@@ -328,10 +382,146 @@ class MaterialsDB:
         return row["role"] if row else None
 
     def set_access_role(self, access_id: int, role: str) -> None:
-        if role not in {"user", "junior_admin"}:
+        if role not in {"employee", "junior_admin", "manager", "assistant"}:
             raise ValueError("Неизвестная роль пользователя.")
         with self._connect() as connection:
             connection.execute("UPDATE access_users SET role = ? WHERE id = ?", (role, access_id))
+            if role != "manager":
+                connection.execute(
+                    "DELETE FROM sales_teams WHERE manager_access_id = ?", (access_id,)
+                )
+            if role != "assistant":
+                connection.execute(
+                    "UPDATE sales_teams SET assistant_access_id = NULL WHERE assistant_access_id = ?",
+                    (access_id,),
+                )
+
+    def access_user_by_telegram(
+        self, telegram_id: int, username: str | None = None
+    ) -> AccessUser | None:
+        if not self.authorize_user(telegram_id, username):
+            return None
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT id, telegram_id, username, role,
+                          sales_channel_name, sales_channel_href
+                   FROM access_users WHERE telegram_id = ?""",
+                (telegram_id,),
+            ).fetchone()
+        return self._access_user(row) if row else None
+
+    def access_user_by_channel(self, channel_href: str) -> AccessUser | None:
+        normalized = channel_href.split("?", 1)[0].rstrip("/")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT id, telegram_id, username, role,
+                          sales_channel_name, sales_channel_href
+                   FROM access_users
+                   WHERE sales_channel_href IS NOT NULL"""
+            ).fetchall()
+        for row in rows:
+            if str(row["sales_channel_href"]).split("?", 1)[0].rstrip("/") == normalized:
+                return self._access_user(row)
+        return None
+
+    def permissions_for_access(self, access_id: int) -> set[str]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT permission FROM access_permissions WHERE access_id = ?",
+                (access_id,),
+            ).fetchall()
+        return {row["permission"] for row in rows}
+
+    def user_permissions(self, telegram_id: int, username: str | None = None) -> set[str]:
+        user = self.access_user_by_telegram(telegram_id, username)
+        return self.permissions_for_access(user.id) if user else set()
+
+    def set_access_permission(self, access_id: int, permission: str, enabled: bool) -> None:
+        with self._connect() as connection:
+            if enabled:
+                connection.execute(
+                    """INSERT OR IGNORE INTO access_permissions(access_id, permission)
+                       VALUES (?, ?)""",
+                    (access_id, permission),
+                )
+            else:
+                connection.execute(
+                    "DELETE FROM access_permissions WHERE access_id = ? AND permission = ?",
+                    (access_id, permission),
+                )
+
+    def set_team_assistant(self, manager_access_id: int, assistant_access_id: int | None) -> None:
+        manager = self.get_access_user(manager_access_id)
+        if not manager or manager.role != "manager":
+            raise ValueError("Команду можно создать только для менеджера.")
+        if assistant_access_id is not None:
+            assistant = self.get_access_user(assistant_access_id)
+            if not assistant or assistant.role != "assistant":
+                raise ValueError("Выбранный сотрудник не является помощником.")
+            if assistant_access_id == manager_access_id:
+                raise ValueError("Менеджер не может быть собственным помощником.")
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO sales_teams(manager_access_id, assistant_access_id, updated_at)
+                   VALUES (?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(manager_access_id) DO UPDATE SET
+                       assistant_access_id=excluded.assistant_access_id,
+                       updated_at=CURRENT_TIMESTAMP""",
+                (manager_access_id, assistant_access_id),
+            )
+
+    def team_assistant(self, manager_access_id: int) -> AccessUser | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT u.id, u.telegram_id, u.username, u.role,
+                          u.sales_channel_name, u.sales_channel_href
+                   FROM sales_teams t
+                   JOIN access_users u ON u.id = t.assistant_access_id
+                   WHERE t.manager_access_id = ?""",
+                (manager_access_id,),
+            ).fetchone()
+        return self._access_user(row) if row else None
+
+    def list_sales_teams(self) -> list[SalesTeam]:
+        managers = [user for user in self.list_access_users() if user.role == "manager"]
+        return [SalesTeam(manager, self.team_assistant(manager.id)) for manager in managers]
+
+    def order_watch_state(self, order_id: str) -> sqlite3.Row | None:
+        with self._connect() as connection:
+            return connection.execute(
+                "SELECT * FROM order_status_watch WHERE order_id = ?", (order_id,)
+            ).fetchone()
+
+    def save_order_watch_state(
+        self,
+        order_id: str,
+        state_href: str,
+        state_name: str,
+        order_updated_at: str,
+        *,
+        notified: bool,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO order_status_watch(
+                       order_id, state_href, state_name, order_updated_at,
+                       notified_state_href, notified_updated_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(order_id) DO UPDATE SET
+                       state_href=excluded.state_href,
+                       state_name=excluded.state_name,
+                       order_updated_at=excluded.order_updated_at,
+                       notified_state_href=CASE WHEN excluded.notified_state_href IS NOT NULL
+                           THEN excluded.notified_state_href ELSE order_status_watch.notified_state_href END,
+                       notified_updated_at=CASE WHEN excluded.notified_updated_at IS NOT NULL
+                           THEN excluded.notified_updated_at ELSE order_status_watch.notified_updated_at END,
+                       updated_at=CURRENT_TIMESTAMP""",
+                (
+                    order_id, state_href, state_name, order_updated_at,
+                    state_href if notified else None,
+                    order_updated_at if notified else None,
+                ),
+            )
 
     def set_access_sales_channel(
         self, access_id: int, name: str | None, href: str | None
@@ -345,6 +535,12 @@ class MaterialsDB:
                    WHERE id = ?""",
                 (name, href, access_id),
             )
+            if href is not None:
+                connection.execute(
+                    """UPDATE access_users SET role = 'manager'
+                       WHERE id = ? AND role IN ('employee', 'assistant')""",
+                    (access_id,),
+                )
 
     def user_sales_channel(
         self, telegram_id: int, username: str | None = None

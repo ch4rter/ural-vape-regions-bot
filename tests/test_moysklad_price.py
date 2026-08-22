@@ -130,6 +130,26 @@ def test_current_availability_retries_without_store_filter_on_400():
     ]
 
 
+def test_changed_customer_orders_uses_filtered_read_only_collection():
+    client = MoySkladClient("test-token", opener=lambda *args, **kwargs: None)
+    calls = []
+
+    def fake_rows(endpoint, params):
+        calls.append((endpoint, params))
+        return []
+
+    client._rows = fake_rows
+    assert client.changed_customer_orders("2026-08-22 10:00:00") == []
+    assert calls == [(
+        "entity/customerorder",
+        {
+            "limit": 100,
+            "filter": "updated>=2026-08-22 10:00:00",
+            "expand": "agent,state,salesChannel",
+        },
+    )]
+
+
 def test_builds_read_only_price_for_available_selected_stock(tmp_path):
     destination = tmp_path / "common.xlsx"
     result = build_price_from_moysklad(
