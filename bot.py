@@ -29,6 +29,8 @@ from aiogram.types import (
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaDocument,
+    InputMediaPhoto,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
@@ -102,6 +104,10 @@ price_storage_path: Path
 bonus_storage_path: Path
 price_updates_in_progress: set[str] = set()
 broadcasts_in_progress: set[int] = set()
+broadcast_album_buffers: dict[tuple[int, int, str], list[Message]] = {}
+broadcast_album_tasks: dict[tuple[int, int, str], asyncio.Task] = {}
+material_album_counts: dict[tuple[int, int, str], int] = {}
+material_album_tasks: dict[tuple[int, int, str], asyncio.Task] = {}
 bonus_reports_in_progress: set[int] = set()
 order_splits_in_progress: set[int] = set()
 PRICE_MESSAGE_SETTING = "price_command_message"
@@ -2297,31 +2303,80 @@ async def receive_broadcast_audience(message: Message, state: FSMContext, bot: B
     )
 
 
+def broadcast_ready_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🧪 Тест", callback_data="broadcast:test"),
+            InlineKeyboardButton(text="✏️ Заменить", callback_data="broadcast:replace_content"),
+        ],
+        [InlineKeyboardButton(text="❌ Отменить", callback_data="main:broadcasts")],
+    ])
+
+
+async def copy_broadcast_source(
+    bot: Bot, target_chat_id: int, source_chat_id: int, message_ids: list[int]
+) -> None:
+    ordered = sorted(set(message_ids))
+    if len(ordered) == 1:
+        await bot.copy_message(target_chat_id, source_chat_id, ordered[0])
+    else:
+        await bot.copy_messages(target_chat_id, source_chat_id, ordered)
+
+
+async def finalize_broadcast_content(
+    message: Message, state: FSMContext, bot: Bot, message_ids: list[int]
+) -> None:
+    ordered = sorted(set(message_ids))
+    await state.update_data(
+        source_chat_id=message.chat.id,
+        source_message_id=ordered[0],
+        source_message_ids=ordered,
+    )
+    await state.set_state(BroadcastState.ready)
+    await message.answer("👁 <b>Предпросмотр поста:</b>")
+    await copy_broadcast_source(bot, message.chat.id, message.chat.id, ordered)
+    await message.answer(
+        "🧪 <b>Шаг 3 из 3</b>\n\nСначала отправьте тест в служебную группу.",
+        reply_markup=broadcast_ready_keyboard(),
+    )
+
+
+async def finalize_broadcast_album(
+    key: tuple[int, int, str], message: Message, state: FSMContext, bot: Bot
+) -> None:
+    await asyncio.sleep(1.0)
+    messages = broadcast_album_buffers.pop(key, [])
+    broadcast_album_tasks.pop(key, None)
+    if not messages or await state.get_state() != BroadcastState.content_upload.state:
+        return
+    await finalize_broadcast_content(
+        message, state, bot, [item.message_id for item in messages]
+    )
+
+
 @router.message(BroadcastState.content_upload)
-async def receive_broadcast_content(message: Message, state: FSMContext) -> None:
+async def receive_broadcast_content(message: Message, state: FSMContext, bot: Bot) -> None:
     if not can_broadcast(message.from_user.id, message.from_user.username): return
     if not (message.text or message.photo or message.video or message.document or message.animation):
         await message.answer("⚠️ Поддерживаются текст, фото, видео, анимация или документ."); return
-    await state.update_data(source_chat_id=message.chat.id, source_message_id=message.message_id)
-    await state.set_state(BroadcastState.ready)
-    await message.answer("👁 <b>Предпросмотр поста:</b>")
-    await message.copy_to(message.chat.id)
-    await message.answer(
-        "🧪 <b>Шаг 3 из 3</b>\n\nСначала отправьте тест в служебную группу.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🧪 Тест", callback_data="broadcast:test"),
-                InlineKeyboardButton(text="✏️ Заменить", callback_data="broadcast:replace_content"),
-            ],
-            [InlineKeyboardButton(text="❌ Отменить", callback_data="main:broadcasts")],
-        ]),
-    )
+    if message.media_group_id:
+        key = (message.from_user.id, message.chat.id, message.media_group_id)
+        broadcast_album_buffers.setdefault(key, []).append(message)
+        previous_task = broadcast_album_tasks.get(key)
+        if previous_task:
+            previous_task.cancel()
+        broadcast_album_tasks[key] = asyncio.create_task(
+            finalize_broadcast_album(key, message, state, bot)
+        )
+        return
+    await finalize_broadcast_content(message, state, bot, [message.message_id])
 
 
 @router.callback_query(F.data == "broadcast:replace_content")
 async def replace_broadcast_content(callback: CallbackQuery, state: FSMContext) -> None:
     if not await require_broadcaster(callback): return
     await state.set_state(BroadcastState.content_upload)
+    await state.update_data(source_message_id=None, source_message_ids=[])
     await callback.message.edit_text("✏️ Отправьте новый вариант поста.")
     await callback.answer()
 
@@ -2330,8 +2385,11 @@ async def replace_broadcast_content(callback: CallbackQuery, state: FSMContext) 
 async def test_broadcast(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     if not await require_broadcaster(callback): return
     data = await state.get_data()
+    message_ids = data.get("source_message_ids") or [data["source_message_id"]]
     try:
-        await bot.copy_message(SERVICE_CHAT_ID, data["source_chat_id"], data["source_message_id"])
+        await copy_broadcast_source(
+            bot, SERVICE_CHAT_ID, data["source_chat_id"], message_ids
+        )
     except Exception:
         logging.exception("Не удалось отправить тест рассылки")
         await callback.answer("Не удалось отправить тест. Проверьте доступ бота к служебной группе.", show_alert=True); return
@@ -2374,8 +2432,9 @@ async def run_client_broadcast(callback: CallbackQuery, state: FSMContext, bot: 
     data = await state.get_data()
     chat_ids = data.get("broadcast_chat_ids", [])
     source_chat_id = data.get("source_chat_id")
-    source_message_id = data.get("source_message_id")
-    if not chat_ids or not source_chat_id or not source_message_id:
+    source_message_ids = data.get("source_message_ids") or [data.get("source_message_id")]
+    source_message_ids = [value for value in source_message_ids if value]
+    if not chat_ids or not source_chat_id or not source_message_ids:
         await state.clear()
         await callback.answer("Черновик рассылки устарел. Создайте его заново.", show_alert=True); return
     broadcasts_in_progress.add(operator_id)
@@ -2397,13 +2456,17 @@ async def run_client_broadcast(callback: CallbackQuery, state: FSMContext, bot: 
                 failed += 1
             else:
                 try:
-                    await bot.copy_message(chat_id, source_chat_id, source_message_id)
+                    await copy_broadcast_source(
+                        bot, chat_id, source_chat_id, source_message_ids
+                    )
                     results.append({"title": title, "chat_id": chat_id, "status": "Отправлено", "error": ""})
                     sent += 1
                 except TelegramRetryAfter as error:
                     await asyncio.sleep(error.retry_after)
                     try:
-                        await bot.copy_message(chat_id, source_chat_id, source_message_id)
+                        await copy_broadcast_source(
+                            bot, chat_id, source_chat_id, source_message_ids
+                        )
                         results.append({"title": title, "chat_id": chat_id, "status": "Отправлено", "error": ""})
                         sent += 1
                     except Exception as retry_error:
@@ -3239,6 +3302,54 @@ async def send_material(bot: Bot, chat_id: int, material: Material) -> None:
         await bot.send_document(chat_id, material.file_id, caption=material.caption, parse_mode=None)
 
 
+def material_batches(items: list[Material]) -> list[list[Material]]:
+    """Return logical materials, keeping album elements in their original order."""
+    batches: list[list[Material]] = []
+    grouped: dict[str, list[Material]] = {}
+    for item in items:
+        if not item.media_group_id:
+            batches.append([item])
+            continue
+        batch = grouped.get(item.media_group_id)
+        if batch is None:
+            batch = []
+            grouped[item.media_group_id] = batch
+            batches.append(batch)
+        batch.append(item)
+    for batch in batches:
+        batch.sort(key=lambda item: (item.media_group_position or item.id, item.id))
+    return batches
+
+
+async def send_material_batch(bot: Bot, chat_id: int, batch: list[Material]) -> None:
+    if len(batch) == 1:
+        await send_material(bot, chat_id, batch[0])
+        return
+    if all(item.kind == "photo" for item in batch):
+        media = [
+            InputMediaPhoto(media=item.file_id, caption=item.caption, parse_mode=None)
+            for item in batch
+        ]
+    elif all(item.kind == "document" for item in batch):
+        media = [
+            InputMediaDocument(media=item.file_id, caption=item.caption, parse_mode=None)
+            for item in batch
+        ]
+    else:
+        # Telegram doesn't allow documents and photos in one standard album.
+        for item in batch:
+            await send_material(bot, chat_id, item)
+        return
+    await bot.send_media_group(chat_id=chat_id, media=media)
+
+
+async def send_material_collection(
+    bot: Bot, chat_id: int, items: list[Material]
+) -> None:
+    for batch in material_batches(items):
+        await send_material_batch(bot, chat_id, batch)
+
+
 @router.callback_query(F.data.startswith("db:s:"))
 async def deliver_section(callback: CallbackQuery, bot: Bot) -> None:
     section = materials_db.get_section(int(callback.data.rsplit(":", 1)[1]))
@@ -3261,11 +3372,14 @@ async def deliver_section(callback: CallbackQuery, bot: Bot) -> None:
         callback.message.chat.id,
         f"📎 <b>{html.escape(product.name)}</b>\nРаздел: <b>{html.escape(section.name)}</b>",
     )
-    for item in items:
+    for batch in material_batches(items):
         try:
-            await send_material(bot, callback.message.chat.id, item)
+            await send_material_batch(bot, callback.message.chat.id, batch)
         except Exception:
-            logging.exception("Не удалось отправить материал %s", item.id)
+            logging.exception(
+                "Не удалось отправить материал или альбом %s",
+                [item.id for item in batch],
+            )
             await bot.send_message(
                 callback.message.chat.id,
                 "⚠️ Один из материалов временно недоступен. Сообщите об этом администратору.",
@@ -5559,19 +5673,28 @@ async def save_section(message: Message, state: FSMContext) -> None:
     )
 
 
-def material_title(material: Material, number: int) -> str:
+def material_title(material: Material, number: int, count: int = 1) -> str:
     if material.kind == "text":
         preview = (material.text or "").replace("\n", " ")[:30]
         return f"🗑 {number}. Текст: {preview}"
     if material.kind == "photo":
-        return f"🗑 {number}. Изображение"
+        return (
+            f"🗑 {number}. Альбом · {count} изображений"
+            if count > 1 else f"🗑 {number}. Изображение"
+        )
+    if material.kind == "document" and count > 1:
+        return f"🗑 {number}. Альбом · {count} файлов"
     return f"🗑 {number}. {material.file_name or 'Файл'}"
 
 
 def admin_section_keyboard(section_id: int) -> InlineKeyboardMarkup:
     section = materials_db.get_section(section_id)
     items = materials_db.list_materials(section_id)
-    rows = [[InlineKeyboardButton(text=material_title(m, i), callback_data=f"adm:confirm_material:{m.id}")] for i, m in enumerate(items, 1)]
+    batches = material_batches(items)
+    rows = [[InlineKeyboardButton(
+        text=material_title(batch[0], number, len(batch)),
+        callback_data=f"adm:confirm_material:{batch[0].id}",
+    )] for number, batch in enumerate(batches, 1)]
     rows.extend([
         [
             InlineKeyboardButton(text="➕ Материалы", callback_data=f"adm:add_material:{section_id}"),
@@ -5597,7 +5720,7 @@ async def admin_section(callback: CallbackQuery) -> None:
     section = materials_db.get_section(section_id)
     if not section:
         await callback.answer("Раздел не найден.", show_alert=True); return
-    count = len(materials_db.list_materials(section_id))
+    count = len(material_batches(materials_db.list_materials(section_id)))
     access_status = "🌐 доступен всем" if section.is_public else "🔒 только сотрудникам"
     await callback.message.edit_text(
         f"📁 <b>{html.escape(section.name)}</b>\n\nМатериалов внутри: <b>{count}</b>\n"
@@ -5645,8 +5768,9 @@ async def start_upload(callback: CallbackQuery, state: FSMContext) -> None:
     await state.update_data(section_id=section_id)
     await callback.message.edit_text(
         "📎 <b>Добавление материалов</b>\n\n"
-        "Отправляйте текст, изображения или документы по одному сообщению. "
-        "Пользователь получит их в том же порядке.\n\n"
+        "Отправляйте текст, изображения или документы. Несколько изображений или "
+        "файлов можно выбрать и отправить одним альбомом — пользователь получит их "
+        "в таком же сгруппированном виде.\n\n"
         "Когда всё будет добавлено, нажмите <b>«Завершить»</b>.",
         reply_markup=upload_keyboard(),
     )
@@ -5661,12 +5785,25 @@ async def save_material(message: Message, state: FSMContext) -> None:
         materials_db.add_material(section_id, "text", text=message.text)
         label = "Текст"
     elif message.photo:
-        materials_db.add_material(section_id, "photo", file_id=message.photo[-1].file_id, caption=message.caption)
+        materials_db.add_material(
+            section_id, "photo", file_id=message.photo[-1].file_id,
+            caption=message.caption,
+            media_group_id=(
+                f"{message.chat.id}:{message.media_group_id}"
+                if message.media_group_id else None
+            ),
+            media_group_position=message.message_id if message.media_group_id else None,
+        )
         label = "Изображение"
     elif message.document:
         materials_db.add_material(
             section_id, "document", file_id=message.document.file_id,
             caption=message.caption, file_name=message.document.file_name,
+            media_group_id=(
+                f"{message.chat.id}:{message.media_group_id}"
+                if message.media_group_id else None
+            ),
+            media_group_position=message.message_id if message.media_group_id else None,
         )
         label = "Файл"
     else:
@@ -5674,7 +5811,30 @@ async def save_material(message: Message, state: FSMContext) -> None:
             "⚠️ Этот формат пока не поддерживается. Отправьте текст, изображение или документ.",
             reply_markup=upload_keyboard(),
         ); return
-    await message.answer(f"✅ {label} добавлен. Можно отправить следующий материал.", reply_markup=upload_keyboard())
+    if message.media_group_id:
+        key = (message.from_user.id, message.chat.id, message.media_group_id)
+        material_album_counts[key] = material_album_counts.get(key, 0) + 1
+        previous_task = material_album_tasks.get(key)
+        if previous_task:
+            previous_task.cancel()
+
+        async def acknowledge_album() -> None:
+            await asyncio.sleep(1.0)
+            count = material_album_counts.pop(key, 0)
+            material_album_tasks.pop(key, None)
+            if count:
+                await message.answer(
+                    f"✅ Альбом добавлен: <b>{count}</b> элементов. "
+                    "Можно отправить следующий материал.",
+                    reply_markup=upload_keyboard(),
+                )
+
+        material_album_tasks[key] = asyncio.create_task(acknowledge_album())
+    else:
+        await message.answer(
+            f"✅ {label} добавлен. Можно отправить следующий материал.",
+            reply_markup=upload_keyboard(),
+        )
 
 
 @router.callback_query(F.data == "adm:finish_upload")
@@ -5700,8 +5860,7 @@ async def preview_section(callback: CallbackQuery, bot: Bot) -> None:
     if not items:
         await callback.answer("Материалов пока нет.", show_alert=True); return
     await callback.answer("Отправляю предпросмотр…")
-    for item in items:
-        await send_material(bot, callback.message.chat.id, item)
+    await send_material_collection(bot, callback.message.chat.id, items)
 
 
 @router.callback_query(F.data.startswith("adm:rename_product:"))

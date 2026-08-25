@@ -26,6 +26,28 @@ def test_product_section_material_lifecycle(tmp_path):
     assert db.get_material(document.id) is None
 
 
+def test_material_album_is_stored_ordered_and_deleted_as_one_item(tmp_path):
+    db = MaterialsDB(tmp_path / "materials.sqlite3")
+    product = db.add_product("OGGO")
+    section = db.add_section(product.id, "Мокапы")
+    second = db.add_material(
+        section.id, "photo", file_id="photo-2", media_group_id="chat:album",
+        media_group_position=102,
+    )
+    first = db.add_material(
+        section.id, "photo", file_id="photo-1", caption="Мокапы",
+        media_group_id="chat:album", media_group_position=101,
+    )
+
+    stored = db.list_materials(section.id)
+    assert {item.media_group_id for item in stored} == {"chat:album"}
+    assert {item.media_group_position for item in stored} == {101, 102}
+
+    db.delete_material(second.id)
+    assert db.get_material(first.id) is None
+    assert db.list_materials(section.id) == []
+
+
 def test_hidden_products_and_unique_names(tmp_path):
     db = MaterialsDB(tmp_path / "materials.sqlite3")
     product = db.add_product("OGGO VLIQ")

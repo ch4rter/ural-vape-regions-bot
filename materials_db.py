@@ -29,6 +29,8 @@ class Material:
     file_id: str | None
     caption: str | None
     file_name: str | None
+    media_group_id: str | None = None
+    media_group_position: int | None = None
 
 
 @dataclass(frozen=True)
@@ -136,6 +138,8 @@ class MaterialsDB:
                     file_id TEXT,
                     caption TEXT,
                     file_name TEXT,
+                    media_group_id TEXT,
+                    media_group_position INTEGER,
                     position INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
@@ -250,6 +254,13 @@ class MaterialsDB:
                 connection.execute("ALTER TABLE access_users ADD COLUMN sales_channel_name TEXT")
             if "sales_channel_href" not in columns:
                 connection.execute("ALTER TABLE access_users ADD COLUMN sales_channel_href TEXT")
+            material_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(materials)")
+            }
+            if "media_group_id" not in material_columns:
+                connection.execute("ALTER TABLE materials ADD COLUMN media_group_id TEXT")
+            if "media_group_position" not in material_columns:
+                connection.execute("ALTER TABLE materials ADD COLUMN media_group_position INTEGER")
             connection.execute(
                 """UPDATE access_users SET role = 'manager'
                    WHERE role = 'user' AND sales_channel_href IS NOT NULL"""
@@ -1122,6 +1133,8 @@ class MaterialsDB:
         file_id: str | None = None,
         caption: str | None = None,
         file_name: str | None = None,
+        media_group_id: str | None = None,
+        media_group_position: int | None = None,
     ) -> Material:
         with self._connect() as connection:
             position = connection.execute(
@@ -1129,9 +1142,14 @@ class MaterialsDB:
                 (section_id,),
             ).fetchone()[0]
             cursor = connection.execute(
-                """INSERT INTO materials(section_id, kind, text, file_id, caption, file_name, position)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (section_id, kind, text, file_id, caption, file_name, position),
+                """INSERT INTO materials(
+                       section_id, kind, text, file_id, caption, file_name,
+                       media_group_id, media_group_position, position
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    section_id, kind, text, file_id, caption, file_name,
+                    media_group_id, media_group_position, position,
+                ),
             )
             material_id = cursor.lastrowid
             connection.commit()
@@ -1140,7 +1158,9 @@ class MaterialsDB:
     def get_material(self, material_id: int) -> Material | None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT id, section_id, kind, text, file_id, caption, file_name FROM materials WHERE id = ?",
+                """SELECT id, section_id, kind, text, file_id, caption, file_name,
+                          media_group_id, media_group_position
+                   FROM materials WHERE id = ?""",
                 (material_id,),
             ).fetchone()
         return self._material(row) if row else None
@@ -1148,7 +1168,8 @@ class MaterialsDB:
     def list_materials(self, section_id: int) -> list[Material]:
         with self._connect() as connection:
             rows = connection.execute(
-                """SELECT id, section_id, kind, text, file_id, caption, file_name
+                """SELECT id, section_id, kind, text, file_id, caption, file_name,
+                          media_group_id, media_group_position
                    FROM materials WHERE section_id = ? ORDER BY position, id""",
                 (section_id,),
             ).fetchall()
@@ -1156,11 +1177,21 @@ class MaterialsDB:
 
     def delete_material(self, material_id: int) -> None:
         with self._connect() as connection:
-            connection.execute("DELETE FROM materials WHERE id = ?", (material_id,))
+            row = connection.execute(
+                "SELECT media_group_id FROM materials WHERE id = ?", (material_id,)
+            ).fetchone()
+            if row and row["media_group_id"]:
+                connection.execute(
+                    "DELETE FROM materials WHERE media_group_id = ?",
+                    (row["media_group_id"],),
+                )
+            else:
+                connection.execute("DELETE FROM materials WHERE id = ?", (material_id,))
 
     @staticmethod
     def _material(row: sqlite3.Row) -> Material:
         return Material(
             row["id"], row["section_id"], row["kind"], row["text"], row["file_id"],
-            row["caption"], row["file_name"]
+            row["caption"], row["file_name"], row["media_group_id"],
+            row["media_group_position"],
         )
