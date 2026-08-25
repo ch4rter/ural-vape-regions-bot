@@ -58,6 +58,7 @@ from moysklad_bonus import (
     month_title,
     save_classification,
 )
+from sales_progress import fetch_team_revenue, parse_goal, render_progress
 from order_splitter import ORDER_STORES, split_customer_order
 from order_notifications import (
     OrderNotice,
@@ -111,6 +112,8 @@ material_album_counts: dict[tuple[int, int, str], int] = {}
 material_album_tasks: dict[tuple[int, int, str], asyncio.Task] = {}
 bonus_reports_in_progress: set[int] = set()
 order_splits_in_progress: set[int] = set()
+sales_progress_cache: dict[str, tuple[datetime, list]] = {}
+sales_progress_refreshes: dict[tuple[int, int], datetime] = {}
 
 
 @dataclass
@@ -167,6 +170,20 @@ MANAGER_LINKS = {
 MANAGER_IDS = {
     "вадим": 8844943870,
 }
+TEAM_PROGRESS_MANAGERS = {
+    "uvvalera": "Валера",
+    "shmidtuv": "Андрей",
+    "ural_vape": "Матвей",
+    "evgenuralv": "Евгений",
+    "vadimurv": "Вадим",
+}
+TEAM_PROGRESS_CHANNEL_NAMES = {
+    "валера": "Валера",
+    "шмидт": "Андрей",
+    "ярик": "Матвей",
+    "гесс": "Евгений",
+    "вадим": "Вадим",
+}
 
 
 class AppState(StatesGroup):
@@ -192,6 +209,7 @@ class AdminState(StatesGroup):
     region_manager = State()
     bonus_classification_upload = State()
     order_split_upload = State()
+    sales_goal_amount = State()
 
 
 class BroadcastState(StatesGroup):
@@ -249,6 +267,11 @@ class AccessMiddleware(BaseMiddleware):
             is_game_command = bool(re.match(r"^/game(?:@\w+)?\s*$", text, re.IGNORECASE))
             if is_game_command:
                 return await handler(event, data)
+            is_progress_command = bool(re.match(r"^/progress(?:@\w+)?\s*$", text, re.IGNORECASE))
+            if is_progress_command and user and (
+                is_admin(user.id) or materials_db.authorize_user(user.id, user.username)
+            ):
+                return await handler(event, data)
             return None
         if isinstance(event, CallbackQuery) and event.message and event.message.chat.type != "private":
             callback_data = event.data or ""
@@ -259,6 +282,10 @@ class AccessMiddleware(BaseMiddleware):
             ):
                 return await handler(event, data)
             if callback_data.startswith("game:"):
+                return await handler(event, data)
+            if callback_data.startswith("progress:") and user and (
+                is_admin(user.id) or materials_db.authorize_user(user.id, user.username)
+            ):
                 return await handler(event, data)
             if callback_data.startswith("chatcfg:"):
                 await event.answer("Настройка доступна только сотрудникам.", show_alert=True)
@@ -1097,6 +1124,212 @@ async def play_secret_game(callback: CallbackQuery) -> None:
         f"{second} — <b>{RPS_LABELS[second_choice]}</b>\n\n"
         f"{verdict}\n\n"
         "Новый раунд: /game",
+    )
+
+
+def shift_month(month: str, offset: int) -> str:
+    year, number = map(int, month.split("-"))
+    index = year * 12 + number - 1 + offset
+    return f"{index // 12:04d}-{index % 12 + 1:02d}"
+
+
+def progress_months(*, admin: bool = False) -> list[str]:
+    current = datetime.now().strftime("%Y-%m")
+    offsets = range(-2, 7) if admin else range(-5, 3)
+    return [shift_month(current, offset) for offset in offsets]
+
+
+def progress_month_keyboard(*, admin: bool = False) -> InlineKeyboardMarkup:
+    prefix = "adm:sales_goal" if admin else "progress:show"
+    buttons = [
+        InlineKeyboardButton(
+            text=month_title(month).capitalize(), callback_data=f"{prefix}:{month}"
+        )
+        for month in reversed(progress_months(admin=admin))
+    ]
+    rows = button_grid(buttons)
+    if admin:
+        rows.append(compact_nav("main:admin"))
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def configured_progress_managers() -> list[tuple[str, str]]:
+    found: dict[str, str] = {}
+    for user in materials_db.list_access_users():
+        if not user.sales_channel_href:
+            continue
+        username = (user.username or "").lstrip("@").casefold()
+        display_name = TEAM_PROGRESS_MANAGERS.get(username)
+        if not display_name:
+            display_name = TEAM_PROGRESS_CHANNEL_NAMES.get(
+                (user.sales_channel_name or "").strip().casefold()
+            )
+        if display_name and display_name not in found:
+            found[display_name] = user.sales_channel_href
+    return [(name, found.get(name, "")) for name in TEAM_PROGRESS_MANAGERS.values()]
+
+
+def sales_goal_key(month: str) -> str:
+    return f"sales_progress_goal:{month}"
+
+
+async def load_progress_rows(month: str, *, force: bool = False) -> list:
+    cached = sales_progress_cache.get(month)
+    if cached and not force and datetime.now() - cached[0] < timedelta(seconds=60):
+        return cached[1]
+    token, _, _, _ = moysklad_settings()
+    if not token:
+        raise MoySkladError("В .env не указан MOYSKLAD_TOKEN.")
+    client = MoySkladClient(token)
+    managers = configured_progress_managers()
+    missing = [name for name, href in managers if not href]
+    if missing:
+        raise MoySkladError(
+            "Не привязан канал продаж: " + ", ".join(missing) + "."
+        )
+    rows = await asyncio.to_thread(
+        fetch_team_revenue, client, month, managers
+    )
+    sales_progress_cache[month] = (datetime.now(), rows)
+    return rows
+
+
+def progress_refresh_keyboard(month: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🔄 Обновить", callback_data=f"progress:refresh:{month}")
+    ]])
+
+
+@router.message(Command("progress"))
+async def command_sales_progress(message: Message) -> None:
+    if not message.from_user or not has_internal_access(
+        message.from_user.id, message.from_user.username
+    ):
+        return
+    await message.answer(
+        "🎯 <b>Прогресс отдела продаж</b>\n\nВыберите месяц:",
+        reply_markup=progress_month_keyboard(),
+    )
+
+
+async def show_sales_progress(callback: CallbackQuery, month: str, *, force: bool) -> None:
+    if not re.fullmatch(r"\d{4}-\d{2}", month):
+        await callback.answer("Некорректный месяц.", show_alert=True)
+        return
+    goal = parse_goal(materials_db.get_setting(sales_goal_key(month)))
+    if goal is None:
+        await callback.answer(
+            "Для этого месяца администратор ещё не установил цель.", show_alert=True
+        )
+        return
+    if force:
+        key = (callback.message.chat.id, callback.message.message_id)
+        previous = sales_progress_refreshes.get(key)
+        if previous and datetime.now() - previous < timedelta(seconds=20):
+            await callback.answer("Подождите несколько секунд перед следующим обновлением.", show_alert=True)
+            return
+        sales_progress_refreshes[key] = datetime.now()
+    await callback.answer("Обновляю данные…")
+    try:
+        rows = await load_progress_rows(month, force=force)
+        text = render_progress(
+            month_title(month), month, goal, rows, now=datetime.now()
+        )
+        await callback.message.edit_text(
+            text, reply_markup=progress_refresh_keyboard(month)
+        )
+    except Exception as error:
+        logging.exception("Не удалось обновить прогресс отдела за %s", month)
+        await callback.message.answer(
+            "❌ <b>Не удалось получить данные из МоегоСклада</b>\n\n"
+            f"{html.escape(str(error))}"
+        )
+
+
+@router.callback_query(F.data.startswith("progress:show:"))
+async def select_sales_progress_month(callback: CallbackQuery) -> None:
+    await show_sales_progress(callback, callback.data.rsplit(":", 1)[1], force=False)
+
+
+@router.callback_query(F.data.startswith("progress:refresh:"))
+async def refresh_sales_progress(callback: CallbackQuery) -> None:
+    await show_sales_progress(callback, callback.data.rsplit(":", 1)[1], force=True)
+
+
+@router.callback_query(F.data == "adm:sales_goals")
+async def sales_goals_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id) or callback.message.chat.type != "private":
+        await callback.answer("Настройка доступна только главному администратору.", show_alert=True)
+        return
+    await state.clear()
+    await callback.message.edit_text(
+        "🎯 <b>Цели отдела продаж</b>\n\n"
+        "Выберите месяц, для которого хотите установить или изменить цель:",
+        reply_markup=progress_month_keyboard(admin=True),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:sales_goal:"))
+async def select_sales_goal_month(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id) or callback.message.chat.type != "private":
+        await callback.answer("Настройка доступна только главному администратору.", show_alert=True)
+        return
+    month = callback.data.rsplit(":", 1)[1]
+    current = parse_goal(materials_db.get_setting(sales_goal_key(month)))
+    await state.set_state(AdminState.sales_goal_amount)
+    await state.update_data(sales_goal_month=month)
+    rows = []
+    if current is not None:
+        rows.append([InlineKeyboardButton(
+            text="🗑 Удалить цель", callback_data=f"adm:sales_goal_delete:{month}", style="danger"
+        )])
+    rows.append(compact_nav("adm:sales_goals"))
+    await callback.message.edit_text(
+        f"🎯 <b>{month_title(month).capitalize()}</b>\n\n"
+        + (f"Текущая цель: <b>{current:,.0f} ₽</b>\n\n".replace(",", " ") if current else "Цель пока не задана.\n\n")
+        + "Отправьте новую цель одним числом, например: <code>10000000</code>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:sales_goal_delete:"))
+async def delete_sales_goal(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id) or callback.message.chat.type != "private":
+        await callback.answer("Настройка доступна только главному администратору.", show_alert=True)
+        return
+    month = callback.data.rsplit(":", 1)[1]
+    materials_db.set_setting(sales_goal_key(month), "")
+    await state.clear()
+    await callback.message.edit_text(
+        f"✅ Цель за <b>{month_title(month)}</b> удалена.",
+        reply_markup=progress_month_keyboard(admin=True),
+    )
+    await callback.answer()
+
+
+@router.message(AdminState.sales_goal_amount, F.text)
+async def save_sales_goal(message: Message, state: FSMContext) -> None:
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    cleaned = re.sub(r"[\s₽]", "", message.text).replace(",", ".")
+    goal = parse_goal(cleaned)
+    if goal is None:
+        await message.answer("Введите положительное число, например <code>10000000</code>.")
+        return
+    data = await state.get_data()
+    month = data.get("sales_goal_month", "")
+    if not re.fullmatch(r"\d{4}-\d{2}", month):
+        await state.clear()
+        await message.answer("Не удалось определить месяц. Откройте настройку цели ещё раз.")
+        return
+    materials_db.set_setting(sales_goal_key(month), str(goal))
+    await state.clear()
+    formatted = f"{goal:,.2f}".replace(",", " ").replace(".", ",").rstrip("0").rstrip(",")
+    await message.answer(
+        f"✅ <b>Цель сохранена</b>\n\n{month_title(month).capitalize()}: <b>{formatted} ₽</b>",
+        reply_markup=progress_month_keyboard(admin=True),
     )
 
 
@@ -3331,6 +3564,8 @@ def products_keyboard(
             admin_buttons.append(InlineKeyboardButton(text="📝 Анкеты клиентов", callback_data="adm:leads"))
         if allowed("bonus_reports"):
             admin_buttons.append(InlineKeyboardButton(text="📈 Премиальный отчёт", callback_data="bonus:menu"))
+        if actor_id is None or is_admin(actor_id):
+            admin_buttons.append(InlineKeyboardButton(text="🎯 Цели продаж", callback_data="adm:sales_goals"))
         rows.extend(button_grid(admin_buttons))
         if actor_id is None or is_admin(actor_id):
             rows.append([InlineKeyboardButton(text="💾 Скачать резервную копию", callback_data="adm:backup")])
