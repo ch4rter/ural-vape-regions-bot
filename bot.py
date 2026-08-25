@@ -4,6 +4,7 @@ import html
 import logging
 import os
 import re
+import secrets
 import shutil
 import sqlite3
 import tempfile
@@ -110,6 +111,19 @@ material_album_counts: dict[tuple[int, int, str], int] = {}
 material_album_tasks: dict[tuple[int, int, str], asyncio.Task] = {}
 bonus_reports_in_progress: set[int] = set()
 order_splits_in_progress: set[int] = set()
+
+
+@dataclass
+class RockPaperScissorsGame:
+    token: str
+    chat_id: int
+    message_id: int
+    created_at: datetime
+    choices: dict[int, str]
+    player_names: dict[int, str]
+
+
+rps_games: dict[tuple[int, str], RockPaperScissorsGame] = {}
 PRICE_MESSAGE_SETTING = "price_command_message"
 PRICE_ATTACHMENT_KIND_SETTING = "price_command_attachment_kind"
 PRICE_ATTACHMENT_ID_SETTING = "price_command_attachment_id"
@@ -232,6 +246,9 @@ class AccessMiddleware(BaseMiddleware):
                 is_admin(user.id) or materials_db.authorize_user(user.id, user.username)
             ):
                 return await handler(event, data)
+            is_game_command = bool(re.match(r"^/game(?:@\w+)?\s*$", text, re.IGNORECASE))
+            if is_game_command:
+                return await handler(event, data)
             return None
         if isinstance(event, CallbackQuery) and event.message and event.message.chat.type != "private":
             callback_data = event.data or ""
@@ -241,10 +258,18 @@ class AccessMiddleware(BaseMiddleware):
                 is_admin(user.id) or materials_db.authorize_user(user.id, user.username)
             ):
                 return await handler(event, data)
+            if callback_data.startswith("game:"):
+                return await handler(event, data)
             if callback_data.startswith("chatcfg:"):
                 await event.answer("Настройка доступна только сотрудникам.", show_alert=True)
             return None
         if not user or is_admin(user.id) or materials_db.authorize_user(user.id, user.username):
+            return await handler(event, data)
+        if isinstance(event, Message) and re.match(
+            r"^/game(?:@\w+)?\s*$", (event.text or "").strip(), re.IGNORECASE
+        ):
+            return await handler(event, data)
+        if isinstance(event, CallbackQuery) and (event.data or "").startswith("game:"):
             return await handler(event, data)
         lead_state = data.get("raw_state")
         lead_states = {
@@ -967,6 +992,114 @@ async def cancel(message: Message, state: FSMContext) -> None:
     await show_main(message, message.from_user.id if message.from_user else None)
 
 
+RPS_LABELS = {
+    "rock": "🪨 Камень",
+    "scissors": "✂️ Ножницы",
+    "paper": "📄 Бумага",
+}
+RPS_BEATS = {"rock": "scissors", "scissors": "paper", "paper": "rock"}
+
+
+def rps_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🪨 Камень", callback_data=f"game:{token}:rock"),
+        InlineKeyboardButton(text="✂️ Ножницы", callback_data=f"game:{token}:scissors"),
+        InlineKeyboardButton(text="📄 Бумага", callback_data=f"game:{token}:paper"),
+    ]])
+
+
+def rps_result(first: str, second: str) -> int:
+    """Return 0 for draw, 1 if the first choice wins, otherwise 2."""
+    if first == second:
+        return 0
+    return 1 if RPS_BEATS[first] == second else 2
+
+
+def game_player_link(user_id: int, name: str) -> str:
+    return f'<a href="tg://user?id={user_id}">{html.escape(name)}</a>'
+
+
+@router.message(Command("game"))
+async def start_secret_game(message: Message) -> None:
+    if message.chat.type == "private":
+        await message.answer("🎮 Эта игра запускается командой <code>/game</code> в групповом чате.")
+        return
+    for key in [key for key in rps_games if key[0] == message.chat.id]:
+        rps_games.pop(key, None)
+    token = secrets.token_urlsafe(5).replace("-", "A").replace("_", "B")
+    sent = await message.answer(
+        "🎮 <b>Камень · ножницы · бумага</b>\n\n"
+        "Нужны два разных игрока. Каждый выбирает один вариант — ход останется "
+        "секретным до выбора второго участника.",
+        reply_markup=rps_keyboard(token),
+    )
+    rps_games[(message.chat.id, token)] = RockPaperScissorsGame(
+        token=token,
+        chat_id=message.chat.id,
+        message_id=sent.message_id,
+        created_at=datetime.now(),
+        choices={},
+        player_names={},
+    )
+
+
+@router.callback_query(F.data.startswith("game:"))
+async def play_secret_game(callback: CallbackQuery) -> None:
+    try:
+        _, token, choice = (callback.data or "").split(":", 2)
+    except ValueError:
+        await callback.answer("Некорректный ход.", show_alert=True)
+        return
+    game = rps_games.get((callback.message.chat.id, token))
+    if (
+        not game
+        or callback.message.message_id != game.message_id
+        or datetime.now() - game.created_at > timedelta(minutes=10)
+    ):
+        rps_games.pop((callback.message.chat.id, token), None)
+        await callback.answer("Этот раунд уже завершён или устарел. Запустите /game ещё раз.", show_alert=True)
+        return
+    if choice not in RPS_LABELS:
+        await callback.answer("Неизвестный вариант.", show_alert=True)
+        return
+    player_id = callback.from_user.id
+    if player_id in game.choices:
+        await callback.answer("Вы уже сделали ход. Ждём второго игрока.", show_alert=True)
+        return
+    game.choices[player_id] = choice
+    game.player_names[player_id] = callback.from_user.full_name
+    if len(game.choices) == 1:
+        await callback.answer("Ход принят и скрыт 🤫")
+        await callback.message.edit_text(
+            "🎮 <b>Камень · ножницы · бумага</b>\n\n"
+            "Первый игрок сделал секретный ход. Ждём второго участника.",
+            reply_markup=rps_keyboard(token),
+        )
+        return
+
+    players = list(game.choices)
+    first_id, second_id = players[0], players[1]
+    first_choice, second_choice = game.choices[first_id], game.choices[second_id]
+    outcome = rps_result(first_choice, second_choice)
+    first = game_player_link(first_id, game.player_names[first_id])
+    second = game_player_link(second_id, game.player_names[second_id])
+    if outcome == 0:
+        verdict = "🤝 <b>Ничья!</b>"
+    else:
+        winner_id = first_id if outcome == 1 else second_id
+        winner = first if winner_id == first_id else second
+        verdict = f"🏆 Победитель: <b>{winner}</b>"
+    rps_games.pop((callback.message.chat.id, token), None)
+    await callback.answer("Раунд завершён!")
+    await callback.message.edit_text(
+        "🎮 <b>Результат игры</b>\n\n"
+        f"{first} — <b>{RPS_LABELS[first_choice]}</b>\n"
+        f"{second} — <b>{RPS_LABELS[second_choice]}</b>\n\n"
+        f"{verdict}\n\n"
+        "Новый раунд: /game",
+    )
+
+
 async def send_price_command_intro(message: Message) -> None:
     text = materials_db.get_setting(PRICE_MESSAGE_SETTING) or DEFAULT_PRICE_COMMAND_MESSAGE
     await message.answer(text)
@@ -1516,7 +1649,7 @@ async def notify_waitlist_matches(bot: Bot, reports: dict[str, dict] | None) -> 
                 InlineKeyboardButton(text="✉️ Сообщение", callback_data=f"wait:message:{entry.id}"),
             ],
             [
-                InlineKeyboardButton(text="✅ Сообщили", callback_data=f"wait:done:{entry.id}"),
+                InlineKeyboardButton(text="✅ Сообщили", callback_data=f"wait:done:{entry.id}", style="success"),
                 InlineKeyboardButton(text="⏳ Оставить", callback_data=f"wait:keep:{entry.id}"),
             ],
         ])
@@ -1626,7 +1759,7 @@ def wait_entry_keyboard(entry) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="✏️ Товар", callback_data=f"wait:edit_query:{entry.id}"),
             InlineKeyboardButton(text="💬 Комментарий", callback_data=f"wait:edit_comment:{entry.id}"),
         ],
-        [InlineKeyboardButton(text="✅ Закрыть ожидание", callback_data=f"wait:done:{entry.id}")],
+        [InlineKeyboardButton(text="✅ Закрыть ожидание", callback_data=f"wait:done:{entry.id}", style="success")],
         compact_nav("main:waitlist"),
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1931,7 +2064,7 @@ def client_tags_keyboard(chat_id: int) -> InlineKeyboardMarkup:
         for key, label in CLIENT_TAGS.items()
     ]
     rows = button_grid(buttons)
-    rows.append([InlineKeyboardButton(text="✅ Готово", callback_data=f"chatcfg:done:{chat_id}")])
+    rows.append([InlineKeyboardButton(text="✅ Готово", callback_data=f"chatcfg:done:{chat_id}", style="success")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -2227,7 +2360,7 @@ async def new_broadcast(callback: CallbackQuery, state: FSMContext) -> None:
         "удалит дубли и подготовит список получателей."
     )
     markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отменить", callback_data="main:broadcasts")]
+        [InlineKeyboardButton(text="❌ Отменить", callback_data="main:broadcasts", style="danger")]
     ])
     if callback.message.text:
         await callback.message.edit_text(text, reply_markup=markup)
@@ -2298,7 +2431,7 @@ async def receive_broadcast_audience(message: Message, state: FSMContext, bot: B
         f"Отмечены недоступными: <b>{inactive}</b>\n\n"
         "📨 <b>Шаг 2 из 3</b>\nОтправьте готовый пост: текст, фото, видео или документ с подписью.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отменить", callback_data="main:broadcasts")]
+            [InlineKeyboardButton(text="❌ Отменить", callback_data="main:broadcasts", style="danger")]
         ]),
     )
 
@@ -2309,7 +2442,7 @@ def broadcast_ready_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🧪 Тест", callback_data="broadcast:test"),
             InlineKeyboardButton(text="✏️ Заменить", callback_data="broadcast:replace_content"),
         ],
-        [InlineKeyboardButton(text="❌ Отменить", callback_data="main:broadcasts")],
+        [InlineKeyboardButton(text="❌ Отменить", callback_data="main:broadcasts", style="danger")],
     ])
 
 
@@ -2398,10 +2531,10 @@ async def test_broadcast(callback: CallbackQuery, state: FSMContext, bot: Bot) -
         f"Получателей в Excel: <b>{len(data.get('broadcast_chat_ids', []))}</b>\n\n"
         "Проверьте сообщение в группе и подтвердите массовую рассылку.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🚀 Начать рассылку", callback_data="broadcast:confirm_send")],
+            [InlineKeyboardButton(text="🚀 Начать рассылку", callback_data="broadcast:confirm_send", style="success")],
             [
                 InlineKeyboardButton(text="✏️ Заменить", callback_data="broadcast:replace_content"),
-                InlineKeyboardButton(text="❌ Отменить", callback_data="main:broadcasts"),
+                InlineKeyboardButton(text="❌ Отменить", callback_data="main:broadcasts", style="danger"),
             ],
         ]),
     )
@@ -2637,8 +2770,8 @@ async def confirm_report_broadcast(callback: CallbackQuery) -> None:
         + "\n\nОтправить это уведомление пользователям белого списка?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [
-                InlineKeyboardButton(text="✅ Отправить", callback_data="reports:send_all"),
-                InlineKeyboardButton(text="❌ Отмена", callback_data="main:price_reports"),
+                InlineKeyboardButton(text="✅ Отправить", callback_data="reports:send_all", style="success"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data="main:price_reports", style="danger"),
             ],
         ]),
     )
@@ -3044,6 +3177,7 @@ def price_cart_keyboard(selected_ids: list[int]) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(
             text=f"❌ {price_group_label(summaries[value].display_name, summaries[value].category_name)}",
             callback_data=f"price:cart_remove:{value}",
+            style="danger",
         )]
         for value in selected_ids if value in summaries
     ]
@@ -3053,7 +3187,7 @@ def price_cart_keyboard(selected_ids: list[int]) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="📄 Базовый", callback_data="price:export:0"),
                 InlineKeyboardButton(text="📄 Скидка −10%", callback_data="price:export:10"),
             ],
-            [InlineKeyboardButton(text="🗑 Очистить подборку", callback_data="price:cart_clear")],
+            [InlineKeyboardButton(text="🗑 Очистить подборку", callback_data="price:cart_clear", style="danger")],
         ])
     rows.append(compact_nav("price:back", search_data="main:prices"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -3578,7 +3712,7 @@ async def show_missing_region(callback: CallbackQuery) -> None:
         f"Дата: <b>{html.escape(item.updated_at)}</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="➕ Добавить в справочник", callback_data=f"adm:add_missing_region:{item.id}")],
-            [InlineKeyboardButton(text="✅ Не добавлять · обработано", callback_data=f"adm:ignore_missing_region:{item.id}")],
+            [InlineKeyboardButton(text="✅ Не добавлять · обработано", callback_data=f"adm:ignore_missing_region:{item.id}", style="success")],
             compact_nav("adm:missing_regions:0"),
         ]),
     )
@@ -3835,7 +3969,7 @@ async def start_excel_upload(callback: CallbackQuery, state: FSMContext) -> None
         "• <b>Менеджер</b>\n\n"
         "Сначала бот проверит файл и покажет сводку. Действующая таблица не изменится без подтверждения.",
         reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="main:admin")]]
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="main:admin", style="danger")]]
         ),
     )
     await callback.answer()
@@ -3882,8 +4016,8 @@ async def receive_excel(message: Message, state: FSMContext, bot: Bot) -> None:
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [
-                    InlineKeyboardButton(text="✅ Применить", callback_data="adm:apply_excel"),
-                    InlineKeyboardButton(text="❌ Отмена", callback_data="adm:cancel_excel"),
+                    InlineKeyboardButton(text="✅ Применить", callback_data="adm:apply_excel", style="success"),
+                    InlineKeyboardButton(text="❌ Отмена", callback_data="adm:cancel_excel", style="danger"),
                 ],
             ]
         ),
@@ -4500,7 +4634,7 @@ async def bonus_start_classification_upload(callback: CallbackQuery, state: FSMC
         f"Отправьте заполненный файл <code>.xlsx</code> за {html.escape(month_title(month))}. "
         "Существующая классификация этого месяца будет заменена только после успешной проверки.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"bonus:m:{month}")]
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"bonus:m:{month}", style="danger")]
         ]),
     )
     await callback.answer()
@@ -4804,7 +4938,7 @@ async def start_price_upload(callback: CallbackQuery, state: FSMContext) -> None
         "Отправьте свежий прайс в формате <code>.xlsx</code>. Бот проверит структуру, "
         "товарные группы и цены, после чего покажет сводку перед применением.",
         reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="adm:prices")]]
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="adm:prices", style="danger")]]
         ),
     )
     await callback.answer()
@@ -4855,8 +4989,8 @@ async def receive_price_file(message: Message, state: FSMContext, bot: Bot) -> N
         "Применить этот прайс? Предыдущая версия будет сохранена.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [
-                InlineKeyboardButton(text="✅ Применить", callback_data="adm:apply_price"),
-                InlineKeyboardButton(text="❌ Отмена", callback_data="adm:cancel_price"),
+                InlineKeyboardButton(text="✅ Применить", callback_data="adm:apply_price", style="success"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data="adm:cancel_price", style="danger"),
             ],
         ]),
     )
@@ -5042,7 +5176,7 @@ def price_message_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="↩️ Вернуть стандартный текст", callback_data="adm:reset_price_message")],
     ]
     if materials_db.get_setting(PRICE_ATTACHMENT_ID_SETTING):
-        rows.append([InlineKeyboardButton(text="🗑 Удалить вложение", callback_data="adm:remove_price_attachment")])
+        rows.append([InlineKeyboardButton(text="🗑 Удалить вложение", callback_data="adm:remove_price_attachment", style="danger")])
     rows.append(compact_nav("main:admin"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -5265,9 +5399,9 @@ async def manage_access_user(callback: CallbackQuery, state: FSMContext) -> None
             [InlineKeyboardButton(text="🔐 Разрешения", callback_data=f"adm:permissions:{access_id}")],
             *([[InlineKeyboardButton(text="🤝 Назначить помощника", callback_data=f"adm:team_choose:{access_id}")]] if user.role == "manager" else []),
             *([[InlineKeyboardButton(text="📈 Привязать канал продаж", callback_data=f"adm:access_channel:{access_id}")]] if user.role == "manager" else []),
-            *([[InlineKeyboardButton(text="❌ Убрать канал продаж", callback_data=f"adm:clear_channel:{access_id}")]] if user.sales_channel_name else []),
+            *([[InlineKeyboardButton(text="❌ Убрать канал продаж", callback_data=f"adm:clear_channel:{access_id}", style="danger")]] if user.sales_channel_name else []),
             [InlineKeyboardButton(text="🔎 Назначить проверяющим", callback_data=f"adm:reviewer_set:{access_id}")],
-            [InlineKeyboardButton(text="🗑 Закрыть доступ", callback_data=f"adm:confirm_access:{access_id}")],
+            [InlineKeyboardButton(text="🗑 Закрыть доступ", callback_data=f"adm:confirm_access:{access_id}", style="danger")],
             compact_nav("adm:access"),
         ]),
     )
@@ -5455,7 +5589,7 @@ async def choose_team_assistant(callback: CallbackQuery) -> None:
         callback_data=f"adm:team_set:{manager_id}:{user.id}",
     )] for user in assistants]
     rows.append([InlineKeyboardButton(
-        text="❌ Без помощника", callback_data=f"adm:team_set:{manager_id}:0"
+        text="❌ Без помощника", callback_data=f"adm:team_set:{manager_id}:0", style="danger"
     )])
     rows.append(compact_nav("adm:teams"))
     await callback.message.edit_text(
@@ -5520,7 +5654,7 @@ async def ask_access_user(callback: CallbackQuery, state: FSMContext) -> None:
         "• username с символом @, например <code>@username</code>.\n\n"
         "ID надёжнее, потому что username пользователь может изменить.",
         reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="adm:access")]]
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="adm:access", style="danger")]]
         ),
     )
     await callback.answer()
@@ -5558,8 +5692,8 @@ async def confirm_access_delete(callback: CallbackQuery) -> None:
         "⚠️ <b>Закрыть доступ?</b>\n\n"
         f"Пользователь: <b>{html.escape(access_user_label(user))}</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Да, закрыть доступ", callback_data=f"adm:delete_access:{access_id}")],
-            [InlineKeyboardButton(text="Отмена", callback_data="adm:access")],
+            [InlineKeyboardButton(text="Да, закрыть доступ", callback_data=f"adm:delete_access:{access_id}", style="danger")],
+            [InlineKeyboardButton(text="Отмена", callback_data="adm:access", style="danger")],
         ]),
     )
     await callback.answer()
@@ -5621,7 +5755,7 @@ def admin_product_keyboard(product_id: int) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="🙈 Скрыть" if product and product.is_visible else "👁 Показать", callback_data=f"adm:toggle_product:{product_id}"),
-            InlineKeyboardButton(text="🗑 Удалить", callback_data=f"adm:confirm_product:{product_id}"),
+            InlineKeyboardButton(text="🗑 Удалить", callback_data=f"adm:confirm_product:{product_id}", style="danger"),
         ],
         compact_nav("main:admin"),
     ])
@@ -5694,6 +5828,7 @@ def admin_section_keyboard(section_id: int) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(
         text=material_title(batch[0], number, len(batch)),
         callback_data=f"adm:confirm_material:{batch[0].id}",
+        style="danger",
     )] for number, batch in enumerate(batches, 1)]
     rows.extend([
         [
@@ -5706,7 +5841,7 @@ def admin_section_keyboard(section_id: int) -> InlineKeyboardMarkup:
         )],
         [
             InlineKeyboardButton(text="✏️ Название", callback_data=f"adm:rename_section:{section_id}"),
-            InlineKeyboardButton(text="🗑 Удалить", callback_data=f"adm:confirm_section:{section_id}"),
+            InlineKeyboardButton(text="🗑 Удалить", callback_data=f"adm:confirm_section:{section_id}", style="danger"),
         ],
         compact_nav(f"adm:p:{section.product_id}"),
     ])
@@ -5754,8 +5889,8 @@ async def toggle_section_public(callback: CallbackQuery) -> None:
 def upload_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="✅ Завершить", callback_data="adm:finish_upload"),
-            InlineKeyboardButton(text="❌ Отменить", callback_data="main:admin"),
+            InlineKeyboardButton(text="✅ Завершить", callback_data="adm:finish_upload", style="success"),
+            InlineKeyboardButton(text="❌ Отменить", callback_data="main:admin", style="danger"),
         ],
     ])
 
@@ -5909,8 +6044,8 @@ async def toggle_product(callback: CallbackQuery) -> None:
 def confirm_keyboard(yes_data: str, back_data: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="✅ Да", callback_data=yes_data),
-            InlineKeyboardButton(text="❌ Нет", callback_data=back_data),
+            InlineKeyboardButton(text="✅ Да", callback_data=yes_data, style="success"),
+            InlineKeyboardButton(text="❌ Нет", callback_data=back_data, style="danger"),
         ],
     ])
 

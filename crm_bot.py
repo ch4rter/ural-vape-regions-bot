@@ -585,7 +585,10 @@ async def render_tasks(callback: CallbackQuery, page: int) -> None:
         icon = "🔴" if task.due_date < today else "📅" if task.due_date == today else "🔵"
         lines.extend(["", f"<b>{index}. {html.escape(task.client_name)}</b>",
                       f"{icon} {datetime.fromisoformat(task.due_date).strftime('%d.%m.%Y')} · {html.escape(task.text)}"])
-        rows.append([InlineKeyboardButton(text=f"✅ Выполнено · {task.client_name}"[:64], callback_data=f"crm:task_done:{task.id}")])
+        rows.append([InlineKeyboardButton(
+            text=f"✅ Выполнено · {task.client_name}"[:64],
+            callback_data=f"crm:task_done:{task.id}", style="success",
+        )])
     pagination = []
     if page > 0:
         pagination.append(InlineKeyboardButton(text="⬅️", callback_data=f"crm:tasks_page:{page - 1}"))
@@ -666,7 +669,7 @@ async def render_call_list(callback: CallbackQuery, items, page: int) -> None:
     if pagination:
         rows.append(pagination)
     if items:
-        rows.append([InlineKeyboardButton(text="🗑 Очистить список", callback_data="crm:list_clear")])
+        rows.append([InlineKeyboardButton(text="🗑 Очистить список", callback_data="crm:list_clear", style="danger")])
     rows.append(nav())
     text = (
         f"📋 <b>Мой список обзвона</b>\n\nКлиентов: <b>{len(items)}</b>\n"
@@ -898,7 +901,7 @@ async def ask_filter_region(callback: CallbackQuery, state: FSMContext) -> None:
     settings = (await state.get_data()).get("crm_filter", default_filter())
     rows = []
     if settings.get("region"):
-        rows.append([InlineKeyboardButton(text="🗑 Сбросить регион", callback_data="crm:filter_region_clear")])
+        rows.append([InlineKeyboardButton(text="🗑 Сбросить регион", callback_data="crm:filter_region_clear", style="danger")])
     rows.append(nav("crm:filter"))
     await state.set_state(CRMState.filter_region)
     await callback.message.edit_text(
@@ -945,7 +948,7 @@ def status_filter_keyboard(settings: dict) -> InlineKeyboardMarkup:
             label = f"✅ {label}"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"crm:filter_status:{index}")])
     if selected:
-        rows.append([InlineKeyboardButton(text="🗑 Сбросить статусы", callback_data="crm:filter_status_clear")])
+        rows.append([InlineKeyboardButton(text="🗑 Сбросить статусы", callback_data="crm:filter_status_clear", style="danger")])
     rows.append(nav("crm:filter"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 

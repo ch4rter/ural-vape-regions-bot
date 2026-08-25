@@ -3,9 +3,13 @@ from bot import (
     HOME_BUTTON_TEXT,
     clean_client_title,
     compact_nav,
+    confirm_keyboard,
     group_welcome_text,
     main_menu,
     persistent_home_keyboard,
+    rps_keyboard,
+    rps_result,
+    upload_keyboard,
 )
 from materials_db import MaterialsDB
 
@@ -75,6 +79,26 @@ def test_compact_navigation_uses_icon_only_buttons():
     row = compact_nav("section:back", forward_data="section:next", search_data="main:prices")
     assert [button.text for button in row] == ["⬅️", "➡️", "🔎", "🏠"]
     assert row[-1].callback_data == "main:menu"
+
+
+def test_semantic_button_colors_are_used_for_confirmation_and_danger():
+    confirmation = confirm_keyboard("confirm", "back").inline_keyboard[0]
+    assert [button.style for button in confirmation] == ["success", "danger"]
+    upload = upload_keyboard().inline_keyboard[0]
+    assert [button.style for button in upload] == ["success", "danger"]
+
+
+def test_rock_paper_scissors_rules_and_hidden_choice_buttons():
+    assert rps_result("rock", "rock") == 0
+    assert rps_result("rock", "scissors") == 1
+    assert rps_result("rock", "paper") == 2
+    assert rps_result("scissors", "paper") == 1
+    assert rps_result("paper", "rock") == 1
+    buttons = rps_keyboard("secret").inline_keyboard[0]
+    assert [button.text for button in buttons] == ["🪨 Камень", "✂️ Ножницы", "📄 Бумага"]
+    assert [button.callback_data for button in buttons] == [
+        "game:secret:rock", "game:secret:scissors", "game:secret:paper",
+    ]
 
 
 def test_persistent_home_keyboard_and_group_welcome():
