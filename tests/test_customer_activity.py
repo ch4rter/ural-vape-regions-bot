@@ -90,13 +90,17 @@ def test_excel_has_dashboard_and_single_lost_sheet(tmp_path):
     workbook = load_workbook(destination)
     assert workbook.sheetnames == ["Дэшборд", "Помесячная аналитика", "Новые кенты", "Вернувшиеся кенты", "Кенты-потеряшки"]
     dashboard = workbook["Дэшборд"]
-    assert len(dashboard._charts) == 3
-    assert dashboard["I22"].value == "Как читать дэшборд"
+    assert len(dashboard._charts) == 2
+    assert len(dashboard._charts[0].ser) == 2
+    assert len(dashboard._charts[1].ser) == 1
+    assert dashboard["A25"].value == "Как читать дэшборд"
     monthly_headers = [cell.value for cell in workbook["Помесячная аналитика"][1]]
     assert "Уникальные покупатели" in monthly_headers
     assert "Выручка на покупателя" in monthly_headers
-    headers = [cell.value for cell in dashboard[42]]
-    assert all("Клиенты, которые давно не заказывали" in value for value in headers[7:10])
+    assert workbook["Помесячная аналитика"].max_row == 6  # April through August only.
+    headers = [cell.value for cell in dashboard[20]]
+    assert dashboard["F19"].value == "Клиенты, которые давно не заказывали"
     assert "Новые — предыдущая" not in headers
     assert "Вернувшиеся — предыдущая" not in headers
     assert "Активные неделю назад" not in headers
+    assert dashboard.freeze_panes == "A3"

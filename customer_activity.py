@@ -323,7 +323,11 @@ def activity_dynamics(rows: list[sqlite3.Row], report_monday: date) -> dict:
             if month_start.month == 12
             else date(month_start.year, month_start.month + 1, 1)
         )
-        boundary = min(next_month, report_monday)
+        # Only completed calendar months belong to trend charts. A partial
+        # month creates a false visual drop in buyers and revenue.
+        if next_month > report_monday:
+            break
+        boundary = next_month
         buyers = set()
         episodes_count = 0
         revenue = 0.0
@@ -459,13 +463,18 @@ def build_activity_excel(destination: Path, data: dict, channel_href: str = "") 
         dash.merge_cells(start_row=3, start_column=column, end_row=3, end_column=column + 1)
         dash.merge_cells(start_row=4, start_column=column, end_row=4, end_column=column + 1)
 
-    headers = ["Менеджер", "Активные клиенты", "Новые кенты", "Выручка новых",
-               "Вернувшиеся кенты", "Выручка вернувшихся", "Стали неактивными",
-               "Клиенты, которые давно не заказывали: 20–29 дней",
-               "Клиенты, которые давно не заказывали: 30–59 дней",
-               "Клиенты, которые давно не заказывали: 60+ дней",
-               "Потеряшки — всего сейчас", "Потеряшки — предыдущая неделя", "Изменение"]
-    manager_header_row = 42
+    headers = ["Менеджер", "Активные", "Новые", "Вернулись", "Стали неактивными",
+               "20–29 дней", "30–59 дней", "60+ дней",
+               "Всего сейчас", "Неделю назад", "Изменение"]
+    manager_group_row = 19
+    manager_header_row = 20
+    dash.merge_cells(start_row=manager_group_row, start_column=1, end_row=manager_group_row, end_column=5)
+    dash.cell(manager_group_row, 1, "Клиентская база").font = Font(bold=True, color="FFFFFF")
+    dash.merge_cells(start_row=manager_group_row, start_column=6, end_row=manager_group_row, end_column=11)
+    dash.cell(manager_group_row, 6, "Клиенты, которые давно не заказывали").font = Font(bold=True, color="FFFFFF")
+    for cell in dash[manager_group_row]:
+        cell.fill = PatternFill("solid", fgColor="455A64")
+        cell.alignment = Alignment(horizontal="center")
     for column, value in enumerate(headers, 1):
         dash.cell(manager_header_row, column, value)
     for manager in managers:
@@ -476,20 +485,16 @@ def build_activity_excel(destination: Path, data: dict, channel_href: str = "") 
         a = [x for x in active if (x["manager"] or "Без менеджера") == manager]
         pa = [x for x in previous_active if (x["manager"] or "Без менеджера") == manager]
         bi = [x for x in became_inactive if (x["manager"] or "Без менеджера") == manager]
-        dash.append([manager, len(a), len(n), sum(x["amount"] for x in n),
-                     len(r), sum(x["amount"] for x in r), len(bi),
+        dash.append([manager, len(a), len(n), len(r), len(bi),
                      sum(x["category"] == "20–29 дней" for x in l), sum(x["category"] == "30–59 дней" for x in l),
                      sum(x["category"] == "60+ дней" for x in l), len(l), len(pl), len(l) - len(pl)])
-    dash.append(["ИТОГО", len(active), len(new), sum(x["amount"] for x in new),
-                 len(returned), sum(x["amount"] for x in returned), len(became_inactive),
+    dash.append(["ИТОГО", len(active), len(new), len(returned), len(became_inactive),
                  sum(x["category"] == "20–29 дней" for x in lost), sum(x["category"] == "30–59 дней" for x in lost),
                  sum(x["category"] == "60+ дней" for x in lost), len(lost), len(previous_lost), len(lost) - len(previous_lost)])
     for cell in dash[manager_header_row]:
         cell.font = Font(bold=True, color="FFFFFF"); cell.fill = PatternFill("solid", fgColor="263238"); cell.alignment = Alignment(wrap_text=True)
-    dash.freeze_panes = "B25"
-    for col, width in zip("ABCDEFGHIJKLM", [24,20,18,20,22,23,22,34,34,34,22,26,14]): dash.column_dimensions[col].width = width
-    for row in dash.iter_rows(min_row=manager_header_row + 1):
-        row[3].number_format = row[5].number_format = '#,##0.00 [$₽-ru-RU]'
+    dash.freeze_panes = "A3"
+    for col, width in zip("ABCDEFGHIJK", [24,14,12,14,20,14,14,14,16,17,14]): dash.column_dimensions[col].width = width
 
     analytics = wb.create_sheet("Помесячная аналитика")
     monthly_values = []
@@ -505,20 +510,24 @@ def build_activity_excel(destination: Path, data: dict, channel_href: str = "") 
     for row in analytics.iter_rows(min_row=2):
         row[5].number_format = row[6].number_format = '#,##0.00 [$₽-ru-RU]'
 
-    def add_line_chart(title: str, value_column: int, anchor: str, y_title: str) -> None:
+    def add_line_chart(title: str, min_column: int, max_column: int, anchor: str, y_title: str) -> None:
         chart = LineChart()
         chart.title = title
         chart.y_axis.title = y_title
         chart.x_axis.title = "Месяц"
-        chart.add_data(Reference(analytics, min_col=value_column, min_row=1, max_row=1 + len(monthly_values)), titles_from_data=True)
+        chart.add_data(Reference(analytics, min_col=min_column, max_col=max_column, min_row=1, max_row=1 + len(monthly_values)), titles_from_data=True, from_rows=False)
         chart.set_categories(Reference(analytics, min_col=1, min_row=2, max_row=1 + len(monthly_values)))
-        chart.height = 8
-        chart.width = 14
+        chart.height = 6.2
+        chart.width = 11.5
+        chart.style = 13
+        for series in chart.series:
+            series.graphicalProperties.line.width = 22000
+            series.marker.symbol = "circle"
+            series.marker.size = 6
         dash.add_chart(chart, anchor)
 
-    add_line_chart("Динамика активной клиентской базы", 3, "A6", "Активные клиенты")
-    add_line_chart("Уникальные покупатели по месяцам", 2, "I6", "Клиенты с отгрузками")
-    add_line_chart("Выручка по месяцам", 6, "A22", "Рубли")
+    add_line_chart("Клиентская база по месяцам", 2, 3, "A6", "Клиенты")
+    add_line_chart("Выручка по месяцам", 6, 6, "G6", "Рубли")
     explanations = [
         ("Как читать дэшборд", "Показатели рассчитаны по созданным отгрузкам начиная с 01.04.2026."),
         ("Закупочный цикл", "Несколько отгрузок одного клиента в пределах 3 дней считаются одной закупкой."),
@@ -534,10 +543,14 @@ def build_activity_excel(destination: Path, data: dict, channel_href: str = "") 
         ("Закупочные эпизоды", "Серии отгрузок клиента, разделённые паузой более 3 дней; показатель не завышается дроблением одного заказа."),
         ("Выручка на покупателя", "Сумма созданных отгрузок месяца, разделённая на число уникальных покупавших клиентов."),
     ])
-    for index, (term, meaning) in enumerate(explanations, 22):
-        dash.cell(index, 9, term).font = Font(bold=True, color="263238")
-        dash.merge_cells(start_row=index, start_column=10, end_row=index, end_column=15)
-        dash.cell(index, 10, meaning).alignment = Alignment(wrap_text=True, vertical="top")
+    explanation_start = manager_header_row + len(managers) + 4
+    dash.merge_cells(start_row=explanation_start - 1, start_column=1, end_row=explanation_start - 1, end_column=11)
+    dash.cell(explanation_start - 1, 1, "Как читать дэшборд").font = Font(bold=True, color="FFFFFF")
+    dash.cell(explanation_start - 1, 1).fill = PatternFill("solid", fgColor="455A64")
+    for index, (term, meaning) in enumerate(explanations, explanation_start):
+        dash.cell(index, 1, term).font = Font(bold=True, color="263238")
+        dash.merge_cells(start_row=index, start_column=2, end_row=index, end_column=11)
+        dash.cell(index, 2, meaning).alignment = Alignment(wrap_text=True, vertical="top")
         dash.row_dimensions[index].height = 34
     ws = wb.create_sheet("Новые кенты")
     _sheet_table(ws, ["Клиент", "Менеджер", "Первая отгрузка", "Отгрузок за неделю", "Сумма", "Контрагенты"],
