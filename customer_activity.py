@@ -8,8 +8,10 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from statistics import median
 
 from openpyxl import Workbook
+from openpyxl.chart import LineChart, Reference
 from openpyxl.styles import Alignment, Font, PatternFill
 
 from moysklad_price import MoySkladClient, _canonical_href
@@ -31,7 +33,14 @@ class ActivityReport:
 
 
 def client_parts(agent_name: str) -> tuple[str, str]:
-    display = (agent_name.split("/", 1)[0] or agent_name).strip()
+    # Counterparties use both `/` and `|` before their legal entity/payment
+    # suffix. Everything before the first such separator is the customer brand.
+    display = (re.split(r"[/|｜]", agent_name, maxsplit=1)[0] or agent_name).strip()
+    display = re.sub(
+        r"\s*\((?:ИП|ООО|АО|ОАО|ЗАО)\s+[^()]+\)\s*$",
+        "", display, flags=re.IGNORECASE,
+    )
+    display = " ".join(display.split())
     key = re.sub(r"[^\w]+", " ", display.replace("_", " ").casefold().replace("ё", "е"))
     return " ".join(key.split()), display
 
@@ -226,6 +235,75 @@ def _money(minor: int) -> float:
     return float(Decimal(minor) / Decimal(100))
 
 
+def _grouped_shipments(rows: list[sqlite3.Row], boundary: date) -> dict[str, list]:
+    result: dict[str, list] = defaultdict(list)
+    end = datetime.combine(boundary, datetime.min.time())
+    for row in rows:
+        moment = datetime.strptime(row["moment"][:19], "%Y-%m-%d %H:%M:%S")
+        if moment < end:
+            result[row["client_key"]].append((moment, row))
+    for values in result.values():
+        values.sort(key=lambda item: item[0])
+    return result
+
+
+def _activity_states(rows: list[sqlite3.Row], boundary: date) -> dict[str, dict]:
+    states = {}
+    for key, shipments in _grouped_shipments(rows, boundary).items():
+        episodes = []
+        for moment, row in shipments:
+            if not episodes or (moment.date() - episodes[-1][0].date()).days > 3:
+                episodes.append((moment, row))
+        gaps = [
+            (episodes[index][0].date() - episodes[index - 1][0].date()).days
+            for index in range(1, len(episodes))
+        ]
+        expected = float(median(gaps)) if gaps else 40.0
+        activity_window = 60 if not gaps else max(21, min(90, round(expected * 1.5)))
+        last_moment, last = shipments[-1]
+        states[key] = {
+            "client": last["client_name"], "manager": last["channel_name"],
+            "channel_href": last["channel_href"], "last": last_moment,
+            "days": (boundary - last_moment.date()).days,
+            "window": activity_window,
+            "expected": round(expected),
+            "active": (boundary - last_moment.date()).days <= activity_window,
+            "counterparties": sorted({item[1]["agent_name"] for item in shipments}),
+        }
+    return states
+
+
+def activity_dynamics(rows: list[sqlite3.Row], report_monday: date) -> dict:
+    previous_boundary = report_monday - timedelta(days=7)
+    current = _activity_states(rows, report_monday)
+    previous = _activity_states(rows, previous_boundary)
+    grouped = _grouped_shipments(rows, report_monday)
+    returned = []
+    became_inactive = []
+    for key, state in current.items():
+        old = previous.get(key)
+        week_shipments = [item for item in grouped[key] if item[0].date() >= previous_boundary]
+        if old and not old["active"] and state["active"] and week_shipments:
+            returned.append({
+                **state, "returned": week_shipments[0][0],
+                "gap": (week_shipments[0][0].date() - old["last"].date()).days,
+                "amount": sum(_money(item[1]["amount_minor"]) for item in week_shipments),
+            })
+    for key, old in previous.items():
+        state = current.get(key)
+        if old["active"] and state and not state["active"]:
+            became_inactive.append(state)
+    first_boundary = date(2026, 4, 6)
+    history = []
+    boundary = first_boundary
+    while boundary <= report_monday:
+        states = _activity_states(rows, boundary)
+        history.append({"week": boundary, "states": states})
+        boundary += timedelta(days=7)
+    return {"current": current, "previous": previous, "returned": returned,
+            "became_inactive": became_inactive, "history": history}
+
+
 def _snapshot(rows: list[sqlite3.Row], report_monday: date) -> dict:
     period_end = datetime.combine(report_monday, datetime.min.time())
     period_start = period_end - timedelta(days=7)
@@ -265,9 +343,12 @@ def _snapshot(rows: list[sqlite3.Row], report_monday: date) -> dict:
 def report_rows(rows: list[sqlite3.Row], report_monday: date) -> dict:
     current = _snapshot(rows, report_monday)
     previous = _snapshot(rows, report_monday - timedelta(days=7))
+    dynamics = activity_dynamics(rows, report_monday)
+    current["returned"] = dynamics["returned"]
     return {
         **current,
         "previous": previous,
+        "dynamics": dynamics,
         "period_start": report_monday - timedelta(days=7),
         "period_end": report_monday - timedelta(days=1),
         "previous_start": report_monday - timedelta(days=14),
@@ -296,7 +377,13 @@ def build_activity_excel(destination: Path, data: dict, channel_href: str = "") 
     previous_new = chosen(data["previous"]["new"])
     previous_returned = chosen(data["previous"]["returned"])
     previous_lost = chosen(data["previous"]["lost"])
-    managers = sorted({item["manager"] or "Без менеджера" for group in (new, returned, lost, previous_new, previous_returned, previous_lost) for item in group})
+    dynamics = data["dynamics"]
+    def state_values(name):
+        return [item for item in dynamics[name].values() if not channel_href or _canonical_href(item["channel_href"]) == _canonical_href(channel_href)]
+    active = [item for item in state_values("current") if item["active"]]
+    previous_active = [item for item in state_values("previous") if item["active"]]
+    became_inactive = chosen(dynamics["became_inactive"])
+    managers = sorted({item["manager"] or "Без менеджера" for group in (new, returned, lost, previous_lost, active, previous_active, became_inactive) for item in group})
     wb = Workbook()
     dash = wb.active
     dash.title = "Дэшборд"
@@ -306,9 +393,9 @@ def build_activity_excel(destination: Path, data: dict, channel_href: str = "") 
     dash["A1"].fill = PatternFill("solid", fgColor="263238")
     dash["A2"] = f"Отчёт за {data['period_start']:%d.%m.%Y}–{data['period_end']:%d.%m.%Y}"
     dash.merge_cells("A2:O2")
-    headers = ["Менеджер", "Новые кенты — эта неделя", "Новые — предыдущая", "Изменение",
-               "Выручка новых", "Вернувшиеся — эта неделя", "Вернувшиеся — предыдущая", "Изменение",
-               "Выручка вернувшихся",
+    headers = ["Менеджер", "Активные клиенты", "Активные неделю назад", "Изменение базы",
+               "Новые кенты", "Выручка новых", "Вернувшиеся кенты", "Выручка вернувшихся",
+               "Стали неактивными",
                "Клиенты, которые давно не заказывали: 20–29 дней",
                "Клиенты, которые давно не заказывали: 30–59 дней",
                "Клиенты, которые давно не заказывали: 60+ дней",
@@ -318,29 +405,63 @@ def build_activity_excel(destination: Path, data: dict, channel_href: str = "") 
         n = [x for x in new if (x["manager"] or "Без менеджера") == manager]
         r = [x for x in returned if (x["manager"] or "Без менеджера") == manager]
         l = [x for x in lost if (x["manager"] or "Без менеджера") == manager]
-        pn = [x for x in previous_new if (x["manager"] or "Без менеджера") == manager]
-        pr = [x for x in previous_returned if (x["manager"] or "Без менеджера") == manager]
         pl = [x for x in previous_lost if (x["manager"] or "Без менеджера") == manager]
-        dash.append([manager, len(n), len(pn), len(n) - len(pn), sum(x["amount"] for x in n),
-                     len(r), len(pr), len(r) - len(pr), sum(x["amount"] for x in r),
+        a = [x for x in active if (x["manager"] or "Без менеджера") == manager]
+        pa = [x for x in previous_active if (x["manager"] or "Без менеджера") == manager]
+        bi = [x for x in became_inactive if (x["manager"] or "Без менеджера") == manager]
+        dash.append([manager, len(a), len(pa), len(a) - len(pa), len(n), sum(x["amount"] for x in n),
+                     len(r), sum(x["amount"] for x in r), len(bi),
                      sum(x["category"] == "20–29 дней" for x in l), sum(x["category"] == "30–59 дней" for x in l),
                      sum(x["category"] == "60+ дней" for x in l), len(l), len(pl), len(l) - len(pl)])
-    dash.append(["ИТОГО", len(new), len(previous_new), len(new) - len(previous_new), sum(x["amount"] for x in new),
-                 len(returned), len(previous_returned), len(returned) - len(previous_returned), sum(x["amount"] for x in returned),
+    dash.append(["ИТОГО", len(active), len(previous_active), len(active) - len(previous_active),
+                 len(new), sum(x["amount"] for x in new), len(returned), sum(x["amount"] for x in returned),
+                 len(became_inactive),
                  sum(x["category"] == "20–29 дней" for x in lost), sum(x["category"] == "30–59 дней" for x in lost),
                  sum(x["category"] == "60+ дней" for x in lost), len(lost), len(previous_lost), len(lost) - len(previous_lost)])
     for cell in dash[3]:
         cell.font = Font(bold=True, color="FFFFFF"); cell.fill = PatternFill("solid", fgColor="263238"); cell.alignment = Alignment(wrap_text=True)
     dash.freeze_panes = "B4"
-    for col, width in zip("ABCDEFGHIJKLMNO", [24,20,20,14,20,22,22,14,23,34,34,34,22,26,14]): dash.column_dimensions[col].width = width
+    for col, width in zip("ABCDEFGHIJKLMNO", [24,20,22,18,18,20,22,23,22,34,34,34,22,26,14]): dash.column_dimensions[col].width = width
     for row in dash.iter_rows(min_row=4):
-        row[4].number_format = row[8].number_format = '#,##0.00 [$₽-ru-RU]'
+        row[5].number_format = row[7].number_format = '#,##0.00 [$₽-ru-RU]'
+    trend_row = len(managers) + 7
+    dash.cell(trend_row, 1, "Неделя")
+    dash.cell(trend_row, 2, "Активные клиенты")
+    for index, point in enumerate(dynamics["history"], trend_row + 1):
+        values = [item for item in point["states"].values() if item["active"] and (not channel_href or _canonical_href(item["channel_href"]) == _canonical_href(channel_href))]
+        dash.cell(index, 1, point["week"])
+        dash.cell(index, 2, len(values))
+    chart = LineChart()
+    chart.title = "Динамика активной клиентской базы"
+    chart.y_axis.title = "Активные клиенты"
+    chart.x_axis.title = "Неделя"
+    chart.add_data(Reference(dash, min_col=2, min_row=trend_row, max_row=trend_row + len(dynamics["history"])), titles_from_data=True)
+    chart.set_categories(Reference(dash, min_col=1, min_row=trend_row + 1, max_row=trend_row + len(dynamics["history"])))
+    chart.height = 8
+    chart.width = 16
+    dash.add_chart(chart, "Q3")
+    explanations = [
+        ("Как читать дэшборд", "Показатели рассчитаны по созданным отгрузкам начиная с 01.04.2026."),
+        ("Закупочный цикл", "Несколько отгрузок одного клиента в пределах 3 дней считаются одной закупкой."),
+        ("Обычный интервал", "Медиана промежутков между закупками клиента; единичный необычный перерыв меньше искажает результат."),
+        ("Активный клиент", "Дней после последней закупки не больше обычного интервала × 1,5. Допустимое окно ограничено 21–90 днями."),
+        ("Мало истории", "Если зафиксирована только одна закупка, клиент считается активным 60 дней."),
+        ("Вернувшийся", "На этой неделе снова закупился клиент, который неделю назад уже был неактивным."),
+        ("Стал неактивным", "На этой неделе клиент вышел за своё индивидуальное допустимое окно."),
+        ("Изменение базы", "Активные сейчас минус активные неделю назад. Положительное значение означает рост активной базы."),
+        ("График", "Показывает число активных клиентов на конец каждой недели; устойчивый подъём означает рост работающей базы."),
+    ]
+    for index, (term, meaning) in enumerate(explanations, 20):
+        dash.cell(index, 17, term).font = Font(bold=True)
+        dash.cell(index, 18, meaning).alignment = Alignment(wrap_text=True, vertical="top")
+    dash.column_dimensions["Q"].width = 24
+    dash.column_dimensions["R"].width = 70
     ws = wb.create_sheet("Новые кенты")
     _sheet_table(ws, ["Клиент", "Менеджер", "Первая отгрузка", "Отгрузок за неделю", "Сумма", "Контрагенты"],
                  [[x["client"], x["manager"], x["first"], x["count"], x["amount"], "\n".join(x["counterparties"])] for x in new], [28,22,20,20,18,55])
     ws = wb.create_sheet("Вернувшиеся кенты")
     _sheet_table(ws, ["Клиент", "Менеджер", "Дата возвращения", "Перерыв, дней", "Сумма за неделю", "Контрагенты"],
-                 [[x["client"], x["manager"], x["returned"], x["days"], x["amount"], "\n".join(x["counterparties"])] for x in returned], [28,22,20,18,20,55])
+                 [[x["client"], x["manager"], x["returned"], x["gap"], x["amount"], "\n".join(x["counterparties"])] for x in returned], [28,22,20,18,20,55])
     ws = wb.create_sheet("Кенты-потеряшки")
     _sheet_table(ws, ["Клиент", "Менеджер", "Категория", "Последняя отгрузка", "Дней без отгрузок", "Сумма последней отгрузки", "Контрагенты"],
                  [[x["client"], x["manager"], x["category"], x["last"], x["days"], x["last_amount"], "\n".join(x["counterparties"])] for x in lost], [28,22,18,22,22,25,55])
@@ -353,6 +474,8 @@ def build_activity_excel(destination: Path, data: dict, channel_href: str = "") 
         "new": len(new), "previous_new": len(previous_new),
         "returned": len(returned), "previous_returned": len(previous_returned),
         "lost": len(lost), "previous_lost": len(previous_lost),
+        "active": len(active), "previous_active": len(previous_active),
+        "became_inactive": len(became_inactive),
     }
 
 

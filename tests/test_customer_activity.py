@@ -34,12 +34,28 @@ class FakeClient:
 def test_client_names_are_grouped_by_prefix():
     assert client_parts("Is_getto/Шаров А.И.-5/Вологда")[0] == client_parts("Is getto/Литвиневский В.М.-5")[0]
     assert client_parts("(О) Vape Zone/НАЛ/СПб")[1] == "(О) Vape Zone"
+    assert client_parts("Вячеслав   KAILAS {Ульяновск} | Нал")[0] == client_parts(
+        "Вячеслав KAILAS {Ульяновск} | (ИП Ниськов А.Н.)"
+    )[0]
+    assert client_parts("Manager   Sistem Opt (Владимирская область)| (ИП Механиков Д. А.)")[0] == client_parts(
+        "Manager Sistem Opt (Владимирская область) | (ИП Куликова А.С.)"
+    )[0]
+    assert client_parts("Joki   Липецк (ИП Нечаев В. А.)")[0] == client_parts(
+        "Joki Липецк (ИП Лаврентьев   А.Н.)"
+    )[0]
+    assert client_parts("Joki Липецк (ИП Толчеев С.Г.)")[1] == "Joki Липецк"
+    assert client_parts("Oleg Wow   Smoke {Самара} (ИП Исмаилов Р.Р.)")[0] == client_parts(
+        "Oleg Wow Smoke {Самара} (ИП   Севостьянов Р.С.)"
+    )[0]
+    assert client_parts("Oleg Wow Smoke {Самара} (ИП Севостьянов Р.С.)")[1] == (
+        "Oleg Wow Smoke {Самара}"
+    )
 
 
 def test_weekly_groups_and_latest_channel(tmp_path):
     db = ActivityDatabase(tmp_path / "activity.sqlite3")
     db.upsert_shipments([
-        demand("old-return", "Return/ИП 1", "2026-08-01 10:00:00", "Андрей", "a"),
+        demand("old-return", "Return/ИП 1", "2026-06-01 10:00:00", "Андрей", "a"),
         demand("returned", "Return/ИП 2", "2026-09-03 10:00:00", "Валера", "v"),
         demand("new", "New shop/ИП", "2026-09-02 10:00:00", "Матвей", "m", 25000),
         demand("lost", "Lost/ИП", "2026-08-10 10:00:00", "Андрей", "a"),
@@ -48,7 +64,7 @@ def test_weekly_groups_and_latest_channel(tmp_path):
     assert [row["client"] for row in data["new"]] == ["New shop"]
     assert data["returned"][0]["client"] == "Return"
     assert data["returned"][0]["manager"] == "Валера"
-    assert data["returned"][0]["days"] == 33
+    assert data["returned"][0]["gap"] == 94
     assert data["lost"][0]["category"] == "20–29 дней"
     assert len(data["previous"]["new"]) == 0
     assert len(data["previous"]["lost"]) == 2
@@ -67,16 +83,13 @@ def test_sync_uses_start_date_then_incremental_cursor(tmp_path):
 
 def test_excel_has_dashboard_and_single_lost_sheet(tmp_path):
     destination = tmp_path / "report.xlsx"
-    data = {
-        "period_start": date(2026, 8, 31), "period_end": date(2026, 9, 6),
-        "new": [], "returned": [],
-        "lost": [{"client": "Lost", "manager": "Валера", "channel_href": "v",
-                  "counterparties": ["Lost/ИП"], "last": datetime(2026, 8, 1),
-                  "days": 37, "category": "30–59 дней", "last_amount": 100.0}],
-        "previous": {"new": [], "returned": [], "lost": []},
-    }
+    db = ActivityDatabase(tmp_path / "excel.sqlite3")
+    db.upsert_shipments([demand("lost", "Lost/ИП", "2026-08-01 10:00:00")])
+    data = report_rows(db.shipments(), date(2026, 9, 7))
     build_activity_excel(destination, data)
     workbook = load_workbook(destination)
     assert workbook.sheetnames == ["Дэшборд", "Новые кенты", "Вернувшиеся кенты", "Кенты-потеряшки"]
     headers = [cell.value for cell in workbook["Дэшборд"][3]]
     assert all("Клиенты, которые давно не заказывали" in value for value in headers[9:12])
+    assert "Новые — предыдущая" not in headers
+    assert "Вернувшиеся — предыдущая" not in headers
