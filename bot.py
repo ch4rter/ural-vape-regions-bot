@@ -1377,7 +1377,7 @@ def activity_report_text(report: ActivityReport, summary: dict) -> str:
         "👥 <b>Новые кенты и кенты-потеряшки</b>\n\n"
         f"Период: <b>{datetime.fromisoformat(report.period_start):%d.%m.%Y}–"
         f"{datetime.fromisoformat(report.period_end):%d.%m.%Y}</b>\n\n"
-        f"📈 Активная база: <b>{comparison(summary.get('active', 0), summary.get('previous_active', 0))}</b>\n"
+        f"📈 Активная база сейчас: <b>{summary.get('active', 0)}</b>\n"
         f"🆕 Новые кенты: <b>{summary.get('new', 0)}</b>\n"
         f"🔄 Вернувшиеся кенты: <b>{summary.get('returned', 0)}</b>\n"
         f"📉 Стали неактивными: <b>{summary.get('became_inactive', 0)}</b>\n"

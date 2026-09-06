@@ -86,7 +86,7 @@ async def main() -> None:
         "🧪 <b>Тестовый еженедельный отчёт</b>\n\n"
         f"Период: <b>{datetime.fromisoformat(report.period_start):%d.%m.%Y}–"
         f"{datetime.fromisoformat(report.period_end):%d.%m.%Y}</b>\n\n"
-        f"📈 Активная база: <b>{compared('active', 'previous_active')}</b>\n"
+        f"📈 Активная база сейчас: <b>{report.summary.get('active', 0)}</b>\n"
         f"🆕 Новые кенты: <b>{report.summary.get('new', 0)}</b>\n"
         f"🔄 Вернувшиеся кенты: <b>{report.summary.get('returned', 0)}</b>\n"
         f"📉 Стали неактивными: <b>{report.summary.get('became_inactive', 0)}</b>\n"

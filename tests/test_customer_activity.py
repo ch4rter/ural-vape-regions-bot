@@ -88,8 +88,15 @@ def test_excel_has_dashboard_and_single_lost_sheet(tmp_path):
     data = report_rows(db.shipments(), date(2026, 9, 7))
     build_activity_excel(destination, data)
     workbook = load_workbook(destination)
-    assert workbook.sheetnames == ["Дэшборд", "Новые кенты", "Вернувшиеся кенты", "Кенты-потеряшки"]
-    headers = [cell.value for cell in workbook["Дэшборд"][3]]
-    assert all("Клиенты, которые давно не заказывали" in value for value in headers[9:12])
+    assert workbook.sheetnames == ["Дэшборд", "Помесячная аналитика", "Новые кенты", "Вернувшиеся кенты", "Кенты-потеряшки"]
+    dashboard = workbook["Дэшборд"]
+    assert len(dashboard._charts) == 3
+    assert dashboard["I22"].value == "Как читать дэшборд"
+    monthly_headers = [cell.value for cell in workbook["Помесячная аналитика"][1]]
+    assert "Уникальные покупатели" in monthly_headers
+    assert "Выручка на покупателя" in monthly_headers
+    headers = [cell.value for cell in dashboard[42]]
+    assert all("Клиенты, которые давно не заказывали" in value for value in headers[7:10])
     assert "Новые — предыдущая" not in headers
     assert "Вернувшиеся — предыдущая" not in headers
+    assert "Активные неделю назад" not in headers
