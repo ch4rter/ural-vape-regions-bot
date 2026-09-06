@@ -11,7 +11,7 @@ import tempfile
 import zipfile
 from typing import Any, Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from difflib import SequenceMatcher
 from itertools import chain
@@ -38,9 +38,11 @@ from aiogram.types import (
 )
 from dotenv import load_dotenv
 from openpyxl import Workbook, load_workbook
+from zoneinfo import ZoneInfo
 
 from crm_bot import configure_crm, router as crm_router
 from crm_db import CRMDatabase
+from customer_activity import ActivityDatabase, ActivityReport, build_weekly_report
 from google_crm import GoogleCRM
 from materials_db import Material, MaterialsDB
 from moysklad_price import (
@@ -98,12 +100,14 @@ catalog: "Catalog"
 materials_db: MaterialsDB
 prices_db: PricesDB
 crm_database: CRMDatabase
+activity_database: ActivityDatabase
 admin_ids: set[int] = set()
 crm_beta_ids: set[int] = {5533726476}
 active_excel_path: Path
 managed_excel_path: Path
 price_storage_path: Path
 bonus_storage_path: Path
+activity_storage_path: Path
 price_updates_in_progress: set[str] = set()
 broadcasts_in_progress: set[int] = set()
 broadcast_album_buffers: dict[tuple[int, int, str], list[Message]] = {}
@@ -522,6 +526,18 @@ def has_internal_access(user_id: int | None, username: str | None = None) -> boo
     )
 
 
+def can_receive_activity_report(user_id: int | None) -> bool:
+    if not user_id:
+        return False
+    if is_admin(user_id):
+        return True
+    user = materials_db.access_user_by_telegram(user_id)
+    if not user:
+        return False
+    reviewer = materials_db.get_setting("order_review_reviewer_access_id") or ""
+    return user.role == "manager" or reviewer == str(user.id)
+
+
 def button_grid(buttons: list[InlineKeyboardButton], columns: int = 2) -> list[list[InlineKeyboardButton]]:
     return [buttons[index : index + columns] for index in range(0, len(buttons), columns)]
 
@@ -562,6 +578,11 @@ def main_menu(user_id: int | None) -> InlineKeyboardMarkup:
                 text="📈 Мои отгрузки", callback_data="myship:menu"
             ))
         buttons.append(InlineKeyboardButton(text="🔔 Ожидания", callback_data="main:waitlist"))
+        if can_receive_activity_report(user_id):
+            buttons.append(InlineKeyboardButton(
+                text="👥 Новые кенты и кенты-потеряшки",
+                callback_data="activity:report",
+            ))
     elif user_id and materials_db.get_lead_profile(user_id):
         buttons.append(InlineKeyboardButton(text="📄 Получить прайсы", callback_data="public:prices"))
     rows = button_grid(buttons)
@@ -1331,6 +1352,55 @@ async def save_sales_goal(message: Message, state: FSMContext) -> None:
         f"✅ <b>Цель сохранена</b>\n\n{month_title(month).capitalize()}: <b>{formatted} ₽</b>",
         reply_markup=progress_month_keyboard(admin=True),
     )
+
+
+def activity_report_path_for(user_id: int, report: ActivityReport) -> Path | None:
+    if is_admin(user_id):
+        return Path(report.common_path)
+    user = materials_db.access_user_by_telegram(user_id)
+    if not user:
+        return None
+    reviewer = materials_db.get_setting("order_review_reviewer_access_id") or ""
+    if reviewer == str(user.id):
+        return Path(report.common_path)
+    if user.role == "manager":
+        value = report.personal_paths.get(str(user.id))
+        return Path(value) if value else None
+    return None
+
+
+def activity_report_text(report: ActivityReport, summary: dict) -> str:
+    return (
+        "👥 <b>Новые кенты и кенты-потеряшки</b>\n\n"
+        f"Период: <b>{datetime.fromisoformat(report.period_start):%d.%m.%Y}–"
+        f"{datetime.fromisoformat(report.period_end):%d.%m.%Y}</b>\n\n"
+        f"🆕 Новые кенты: <b>{summary.get('new', 0)}</b>\n"
+        f"🔄 Вернувшиеся кенты: <b>{summary.get('returned', 0)}</b>\n"
+        f"🕒 Кенты-потеряшки: <b>{summary.get('lost', 0)}</b>\n\n"
+        "Отчёт сформирован автоматически и повторно не нагружает API МоегоСклада."
+    )
+
+
+@router.callback_query(F.data == "activity:report")
+async def send_cached_activity_report(callback: CallbackQuery) -> None:
+    if not can_receive_activity_report(callback.from_user.id):
+        await callback.answer("Этот отчёт доступен только менеджерам и руководителю.", show_alert=True)
+        return
+    report = activity_database.report()
+    if not report:
+        await callback.answer("Первый еженедельный отчёт ещё формируется.", show_alert=True)
+        return
+    path = activity_report_path_for(callback.from_user.id, report)
+    if not path or not path.is_file():
+        await callback.answer("Персональный отчёт пока недоступен. Проверьте канал продаж.", show_alert=True)
+        return
+    user = materials_db.access_user_by_telegram(callback.from_user.id)
+    summary = report.summary
+    if user and not is_admin(callback.from_user.id) and str(user.id) in report.personal_paths:
+        summary = report.summary.get("personal", {}).get(str(user.id), summary)
+    await callback.answer("Отправляю сохранённый отчёт…")
+    await callback.message.answer(activity_report_text(report, summary))
+    await callback.message.answer_document(FSInputFile(path))
 
 
 async def send_price_command_intro(message: Message) -> None:
@@ -4133,6 +4203,10 @@ def build_backup_archive(archive_path: Path) -> None:
         crm_copy = temp_dir / "crm.sqlite3"
         if crm_database_instance is not None:
             crm_database_instance.backup_to(crm_copy)
+        activity_database_instance = globals().get("activity_database")
+        activity_copy = temp_dir / "customer_activity.sqlite3"
+        if activity_database_instance is not None:
+            activity_database_instance.backup_to(activity_copy)
         metadata = temp_dir / "README.txt"
         metadata.write_text(
             "Резервная копия Ural Vape Regions Bot\n"
@@ -4142,6 +4216,7 @@ def build_backup_archive(archive_path: Path) -> None:
             "managers.xlsx — действующая таблица территорий\n"
             "prices.sqlite3 — загруженные цены и товарные группы\n"
             "crm.sqlite3 — задачи, список обзвона и журнал действий CRM\n"
+            "customer_activity.sqlite3 — локальный реестр отгрузок и недельных отчётов\n"
             "price_files/ — последний исходный общий прайс\n",
             encoding="utf-8",
         )
@@ -4152,12 +4227,21 @@ def build_backup_archive(archive_path: Path) -> None:
                 archive.write(prices_copy, prices_copy.name)
             if crm_copy.exists():
                 archive.write(crm_copy, crm_copy.name)
+            if activity_copy.exists():
+                archive.write(activity_copy, activity_copy.name)
             storage = globals().get("price_storage_path")
             if storage and storage.exists():
                 for warehouse in (PRICE_SOURCE, "center", "west", "ural"):
                     source = storage / f"{warehouse}.xlsx"
                     if source.exists():
                         archive.write(source, f"price_files/{source.name}")
+            report_storage = globals().get("activity_storage_path")
+            if report_storage and report_storage.exists():
+                for source in report_storage.rglob("*.xlsx"):
+                    archive.write(
+                        source,
+                        "customer_activity_reports/" + source.relative_to(report_storage).as_posix(),
+                    )
             archive.write(metadata, metadata.name)
 
 
@@ -6467,10 +6551,90 @@ async def order_status_monitor(bot: Bot) -> None:
         await asyncio.sleep(interval)
 
 
+def activity_manager_channels() -> dict[str, str]:
+    return {
+        str(user.id): user.sales_channel_href
+        for user in materials_db.list_access_users()
+        if user.role == "manager" and user.sales_channel_href
+    }
+
+
+async def deliver_weekly_activity_report(bot: Bot, report: ActivityReport) -> None:
+    recipients: dict[int, tuple[Path, dict]] = {}
+    personal = report.summary.get("personal", {})
+    for user in materials_db.list_access_users():
+        if user.role != "manager" or not user.telegram_id:
+            continue
+        path_value = report.personal_paths.get(str(user.id))
+        if path_value:
+            recipients[user.telegram_id] = (
+                Path(path_value), personal.get(str(user.id), report.summary)
+            )
+    reviewer_raw = materials_db.get_setting("order_review_reviewer_access_id") or ""
+    reviewer = materials_db.get_access_user(int(reviewer_raw)) if reviewer_raw.isdigit() else None
+    if reviewer and reviewer.telegram_id:
+        recipients[reviewer.telegram_id] = (Path(report.common_path), report.summary)
+    for administrator_id in admin_ids:
+        recipients[administrator_id] = (Path(report.common_path), report.summary)
+
+    all_delivered = True
+    for user_id, (path, summary) in recipients.items():
+        if activity_database.delivered(report.week, user_id):
+            continue
+        try:
+            await bot.send_document(
+                user_id, FSInputFile(path), caption=activity_report_text(report, summary)
+            )
+            activity_database.mark_delivered(
+                report.week, user_id, datetime.now(ZoneInfo("Europe/Moscow")).isoformat(timespec="seconds")
+            )
+        except TelegramRetryAfter as error:
+            await asyncio.sleep(error.retry_after)
+            all_delivered = False
+        except Exception:
+            all_delivered = False
+            logging.exception("Не удалось отправить еженедельный отчёт пользователю %s", user_id)
+    if all_delivered and all(
+        activity_database.delivered(report.week, user_id) for user_id in recipients
+    ):
+        activity_database.mark_sent(
+            report.week, datetime.now(ZoneInfo("Europe/Moscow")).isoformat(timespec="seconds")
+        )
+
+
+async def customer_activity_monitor(bot: Bot) -> None:
+    token = os.getenv("MOYSKLAD_TOKEN", "").strip()
+    if not token:
+        logging.warning("Еженедельные отчёты по клиентам отключены: не задан MOYSKLAD_TOKEN")
+        return
+    client = MoySkladClient(token)
+    while True:
+        try:
+            now = datetime.now(ZoneInfo("Europe/Moscow"))
+            monday = now.date() - timedelta(days=now.weekday())
+            report = activity_database.report(monday.isoformat())
+            build_time_reached = now.weekday() != 0 or now.hour >= 3
+            if not report and build_time_reached:
+                logging.info("Начинаю еженедельную синхронизацию отгрузок с 01.04.2026")
+                report = await asyncio.to_thread(
+                    build_weekly_report, activity_database, client,
+                    activity_storage_path, monday, activity_manager_channels(), now.replace(tzinfo=None),
+                )
+                logging.info("Еженедельный отчёт по клиентам сформирован: %s", report.week)
+            send_time_reached = now.weekday() == 0 and now.hour >= 9
+            if report and not report.sent_at and send_time_reached:
+                await deliver_weekly_activity_report(bot, report)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception("Ошибка еженедельного отчёта «Новые кенты и кенты-потеряшки»")
+        await asyncio.sleep(300)
+
+
 async def main() -> None:
-    global catalog, materials_db, prices_db, crm_database, admin_ids
+    global catalog, materials_db, prices_db, crm_database, activity_database, admin_ids
     global crm_beta_ids
-    global active_excel_path, managed_excel_path, price_storage_path, bonus_storage_path
+    global active_excel_path, managed_excel_path, price_storage_path, bonus_storage_path, activity_storage_path
     load_dotenv(BASE_DIR / ".env")
     token = os.getenv("BOT_TOKEN", "").strip()
     if not token:
@@ -6481,13 +6645,18 @@ async def main() -> None:
     prices_db_path = Path(os.getenv("PRICES_DB", "data/prices.sqlite3"))
     price_storage_path = Path(os.getenv("PRICE_STORAGE", "data/prices"))
     bonus_storage_path = Path(os.getenv("MOYSKLAD_BONUS_STORAGE", "data/moysklad_bonus"))
+    activity_database_path = Path(os.getenv("CUSTOMER_ACTIVITY_DB", "data/customer_activity.sqlite3"))
+    activity_storage_path = Path(os.getenv("CUSTOMER_ACTIVITY_STORAGE", "data/customer_activity_reports"))
     if not excel_path.is_absolute(): excel_path = BASE_DIR / excel_path
     if not managed_excel_path.is_absolute(): managed_excel_path = BASE_DIR / managed_excel_path
     if not db_path.is_absolute(): db_path = BASE_DIR / db_path
     if not prices_db_path.is_absolute(): prices_db_path = BASE_DIR / prices_db_path
     if not price_storage_path.is_absolute(): price_storage_path = BASE_DIR / price_storage_path
     if not bonus_storage_path.is_absolute(): bonus_storage_path = BASE_DIR / bonus_storage_path
+    if not activity_database_path.is_absolute(): activity_database_path = BASE_DIR / activity_database_path
+    if not activity_storage_path.is_absolute(): activity_storage_path = BASE_DIR / activity_storage_path
     bonus_storage_path.mkdir(parents=True, exist_ok=True)
+    activity_storage_path.mkdir(parents=True, exist_ok=True)
     admin_ids = {int(value.strip()) for value in os.getenv("ADMIN_IDS", "5533726476").split(",") if value.strip()}
     crm_beta_ids = {
         int(value.strip())
@@ -6497,6 +6666,7 @@ async def main() -> None:
     active_excel_path = managed_excel_path if managed_excel_path.exists() else excel_path
     catalog = Catalog(active_excel_path)
     materials_db = MaterialsDB(db_path)
+    activity_database = ActivityDatabase(activity_database_path)
     if materials_db.get_setting(PRICE_MESSAGE_SETTING) == LEGACY_DEFAULT_PRICE_COMMAND_MESSAGE:
         materials_db.set_setting(PRICE_MESSAGE_SETTING, DEFAULT_PRICE_COMMAND_MESSAGE)
     for registered_chat in materials_db.list_client_chats():
@@ -6554,12 +6724,16 @@ async def main() -> None:
             await asyncio.sleep(retry_delay)
             retry_delay = min(retry_delay * 2, 30)
     monitor_task = asyncio.create_task(order_status_monitor(bot))
+    activity_task = asyncio.create_task(customer_activity_monitor(bot))
     try:
         await dispatcher.start_polling(bot)
     finally:
         monitor_task.cancel()
+        activity_task.cancel()
         with suppress(asyncio.CancelledError):
             await monitor_task
+        with suppress(asyncio.CancelledError):
+            await activity_task
 
 
 if __name__ == "__main__":
