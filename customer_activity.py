@@ -198,7 +198,9 @@ def fetch_changed_shipments(client: MoySkladClient, updated_from: str | None) ->
     if updated_from:
         filters.append(f"updated>={updated_from}")
     return client._rows("entity/demand", {
-        "limit": 1000, "filter": ";".join(filters), "expand": "agent,salesChannel",
+        # MoySklad restricts page size for requests with expanded entities.
+        # The shared client follows nextHref, so 100 still loads the full set.
+        "limit": 100, "filter": ";".join(filters), "expand": "agent,salesChannel",
     })
 
 

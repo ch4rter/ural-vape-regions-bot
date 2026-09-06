@@ -60,6 +60,7 @@ def test_sync_uses_start_date_then_incremental_cursor(tmp_path):
     sync_shipments(db, client, datetime(2026, 9, 1, 3, 0))
     sync_shipments(db, client, datetime(2026, 9, 8, 3, 0))
     assert "moment>=2026-04-01 00:00:00" in client.params[0][1]["filter"]
+    assert client.params[0][1]["limit"] == 100
     assert "updated>=" not in client.params[0][1]["filter"]
     assert "updated>=2026-09-01 02:59:55" in client.params[1][1]["filter"]
 
