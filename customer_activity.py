@@ -679,7 +679,7 @@ def build_weekly_report(
     return report
 
 
-def monthly_report_rows(rows: list[sqlite3.Row], month_start: date) -> dict:
+def _monthly_period_rows(rows: list[sqlite3.Row], month_start: date) -> dict:
     next_month = (
         date(month_start.year + 1, 1, 1)
         if month_start.month == 12
@@ -725,6 +725,21 @@ def monthly_report_rows(rows: list[sqlite3.Row], month_start: date) -> dict:
         "became_inactive": became_inactive,
         "buyers": buyers,
     }
+
+
+def monthly_report_rows(rows: list[sqlite3.Row], month_start: date) -> dict:
+    result = _monthly_period_rows(rows, month_start)
+    trend = []
+    cursor = ACTIVITY_START.date().replace(day=1)
+    while cursor <= month_start:
+        trend.append(_monthly_period_rows(rows, cursor))
+        cursor = (
+            date(cursor.year + 1, 1, 1)
+            if cursor.month == 12
+            else date(cursor.year, cursor.month + 1, 1)
+        )
+    result["trend"] = trend
+    return result
 
 
 def _monthly_selected(data: dict, channel_href: str = "") -> dict:
@@ -828,6 +843,79 @@ def build_monthly_activity_excel(destination: Path, data: dict, channel_href: st
     dash.freeze_panes = "A3"
     for column in "ABCDEFGHIJ":
         dash.column_dimensions[column].width = 15
+
+    trend_sheet = wb.create_sheet("Динамика")
+    trend_sheet.append([
+        "Месяц", "Активная база", "Уникальные покупатели", "Новые",
+        "Вернувшиеся", "Стали неактивными", "Выручка",
+    ])
+    for cell in trend_sheet[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="263238")
+        cell.alignment = Alignment(horizontal="center", wrap_text=True)
+    for point in data.get("trend", []):
+        point_selected = _monthly_selected(point, channel_href)
+        point_buyers = point_selected["buyers"]
+        trend_sheet.append([
+            point["period_start"].strftime("%m.%Y"),
+            point_selected["end_active"],
+            len(point_buyers),
+            len(point_selected["new"]),
+            len(point_selected["returned"]),
+            len(point_selected["became_inactive"]),
+            sum(item["amount"] for item in point_buyers),
+        ])
+    trend_sheet.freeze_panes = "A2"
+    trend_sheet.auto_filter.ref = trend_sheet.dimensions
+    for column, width in zip("ABCDEFG", [14, 18, 22, 14, 18, 22, 20]):
+        trend_sheet.column_dimensions[column].width = width
+    for cell in trend_sheet["G"][1:]:
+        cell.number_format = '#,##0.00 "₽"'
+
+    if trend_sheet.max_row >= 2:
+        categories = Reference(trend_sheet, min_col=1, min_row=2, max_row=trend_sheet.max_row)
+
+        client_chart = LineChart()
+        client_chart.title = "Клиентская база и покупатели"
+        client_chart.y_axis.title = "Клиенты"
+        client_chart.x_axis.title = "Месяц"
+        client_chart.add_data(
+            Reference(trend_sheet, min_col=2, max_col=3, min_row=1, max_row=trend_sheet.max_row),
+            titles_from_data=True,
+        )
+        client_chart.set_categories(categories)
+        client_chart.style = 13
+        client_chart.width = 14
+        client_chart.height = 7.5
+        trend_sheet.add_chart(client_chart, "I2")
+
+        movement_chart = LineChart()
+        movement_chart.title = "Движение клиентской базы"
+        movement_chart.y_axis.title = "Клиенты"
+        movement_chart.x_axis.title = "Месяц"
+        movement_chart.add_data(
+            Reference(trend_sheet, min_col=4, max_col=6, min_row=1, max_row=trend_sheet.max_row),
+            titles_from_data=True,
+        )
+        movement_chart.set_categories(categories)
+        movement_chart.style = 12
+        movement_chart.width = 14
+        movement_chart.height = 7.5
+        trend_sheet.add_chart(movement_chart, "I18")
+
+        revenue_chart = LineChart()
+        revenue_chart.title = "Выручка по месяцам"
+        revenue_chart.y_axis.title = "Рубли"
+        revenue_chart.x_axis.title = "Месяц"
+        revenue_chart.add_data(
+            Reference(trend_sheet, min_col=7, min_row=1, max_row=trend_sheet.max_row),
+            titles_from_data=True,
+        )
+        revenue_chart.set_categories(categories)
+        revenue_chart.style = 10
+        revenue_chart.width = 14
+        revenue_chart.height = 7.5
+        trend_sheet.add_chart(revenue_chart, "I34")
 
     ws = wb.create_sheet("Новые клиенты")
     _sheet_table(ws, ["Клиент", "Менеджер", "Первая отгрузка", "Закупок", "Сумма", "Контрагенты"],

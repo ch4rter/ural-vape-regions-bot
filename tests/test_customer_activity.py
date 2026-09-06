@@ -120,10 +120,15 @@ def test_monthly_report_tracks_customer_base_changes_and_excludes_retail(tmp_pat
     assert summary["became_inactive"] == 1
     workbook = load_workbook(destination)
     assert workbook.sheetnames == [
-        "Итоги месяца", "Новые клиенты", "Вернувшиеся клиенты",
+        "Итоги месяца", "Динамика", "Новые клиенты", "Вернувшиеся клиенты",
         "Стали неактивными", "Покупатели месяца",
     ]
     assert workbook["Итоги месяца"].freeze_panes == "A3"
+    trend = workbook["Динамика"]
+    assert trend.max_row == 6  # April through August.
+    assert len(trend._charts) == 3
+    assert [len(chart.ser) for chart in trend._charts] == [2, 3, 1]
+    assert trend.freeze_panes == "A2"
 
 
 def test_sync_uses_start_date_then_incremental_cursor(tmp_path):
