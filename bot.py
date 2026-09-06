@@ -1370,13 +1370,16 @@ def activity_report_path_for(user_id: int, report: ActivityReport) -> Path | Non
 
 
 def activity_report_text(report: ActivityReport, summary: dict) -> str:
+    def comparison(current: int, previous: int) -> str:
+        difference = current - previous
+        return f"{current} (было {previous}, {difference:+d})"
     return (
         "👥 <b>Новые кенты и кенты-потеряшки</b>\n\n"
         f"Период: <b>{datetime.fromisoformat(report.period_start):%d.%m.%Y}–"
         f"{datetime.fromisoformat(report.period_end):%d.%m.%Y}</b>\n\n"
-        f"🆕 Новые кенты: <b>{summary.get('new', 0)}</b>\n"
-        f"🔄 Вернувшиеся кенты: <b>{summary.get('returned', 0)}</b>\n"
-        f"🕒 Кенты-потеряшки: <b>{summary.get('lost', 0)}</b>\n\n"
+        f"🆕 Новые кенты: <b>{comparison(summary.get('new', 0), summary.get('previous_new', 0))}</b>\n"
+        f"🔄 Вернувшиеся кенты: <b>{comparison(summary.get('returned', 0), summary.get('previous_returned', 0))}</b>\n"
+        f"🕒 Кенты-потеряшки: <b>{comparison(summary.get('lost', 0), summary.get('previous_lost', 0))}</b>\n\n"
         "Отчёт сформирован автоматически и повторно не нагружает API МоегоСклада."
     )
 

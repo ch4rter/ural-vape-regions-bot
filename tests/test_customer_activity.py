@@ -50,11 +50,13 @@ def test_weekly_groups_and_latest_channel(tmp_path):
     assert data["returned"][0]["manager"] == "Валера"
     assert data["returned"][0]["days"] == 33
     assert data["lost"][0]["category"] == "20–29 дней"
+    assert len(data["previous"]["new"]) == 0
+    assert len(data["previous"]["lost"]) == 2
 
 
 def test_sync_uses_start_date_then_incremental_cursor(tmp_path):
     db = ActivityDatabase(tmp_path / "activity.sqlite3")
-    client = FakeClient([])
+    client = FakeClient([demand("one", "Shop/ИП", "2026-08-01 10:00:00")])
     sync_shipments(db, client, datetime(2026, 9, 1, 3, 0))
     sync_shipments(db, client, datetime(2026, 9, 8, 3, 0))
     assert "moment>=2026-04-01 00:00:00" in client.params[0][1]["filter"]
@@ -70,9 +72,10 @@ def test_excel_has_dashboard_and_single_lost_sheet(tmp_path):
         "lost": [{"client": "Lost", "manager": "Валера", "channel_href": "v",
                   "counterparties": ["Lost/ИП"], "last": datetime(2026, 8, 1),
                   "days": 37, "category": "30–59 дней", "last_amount": 100.0}],
+        "previous": {"new": [], "returned": [], "lost": []},
     }
     build_activity_excel(destination, data)
     workbook = load_workbook(destination)
     assert workbook.sheetnames == ["Дэшборд", "Новые кенты", "Вернувшиеся кенты", "Кенты-потеряшки"]
     headers = [cell.value for cell in workbook["Дэшборд"][3]]
-    assert all("Клиенты, которые давно не заказывали" in value for value in headers[5:])
+    assert all("Клиенты, которые давно не заказывали" in value for value in headers[9:12])

@@ -145,6 +145,10 @@ class ActivityDatabase:
         with self._connect() as db:
             return db.execute("SELECT * FROM shipments ORDER BY moment").fetchall()
 
+    def shipment_count(self) -> int:
+        with self._connect() as db:
+            return int(db.execute("SELECT COUNT(*) FROM shipments").fetchone()[0])
+
     def save_report(self, report: ActivityReport) -> None:
         with self._connect() as db:
             db.execute(
@@ -200,6 +204,9 @@ def fetch_changed_shipments(client: MoySkladClient, updated_from: str | None) ->
 
 def sync_shipments(database: ActivityDatabase, client: MoySkladClient, now: datetime) -> int:
     cursor = database.meta("shipments_cursor")
+    if database.shipment_count() == 0:
+        # Recover automatically if an interrupted/empty first sync left a cursor.
+        cursor = None
     updated_from = None
     if cursor:
         try:
@@ -208,7 +215,8 @@ def sync_shipments(database: ActivityDatabase, client: MoySkladClient, now: date
             updated_from = None
     next_cursor = now.strftime("%Y-%m-%d %H:%M:%S")
     count = database.upsert_shipments(fetch_changed_shipments(client, updated_from))
-    database.set_meta("shipments_cursor", next_cursor)
+    if count or database.shipment_count():
+        database.set_meta("shipments_cursor", next_cursor)
     return count
 
 
@@ -216,7 +224,7 @@ def _money(minor: int) -> float:
     return float(Decimal(minor) / Decimal(100))
 
 
-def report_rows(rows: list[sqlite3.Row], report_monday: date) -> dict:
+def _snapshot(rows: list[sqlite3.Row], report_monday: date) -> dict:
     period_end = datetime.combine(report_monday, datetime.min.time())
     period_start = period_end - timedelta(days=7)
     grouped: dict[str, list] = defaultdict(list)
@@ -249,8 +257,20 @@ def report_rows(rows: list[sqlite3.Row], report_monday: date) -> dict:
             category = "20–29 дней" if days < 30 else "30–59 дней" if days < 60 else "60+ дней"
             lost.append({**base, "last": last_moment, "days": days, "category": category,
                          "last_amount": _money(last["amount_minor"])})
-    return {"new": new, "returned": returned, "lost": lost,
-            "period_start": period_start.date(), "period_end": (period_end - timedelta(days=1)).date()}
+    return {"new": new, "returned": returned, "lost": lost}
+
+
+def report_rows(rows: list[sqlite3.Row], report_monday: date) -> dict:
+    current = _snapshot(rows, report_monday)
+    previous = _snapshot(rows, report_monday - timedelta(days=7))
+    return {
+        **current,
+        "previous": previous,
+        "period_start": report_monday - timedelta(days=7),
+        "period_end": report_monday - timedelta(days=1),
+        "previous_start": report_monday - timedelta(days=14),
+        "previous_end": report_monday - timedelta(days=8),
+    }
 
 
 def _sheet_table(sheet, headers: list[str], rows: list[list], widths: list[int]) -> None:
@@ -271,37 +291,48 @@ def build_activity_excel(destination: Path, data: dict, channel_href: str = "") 
     def chosen(items):
         return [item for item in items if not channel_href or _canonical_href(item["channel_href"]) == _canonical_href(channel_href)]
     new, returned, lost = chosen(data["new"]), chosen(data["returned"]), chosen(data["lost"])
-    managers = sorted({item["manager"] or "Без менеджера" for key in (new, returned, lost) for item in key})
+    previous_new = chosen(data["previous"]["new"])
+    previous_returned = chosen(data["previous"]["returned"])
+    previous_lost = chosen(data["previous"]["lost"])
+    managers = sorted({item["manager"] or "Без менеджера" for group in (new, returned, lost, previous_new, previous_returned, previous_lost) for item in group})
     wb = Workbook()
     dash = wb.active
     dash.title = "Дэшборд"
-    dash.merge_cells("A1:H1")
+    dash.merge_cells("A1:O1")
     dash["A1"] = "Новые кенты и кенты-потеряшки"
     dash["A1"].font = Font(bold=True, size=16, color="FFFFFF")
     dash["A1"].fill = PatternFill("solid", fgColor="263238")
     dash["A2"] = f"Отчёт за {data['period_start']:%d.%m.%Y}–{data['period_end']:%d.%m.%Y}"
-    dash.merge_cells("A2:H2")
-    headers = ["Менеджер", "Новые кенты", "Выручка новых", "Вернувшиеся кенты", "Выручка вернувшихся",
+    dash.merge_cells("A2:O2")
+    headers = ["Менеджер", "Новые кенты — эта неделя", "Новые — предыдущая", "Изменение",
+               "Выручка новых", "Вернувшиеся — эта неделя", "Вернувшиеся — предыдущая", "Изменение",
+               "Выручка вернувшихся",
                "Клиенты, которые давно не заказывали: 20–29 дней",
                "Клиенты, которые давно не заказывали: 30–59 дней",
-               "Клиенты, которые давно не заказывали: 60+ дней"]
+               "Клиенты, которые давно не заказывали: 60+ дней",
+               "Потеряшки — всего сейчас", "Потеряшки — предыдущая неделя", "Изменение"]
     dash.append(headers)
     for manager in managers:
         n = [x for x in new if (x["manager"] or "Без менеджера") == manager]
         r = [x for x in returned if (x["manager"] or "Без менеджера") == manager]
         l = [x for x in lost if (x["manager"] or "Без менеджера") == manager]
-        dash.append([manager, len(n), sum(x["amount"] for x in n), len(r), sum(x["amount"] for x in r),
+        pn = [x for x in previous_new if (x["manager"] or "Без менеджера") == manager]
+        pr = [x for x in previous_returned if (x["manager"] or "Без менеджера") == manager]
+        pl = [x for x in previous_lost if (x["manager"] or "Без менеджера") == manager]
+        dash.append([manager, len(n), len(pn), len(n) - len(pn), sum(x["amount"] for x in n),
+                     len(r), len(pr), len(r) - len(pr), sum(x["amount"] for x in r),
                      sum(x["category"] == "20–29 дней" for x in l), sum(x["category"] == "30–59 дней" for x in l),
-                     sum(x["category"] == "60+ дней" for x in l)])
-    dash.append(["ИТОГО", len(new), sum(x["amount"] for x in new), len(returned), sum(x["amount"] for x in returned),
+                     sum(x["category"] == "60+ дней" for x in l), len(l), len(pl), len(l) - len(pl)])
+    dash.append(["ИТОГО", len(new), len(previous_new), len(new) - len(previous_new), sum(x["amount"] for x in new),
+                 len(returned), len(previous_returned), len(returned) - len(previous_returned), sum(x["amount"] for x in returned),
                  sum(x["category"] == "20–29 дней" for x in lost), sum(x["category"] == "30–59 дней" for x in lost),
-                 sum(x["category"] == "60+ дней" for x in lost)])
+                 sum(x["category"] == "60+ дней" for x in lost), len(lost), len(previous_lost), len(lost) - len(previous_lost)])
     for cell in dash[3]:
         cell.font = Font(bold=True, color="FFFFFF"); cell.fill = PatternFill("solid", fgColor="263238"); cell.alignment = Alignment(wrap_text=True)
     dash.freeze_panes = "B4"
-    for col, width in zip("ABCDEFGH", [24, 16, 20, 20, 23, 34, 34, 34]): dash.column_dimensions[col].width = width
+    for col, width in zip("ABCDEFGHIJKLMNO", [24,20,20,14,20,22,22,14,23,34,34,34,22,26,14]): dash.column_dimensions[col].width = width
     for row in dash.iter_rows(min_row=4):
-        row[2].number_format = row[4].number_format = '#,##0.00 [$₽-ru-RU]'
+        row[4].number_format = row[8].number_format = '#,##0.00 [$₽-ru-RU]'
     ws = wb.create_sheet("Новые кенты")
     _sheet_table(ws, ["Клиент", "Менеджер", "Первая отгрузка", "Отгрузок за неделю", "Сумма", "Контрагенты"],
                  [[x["client"], x["manager"], x["first"], x["count"], x["amount"], "\n".join(x["counterparties"])] for x in new], [28,22,20,20,18,55])
@@ -316,7 +347,11 @@ def build_activity_excel(destination: Path, data: dict, channel_href: str = "") 
         for cell in row: cell.fill = PatternFill("solid", fgColor=colors.get(row[2].value, "FFFFFF"))
     destination.parent.mkdir(parents=True, exist_ok=True)
     wb.save(destination)
-    return {"new": len(new), "returned": len(returned), "lost": len(lost)}
+    return {
+        "new": len(new), "previous_new": len(previous_new),
+        "returned": len(returned), "previous_returned": len(previous_returned),
+        "lost": len(lost), "previous_lost": len(previous_lost),
+    }
 
 
 def build_weekly_report(
@@ -326,8 +361,10 @@ def build_weekly_report(
     monday: date,
     manager_channels: dict[str, str],
     now: datetime,
+    *,
+    save: bool = True,
 ) -> ActivityReport:
-    sync_shipments(database, client, now)
+    synced = sync_shipments(database, client, now)
     data = report_rows(database.shipments(), monday)
     folder = storage / monday.isoformat()
     common_path = folder / f"Кенты_{monday:%d.%m.%Y}_общий.xlsx"
@@ -344,5 +381,8 @@ def build_weekly_report(
         period_start=data["period_start"].isoformat(), period_end=data["period_end"].isoformat(),
         common_path=str(common_path), summary=summary, personal_paths=personal_paths, sent_at=None,
     )
-    database.save_report(report)
+    report.summary["synced"] = synced
+    report.summary["stored"] = len(database.shipments())
+    if save:
+        database.save_report(report)
     return report

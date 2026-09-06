@@ -51,23 +51,35 @@ async def main() -> None:
     }
     now = datetime.now(ZoneInfo("Europe/Moscow"))
     monday = now.date() - timedelta(days=now.weekday())
+    # A manual check shows the current calendar week. The regular Monday job
+    # still reports the fully completed week and saves the official snapshot.
+    report_boundary = monday if now.weekday() == 0 else monday + timedelta(days=7)
     print("Синхронизирую отгрузки и формирую отчёт. Первая загрузка может занять несколько минут…")
     report = await asyncio.to_thread(
         build_weekly_report,
         activity,
         MoySkladClient(moysklad_token),
         storage,
-        monday,
+        report_boundary,
         channels,
         now.replace(tzinfo=None),
+        save=False,
     )
+    print(
+        f"Получено/обновлено отгрузок: {report.summary.get('synced', 0)}; "
+        f"в локальном реестре: {report.summary.get('stored', 0)}."
+    )
+    def compared(key: str, previous_key: str) -> str:
+        current = int(report.summary.get(key, 0))
+        previous = int(report.summary.get(previous_key, 0))
+        return f"{current} (было {previous}, {current - previous:+d})"
     caption = (
         "🧪 <b>Тестовый еженедельный отчёт</b>\n\n"
         f"Период: <b>{datetime.fromisoformat(report.period_start):%d.%m.%Y}–"
         f"{datetime.fromisoformat(report.period_end):%d.%m.%Y}</b>\n\n"
-        f"🆕 Новые кенты: <b>{report.summary.get('new', 0)}</b>\n"
-        f"🔄 Вернувшиеся кенты: <b>{report.summary.get('returned', 0)}</b>\n"
-        f"🕒 Кенты-потеряшки: <b>{report.summary.get('lost', 0)}</b>\n\n"
+        f"🆕 Новые кенты: <b>{compared('new', 'previous_new')}</b>\n"
+        f"🔄 Вернувшиеся кенты: <b>{compared('returned', 'previous_returned')}</b>\n"
+        f"🕒 Кенты-потеряшки: <b>{compared('lost', 'previous_lost')}</b>\n\n"
         "Это ручная проверка. Штатная рассылка в понедельник не отключена."
     )
     bot = Bot(bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
