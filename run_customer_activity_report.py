@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import argparse
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -28,6 +29,12 @@ def resolved_path(setting: str, default: str) -> Path:
 
 
 async def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--full-sync", action="store_true",
+        help="заново прочитать все отгрузки с 01.04.2026",
+    )
+    args = parser.parse_args()
     load_dotenv(BASE_DIR / ".env")
     bot_token = os.getenv("BOT_TOKEN", "").strip()
     moysklad_token = os.getenv("MOYSKLAD_TOKEN", "").strip()
@@ -43,6 +50,8 @@ async def main() -> None:
     activity = ActivityDatabase(
         resolved_path("CUSTOMER_ACTIVITY_DB", "data/customer_activity.sqlite3")
     )
+    if args.full_sync:
+        activity.set_meta("shipments_cursor", "")
     storage = resolved_path("CUSTOMER_ACTIVITY_STORAGE", "data/customer_activity_reports")
     channels = {
         str(user.id): user.sales_channel_href
