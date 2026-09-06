@@ -6,8 +6,10 @@ from openpyxl import load_workbook
 from customer_activity import (
     ActivityDatabase,
     build_activity_excel,
+    build_monthly_activity_excel,
     client_parts,
     included_sales_channel,
+    monthly_report_rows,
     report_rows,
     sync_shipments,
 )
@@ -76,6 +78,8 @@ def test_oggo_and_missing_latest_channels_are_excluded(tmp_path):
     assert not included_sales_channel("OGGO")
     assert not included_sales_channel("  oggo  ")
     assert not included_sales_channel("Без менеджера")
+    assert not included_sales_channel("Розница")
+    assert not included_sales_channel("  РОЗНИЦА ")
     assert not included_sales_channel("")
 
     db = ActivityDatabase(tmp_path / "excluded.sqlite3")
@@ -88,6 +92,38 @@ def test_oggo_and_missing_latest_channels_are_excluded(tmp_path):
     data = report_rows(db.shipments(), date(2026, 9, 7))
     assert [row["client"] for row in data["lost"]] == ["Regular"]
     assert set(data["dynamics"]["current"]) == {client_parts("Regular/ИП")[0]}
+
+
+def test_monthly_report_tracks_customer_base_changes_and_excludes_retail(tmp_path):
+    db = ActivityDatabase(tmp_path / "monthly.sqlite3")
+    db.upsert_shipments([
+        demand("return-old", "Returned/ИП 1", "2026-04-01 10:00:00", "Валера", "v"),
+        demand("return-now", "Returned/ИП 2", "2026-08-10 10:00:00", "Валера", "v", 30000),
+        demand("new", "New/ИП", "2026-08-05 10:00:00", "Валера", "v", 20000),
+        demand("lost-one", "Lost/ИП 1", "2026-06-20 10:00:00", "Валера", "v"),
+        demand("lost-two", "Lost/ИП 2", "2026-07-10 10:00:00", "Валера", "v"),
+        demand("retail", "Retail/ИП", "2026-08-07 10:00:00", "Розница", "retail"),
+    ])
+    data = monthly_report_rows(db.shipments(), date(2026, 8, 1))
+    assert [item["client"] for item in data["new"]] == ["New"]
+    assert [item["client"] for item in data["returned"]] == ["Returned"]
+    assert [item["client"] for item in data["became_inactive"]] == ["Lost"]
+    assert {item["client"] for item in data["buyers"]} == {"New", "Returned"}
+
+    destination = tmp_path / "monthly.xlsx"
+    summary = build_monthly_activity_excel(destination, data)
+    assert summary["active_start"] == 1
+    assert summary["active_end"] == 2
+    assert summary["active_change"] == 1
+    assert summary["new"] == 1
+    assert summary["returned"] == 1
+    assert summary["became_inactive"] == 1
+    workbook = load_workbook(destination)
+    assert workbook.sheetnames == [
+        "Итоги месяца", "Новые клиенты", "Вернувшиеся клиенты",
+        "Стали неактивными", "Покупатели месяца",
+    ]
+    assert workbook["Итоги месяца"].freeze_panes == "A3"
 
 
 def test_sync_uses_start_date_then_incremental_cursor(tmp_path):

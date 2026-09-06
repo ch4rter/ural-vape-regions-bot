@@ -58,7 +58,7 @@ def _name(value: object) -> str:
 def included_sales_channel(name: str) -> bool:
     """Return whether a client's latest sales channel belongs in the report."""
     normalized = " ".join((name or "").split()).casefold()
-    return bool(normalized) and normalized not in {"oggo", "без менеджера"}
+    return bool(normalized) and normalized not in {"oggo", "без менеджера", "розница"}
 
 
 class ActivityDatabase:
@@ -102,6 +102,22 @@ class ActivityDatabase:
                     user_id INTEGER NOT NULL,
                     sent_at TEXT NOT NULL,
                     PRIMARY KEY(week, user_id)
+                );
+                CREATE TABLE IF NOT EXISTS monthly_activity_reports (
+                    month TEXT PRIMARY KEY,
+                    generated_at TEXT NOT NULL,
+                    period_start TEXT NOT NULL,
+                    period_end TEXT NOT NULL,
+                    common_path TEXT NOT NULL,
+                    summary_json TEXT NOT NULL,
+                    personal_paths_json TEXT NOT NULL,
+                    sent_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS monthly_activity_deliveries (
+                    month TEXT NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    sent_at TEXT NOT NULL,
+                    PRIMARY KEY(month, user_id)
                 );
                 """
             )
@@ -205,6 +221,50 @@ class ActivityDatabase:
         with self._connect() as db:
             db.execute(
                 "INSERT OR IGNORE INTO activity_deliveries VALUES(?,?,?)", (week, user_id, sent_at)
+            )
+
+    def save_monthly_report(self, report: ActivityReport) -> None:
+        with self._connect() as db:
+            db.execute(
+                """INSERT INTO monthly_activity_reports VALUES(?,?,?,?,?,?,?,?)
+                ON CONFLICT(month) DO UPDATE SET generated_at=excluded.generated_at,
+                period_start=excluded.period_start,period_end=excluded.period_end,
+                common_path=excluded.common_path,summary_json=excluded.summary_json,
+                personal_paths_json=excluded.personal_paths_json""",
+                (report.week, report.generated_at, report.period_start, report.period_end,
+                 report.common_path, json.dumps(report.summary, ensure_ascii=False),
+                 json.dumps(report.personal_paths, ensure_ascii=False), report.sent_at),
+            )
+
+    def monthly_report(self, month: str) -> ActivityReport | None:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM monthly_activity_reports WHERE month=?", (month,)
+            ).fetchone()
+        if not row:
+            return None
+        return ActivityReport(
+            row["month"], row["generated_at"], row["period_start"], row["period_end"],
+            row["common_path"], json.loads(row["summary_json"]),
+            json.loads(row["personal_paths_json"]), row["sent_at"],
+        )
+
+    def mark_monthly_sent(self, month: str, sent_at: str) -> None:
+        with self._connect() as db:
+            db.execute("UPDATE monthly_activity_reports SET sent_at=? WHERE month=?", (sent_at, month))
+
+    def monthly_delivered(self, month: str, user_id: int) -> bool:
+        with self._connect() as db:
+            return db.execute(
+                "SELECT 1 FROM monthly_activity_deliveries WHERE month=? AND user_id=?",
+                (month, user_id),
+            ).fetchone() is not None
+
+    def mark_monthly_delivered(self, month: str, user_id: int, sent_at: str) -> None:
+        with self._connect() as db:
+            db.execute(
+                "INSERT OR IGNORE INTO monthly_activity_deliveries VALUES(?,?,?)",
+                (month, user_id, sent_at),
             )
 
 
@@ -616,4 +676,219 @@ def build_weekly_report(
     report.summary["stored"] = len(database.shipments())
     if save:
         database.save_report(report)
+    return report
+
+
+def monthly_report_rows(rows: list[sqlite3.Row], month_start: date) -> dict:
+    next_month = (
+        date(month_start.year + 1, 1, 1)
+        if month_start.month == 12
+        else date(month_start.year, month_start.month + 1, 1)
+    )
+    start_states = _activity_states(rows, month_start)
+    end_states = _activity_states(rows, next_month)
+    grouped = _grouped_shipments(rows, next_month)
+    new, returned, became_inactive, buyers = [], [], [], []
+
+    for key, state in end_states.items():
+        shipments = grouped.get(key, [])
+        month_rows = [item for item in shipments if month_start <= item[0].date() < next_month]
+        old = start_states.get(key)
+        base = {
+            **state,
+            "key": key,
+            "counterparties": sorted({item[1]["agent_name"] for item in shipments}),
+        }
+        if month_rows:
+            amount = sum(_money(item[1]["amount_minor"]) for item in month_rows)
+            episodes = len(_purchase_episodes(month_rows))
+            buyers.append({**base, "amount": amount, "episodes": episodes})
+            if shipments[0][0].date() >= month_start:
+                new.append({**base, "first": shipments[0][0], "amount": amount, "episodes": episodes})
+            elif old and not old["active"] and state["active"]:
+                returned.append({
+                    **base,
+                    "returned": month_rows[0][0],
+                    "gap": (month_rows[0][0].date() - old["last"].date()).days,
+                    "amount": amount,
+                })
+        if old and old["active"] and not state["active"]:
+            became_inactive.append(base)
+
+    return {
+        "period_start": month_start,
+        "period_end": next_month - timedelta(days=1),
+        "start_states": start_states,
+        "end_states": end_states,
+        "new": new,
+        "returned": returned,
+        "became_inactive": became_inactive,
+        "buyers": buyers,
+    }
+
+
+def _monthly_selected(data: dict, channel_href: str = "") -> dict:
+    canonical = _canonical_href(channel_href)
+
+    def belongs(item: dict) -> bool:
+        return not canonical or _canonical_href(item.get("channel_href", "")) == canonical
+
+    # Portfolios are assigned by the latest sales channel at month end.
+    end_states = {key: value for key, value in data["end_states"].items() if belongs(value)}
+    keys = set(end_states)
+    start_active = sum(
+        state["active"] for key, state in data["start_states"].items() if key in keys
+    )
+    end_active = sum(state["active"] for state in end_states.values())
+    result = {
+        name: [item for item in data[name] if belongs(item)]
+        for name in ("new", "returned", "became_inactive", "buyers")
+    }
+    result.update({"start_active": start_active, "end_active": end_active})
+    return result
+
+
+def build_monthly_activity_excel(destination: Path, data: dict, channel_href: str = "") -> dict:
+    selected = _monthly_selected(data, channel_href)
+    new = selected["new"]
+    returned = selected["returned"]
+    inactive = selected["became_inactive"]
+    buyers = selected["buyers"]
+    revenue = sum(item["amount"] for item in buyers)
+    episodes = sum(item["episodes"] for item in buyers)
+    summary = {
+        "active_start": selected["start_active"],
+        "active_end": selected["end_active"],
+        "active_change": selected["end_active"] - selected["start_active"],
+        "new": len(new),
+        "returned": len(returned),
+        "became_inactive": len(inactive),
+        "unique_buyers": len(buyers),
+        "episodes": episodes,
+        "revenue": revenue,
+        "average": revenue / len(buyers) if buyers else 0,
+    }
+
+    wb = Workbook()
+    dash = wb.active
+    dash.title = "Итоги месяца"
+    dash.merge_cells("A1:J1")
+    dash["A1"] = "Итоги месяца по клиентской базе"
+    dash["A1"].font = Font(bold=True, size=18, color="FFFFFF")
+    dash["A1"].fill = PatternFill("solid", fgColor="263238")
+    dash.merge_cells("A2:J2")
+    dash["A2"] = f"Период: {data['period_start']:%d.%m.%Y}–{data['period_end']:%d.%m.%Y}"
+    kpis = [
+        ("Активная база\nна начало", summary["active_start"]),
+        ("Активная база\nна конец", summary["active_end"]),
+        ("Изменение\nбазы", summary["active_change"]),
+        ("Новые\nклиенты", summary["new"]),
+        ("Вернувшиеся\nклиенты", summary["returned"]),
+        ("Стали\nнеактивными", summary["became_inactive"]),
+        ("Уникальные\nпокупатели", summary["unique_buyers"]),
+        ("Закупочные\nэпизоды", summary["episodes"]),
+    ]
+    for index, (label, value) in enumerate(kpis):
+        row = 4 if index < 4 else 7
+        column = (index % 4) * 2 + 1
+        dash.merge_cells(start_row=row, start_column=column, end_row=row, end_column=column + 1)
+        dash.merge_cells(start_row=row + 1, start_column=column, end_row=row + 1, end_column=column + 1)
+        dash.cell(row, column, label).font = Font(bold=True, color="FFFFFF")
+        dash.cell(row, column).fill = PatternFill("solid", fgColor="455A64")
+        dash.cell(row, column).alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        dash.cell(row + 1, column, value).font = Font(bold=True, size=18, color="263238")
+        dash.cell(row + 1, column).alignment = Alignment(horizontal="center")
+    dash["I4"] = "Выручка"
+    dash["I5"] = revenue
+    dash["I7"] = "Выручка на покупателя"
+    dash["I8"] = summary["average"]
+    for cell in (dash["I4"], dash["I7"]):
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="2F6F73")
+        cell.alignment = Alignment(horizontal="center", wrap_text=True)
+    for cell in (dash["I5"], dash["I8"]):
+        cell.number_format = '#,##0.00 "₽"'
+        cell.font = Font(bold=True, size=16, color="263238")
+    dash.merge_cells("A11:J11")
+    dash["A11"] = "Как читать результат"
+    dash["A11"].font = Font(bold=True, color="FFFFFF")
+    dash["A11"].fill = PatternFill("solid", fgColor="2F6F73")
+    explanations = [
+        ("Изменение базы", "Активные клиенты на конец месяца минус активные на начало месяца."),
+        ("Новый клиент", "Первая известная отгрузка клиента с 01.04.2026 создана в отчётном месяце."),
+        ("Вернувшийся", "На начало месяца клиент был неактивен, в течение месяца отгрузился и к концу месяца снова активен."),
+        ("Стал неактивным", "На начало месяца клиент был активен, а к концу вышел за своё индивидуальное окно закупок."),
+        ("Исключения", "Каналы продаж OGGO, Розница, Без менеджера и пустой канал в отчёт не входят."),
+    ]
+    for row, (term, meaning) in enumerate(explanations, 12):
+        dash.cell(row, 1, term).font = Font(bold=True, color="263238")
+        dash.merge_cells(start_row=row, start_column=2, end_row=row, end_column=10)
+        dash.cell(row, 2, meaning).alignment = Alignment(wrap_text=True, vertical="top")
+        dash.row_dimensions[row].height = 28
+    dash.freeze_panes = "A3"
+    for column in "ABCDEFGHIJ":
+        dash.column_dimensions[column].width = 15
+
+    ws = wb.create_sheet("Новые клиенты")
+    _sheet_table(ws, ["Клиент", "Менеджер", "Первая отгрузка", "Закупок", "Сумма", "Контрагенты"],
+                 [[x["client"], x["manager"], x["first"], x["episodes"], x["amount"], "\n".join(x["counterparties"])] for x in new],
+                 [30, 22, 20, 14, 18, 55])
+    ws = wb.create_sheet("Вернувшиеся клиенты")
+    _sheet_table(ws, ["Клиент", "Менеджер", "Дата возвращения", "Перерыв, дней", "Сумма", "Контрагенты"],
+                 [[x["client"], x["manager"], x["returned"], x["gap"], x["amount"], "\n".join(x["counterparties"])] for x in returned],
+                 [30, 22, 20, 18, 18, 55])
+    ws = wb.create_sheet("Стали неактивными")
+    _sheet_table(ws, ["Клиент", "Менеджер", "Последняя отгрузка", "Дней без отгрузок", "Окно активности", "Контрагенты"],
+                 [[x["client"], x["manager"], x["last"], x["days"], x["window"], "\n".join(x["counterparties"])] for x in inactive],
+                 [30, 22, 22, 22, 20, 55])
+    ws = wb.create_sheet("Покупатели месяца")
+    _sheet_table(ws, ["Клиент", "Менеджер", "Закупок", "Сумма", "Контрагенты"],
+                 [[x["client"], x["manager"], x["episodes"], x["amount"], "\n".join(x["counterparties"])] for x in buyers],
+                 [30, 22, 14, 20, 55])
+    for sheet in wb.worksheets[1:]:
+        for row in sheet.iter_rows(min_row=2):
+            for cell in row:
+                if cell.column in {4, 5} and isinstance(cell.value, float):
+                    cell.number_format = '#,##0.00 "₽"'
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(destination)
+    return summary
+
+
+def build_monthly_report(
+    database: ActivityDatabase,
+    client: MoySkladClient,
+    storage: Path,
+    month_start: date,
+    manager_channels: dict[str, str],
+    now: datetime,
+    *,
+    save: bool = True,
+) -> ActivityReport:
+    synced = sync_shipments(database, client, now)
+    data = monthly_report_rows(database.shipments(), month_start)
+    month_key = month_start.strftime("%Y-%m")
+    folder = storage / "monthly" / month_key
+    common_path = folder / f"Клиентская_база_{month_start:%m.%Y}_общий.xlsx"
+    summary = build_monthly_activity_excel(common_path, data)
+    personal_paths, personal_summary = {}, {}
+    for access_id, channel_href in manager_channels.items():
+        path = folder / f"Клиентская_база_{month_start:%m.%Y}_менеджер_{access_id}.xlsx"
+        personal_summary[access_id] = build_monthly_activity_excel(path, data, channel_href)
+        personal_paths[access_id] = str(path)
+    summary["personal"] = personal_summary
+    summary["synced"] = synced
+    summary["stored"] = len(database.shipments())
+    report = ActivityReport(
+        week=month_key,
+        generated_at=now.isoformat(timespec="seconds"),
+        period_start=data["period_start"].isoformat(),
+        period_end=data["period_end"].isoformat(),
+        common_path=str(common_path),
+        summary=summary,
+        personal_paths=personal_paths,
+        sent_at=None,
+    )
+    if save:
+        database.save_monthly_report(report)
     return report

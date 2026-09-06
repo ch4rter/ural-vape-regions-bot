@@ -42,7 +42,12 @@ from zoneinfo import ZoneInfo
 
 from crm_bot import configure_crm, router as crm_router
 from crm_db import CRMDatabase
-from customer_activity import ActivityDatabase, ActivityReport, build_weekly_report
+from customer_activity import (
+    ActivityDatabase,
+    ActivityReport,
+    build_monthly_report,
+    build_weekly_report,
+)
 from google_crm import GoogleCRM
 from materials_db import Material, MaterialsDB
 from moysklad_price import (
@@ -1383,6 +1388,23 @@ def activity_report_text(report: ActivityReport, summary: dict) -> str:
         f"📉 Стали неактивными: <b>{summary.get('became_inactive', 0)}</b>\n"
         f"🕒 Кенты-потеряшки: <b>{comparison(summary.get('lost', 0), summary.get('previous_lost', 0))}</b>\n\n"
         "Отчёт сформирован автоматически и повторно не нагружает API МоегоСклада."
+    )
+
+
+def monthly_activity_report_text(report: ActivityReport, summary: dict) -> str:
+    change = int(summary.get("active_change", 0))
+    change_text = f"{change:+d}"
+    return (
+        "📊 <b>Итоги месяца по клиентской базе</b>\n\n"
+        f"Период: <b>{datetime.fromisoformat(report.period_start):%d.%m.%Y}–"
+        f"{datetime.fromisoformat(report.period_end):%d.%m.%Y}</b>\n\n"
+        f"👥 Активная база: <b>{summary.get('active_start', 0)} → {summary.get('active_end', 0)}</b> "
+        f"(<b>{change_text}</b>)\n"
+        f"🆕 Новые клиенты: <b>{summary.get('new', 0)}</b>\n"
+        f"🔄 Вернувшиеся клиенты: <b>{summary.get('returned', 0)}</b>\n"
+        f"📉 Стали неактивными: <b>{summary.get('became_inactive', 0)}</b>\n"
+        f"🛒 Уникальные покупатели: <b>{summary.get('unique_buyers', 0)}</b>\n\n"
+        "Подробные результаты и списки клиентов находятся в Excel-файле."
     )
 
 
@@ -6607,6 +6629,50 @@ async def deliver_weekly_activity_report(bot: Bot, report: ActivityReport) -> No
         )
 
 
+async def deliver_monthly_activity_report(bot: Bot, report: ActivityReport) -> None:
+    recipients: dict[int, tuple[Path, dict]] = {}
+    personal = report.summary.get("personal", {})
+    for user in materials_db.list_access_users():
+        if user.role != "manager" or not user.telegram_id:
+            continue
+        path_value = report.personal_paths.get(str(user.id))
+        if path_value:
+            recipients[user.telegram_id] = (
+                Path(path_value), personal.get(str(user.id), report.summary)
+            )
+    reviewer_raw = materials_db.get_setting("order_review_reviewer_access_id") or ""
+    reviewer = materials_db.get_access_user(int(reviewer_raw)) if reviewer_raw.isdigit() else None
+    if reviewer and reviewer.telegram_id:
+        recipients[reviewer.telegram_id] = (Path(report.common_path), report.summary)
+    for administrator_id in admin_ids:
+        recipients[administrator_id] = (Path(report.common_path), report.summary)
+
+    all_delivered = True
+    for user_id, (path, summary) in recipients.items():
+        if activity_database.monthly_delivered(report.week, user_id):
+            continue
+        try:
+            await bot.send_document(
+                user_id, FSInputFile(path), caption=monthly_activity_report_text(report, summary)
+            )
+            activity_database.mark_monthly_delivered(
+                report.week, user_id,
+                datetime.now(ZoneInfo("Europe/Moscow")).isoformat(timespec="seconds"),
+            )
+        except TelegramRetryAfter as error:
+            await asyncio.sleep(error.retry_after)
+            all_delivered = False
+        except Exception:
+            all_delivered = False
+            logging.exception("Не удалось отправить месячный отчёт пользователю %s", user_id)
+    if all_delivered and all(
+        activity_database.monthly_delivered(report.week, user_id) for user_id in recipients
+    ):
+        activity_database.mark_monthly_sent(
+            report.week, datetime.now(ZoneInfo("Europe/Moscow")).isoformat(timespec="seconds")
+        )
+
+
 async def customer_activity_monitor(bot: Bot) -> None:
     token = os.getenv("MOYSKLAD_TOKEN", "").strip()
     if not token:
@@ -6629,6 +6695,25 @@ async def customer_activity_monitor(bot: Bot) -> None:
             send_time_reached = now.weekday() == 0 and now.hour >= 9
             if report and not report.sent_at and send_time_reached:
                 await deliver_weekly_activity_report(bot, report)
+
+            if now.day == 2:
+                current_month = now.date().replace(day=1)
+                report_month = (
+                    date(current_month.year - 1, 12, 1)
+                    if current_month.month == 1
+                    else date(current_month.year, current_month.month - 1, 1)
+                )
+                monthly = activity_database.monthly_report(report_month.strftime("%Y-%m"))
+                if not monthly and now.hour >= 3:
+                    logging.info("Начинаю формирование месячного отчёта по клиентской базе: %s", report_month)
+                    monthly = await asyncio.to_thread(
+                        build_monthly_report, activity_database, client,
+                        activity_storage_path, report_month, activity_manager_channels(),
+                        now.replace(tzinfo=None),
+                    )
+                    logging.info("Месячный отчёт по клиентской базе сформирован: %s", monthly.week)
+                if monthly and not monthly.sent_at and now.hour >= 9:
+                    await deliver_monthly_activity_report(bot, monthly)
         except asyncio.CancelledError:
             raise
         except Exception:
