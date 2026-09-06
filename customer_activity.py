@@ -55,6 +55,12 @@ def _name(value: object) -> str:
     return str(value.get("name", "")).strip() if isinstance(value, dict) else ""
 
 
+def included_sales_channel(name: str) -> bool:
+    """Return whether a client's latest sales channel belongs in the report."""
+    normalized = " ".join((name or "").split()).casefold()
+    return bool(normalized) and normalized not in {"oggo", "без менеджера"}
+
+
 class ActivityDatabase:
     def __init__(self, path: Path):
         self.path = path
@@ -266,6 +272,8 @@ def _activity_states(rows: list[sqlite3.Row], boundary: date) -> dict[str, dict]
         expected = float(median(gaps)) if gaps else 40.0
         activity_window = 60 if not gaps else max(21, min(90, round(expected * 1.5)))
         last_moment, last = shipments[-1]
+        if not included_sales_channel(last["channel_name"]):
+            continue
         states[key] = {
             "client": last["client_name"], "manager": last["channel_name"],
             "channel_href": last["channel_href"], "last": last_moment,
@@ -336,7 +344,7 @@ def activity_dynamics(rows: list[sqlite3.Row], report_monday: date) -> dict:
         states = _activity_states(rows, boundary)
         for key, shipments in all_grouped.items():
             month_rows = [item for item in shipments if month_start <= item[0].date() < boundary]
-            if not month_rows:
+            if not month_rows or key not in states:
                 continue
             buyers.add(key)
             episodes_count += len(_purchase_episodes(month_rows))
@@ -374,6 +382,8 @@ def _snapshot(rows: list[sqlite3.Row], report_monday: date) -> dict:
         client_rows.sort(key=lambda item: item[0])
         first_moment, _ = client_rows[0]
         last_moment, last = client_rows[-1]
+        if not included_sales_channel(last["channel_name"]):
+            continue
         week_rows = [item for item in client_rows if period_start <= item[0] < period_end]
         base = {
             "client": last["client_name"], "manager": last["channel_name"],

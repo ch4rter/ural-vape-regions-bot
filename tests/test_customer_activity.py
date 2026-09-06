@@ -7,6 +7,7 @@ from customer_activity import (
     ActivityDatabase,
     build_activity_excel,
     client_parts,
+    included_sales_channel,
     report_rows,
     sync_shipments,
 )
@@ -68,6 +69,25 @@ def test_weekly_groups_and_latest_channel(tmp_path):
     assert data["lost"][0]["category"] == "20–29 дней"
     assert len(data["previous"]["new"]) == 0
     assert len(data["previous"]["lost"]) == 2
+
+
+def test_oggo_and_missing_latest_channels_are_excluded(tmp_path):
+    assert included_sales_channel("Валера")
+    assert not included_sales_channel("OGGO")
+    assert not included_sales_channel("  oggo  ")
+    assert not included_sales_channel("Без менеджера")
+    assert not included_sales_channel("")
+
+    db = ActivityDatabase(tmp_path / "excluded.sqlite3")
+    db.upsert_shipments([
+        demand("oggo", "OGGO client/ИП", "2026-08-01 10:00:00", "OGGO", "oggo"),
+        demand("unassigned", "Unassigned/ИП", "2026-08-01 10:00:00", "Без менеджера", "none"),
+        demand("blank", "No manager/ИП", "2026-08-01 10:00:00", "", "blank"),
+        demand("regular", "Regular/ИП", "2026-08-01 10:00:00", "Валера", "v"),
+    ])
+    data = report_rows(db.shipments(), date(2026, 9, 7))
+    assert [row["client"] for row in data["lost"]] == ["Regular"]
+    assert set(data["dynamics"]["current"]) == {client_parts("Regular/ИП")[0]}
 
 
 def test_sync_uses_start_date_then_incremental_cursor(tmp_path):
