@@ -142,6 +142,21 @@ def test_sync_uses_start_date_then_incremental_cursor(tmp_path):
     assert "updated>=2026-09-01 02:59:55" in client.params[1][1]["filter"]
 
 
+def test_inline_history_uses_local_grouped_shipments(tmp_path):
+    db = ActivityDatabase(tmp_path / "inline-history.sqlite3")
+    db.upsert_shipments([
+        demand("one", "Vape Zone/ИП 1", "2026-06-01 10:00:00", amount=1000000),
+        demand("two", "Vape Zone/ИП 2", "2026-07-01 10:00:00", amount=2000000),
+        demand("three", "Vape Zone/ИП 2", "2026-08-01 10:00:00", amount=3000000),
+    ])
+    history = db.inline_client_history("Vape Zone/ИП 3", now=datetime(2026, 8, 11, 12, 0))
+    assert history["days_since_last"] == 10
+    assert history["recent_purchases"] == 3
+    assert history["recent_revenue"] == 60000
+    assert history["average_purchase"] == 20000
+    assert history["expected_days"] == 30
+
+
 def test_excel_has_dashboard_and_single_lost_sheet(tmp_path):
     destination = tmp_path / "report.xlsx"
     db = ActivityDatabase(tmp_path / "excel.sqlite3")

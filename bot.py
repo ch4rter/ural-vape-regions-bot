@@ -50,6 +50,7 @@ from customer_activity import (
     ActivityReport,
     build_monthly_report,
     build_weekly_report,
+    sync_shipments,
 )
 from google_crm import GoogleCRM
 from materials_db import Material, MaterialsDB
@@ -76,7 +77,7 @@ from order_notifications import (
     fetch_changed_orders,
     review_notification_targets,
 )
-from order_inline import InlineOrderCard, fetch_inline_order, render_order_card
+from order_inline import InlineOrderCard, fetch_inline_order, format_order_caption, render_order_card
 from prices_db import (
     PRICE_SOURCE,
     WAREHOUSES,
@@ -578,6 +579,12 @@ async def inline_order_search(inline_query: InlineQuery, bot: Bot) -> None:
         if not order:
             await inline_query.answer([], cache_time=5, is_personal=True)
             return
+        now = datetime.now(ZoneInfo("Europe/Moscow"))
+        history = await asyncio.to_thread(
+            activity_database.inline_client_history,
+            order.agent,
+            now=now.replace(tzinfo=None),
+        )
         file_id = materials_db.inline_order_card_file(order.order_id, order.fingerprint)
         if not file_id:
             image_bytes = await asyncio.to_thread(
@@ -600,10 +607,7 @@ async def inline_order_search(inline_query: InlineQuery, bot: Bot) -> None:
             photo_file_id=file_id,
             title=f"Заказ №{order.name} · {order.agent}",
             description=f"{order.state} · {order.total:,.0f} ₽".replace(",", " "),
-            caption=(
-                f"📋 <b>Заказ №{html.escape(order.name)}</b> · {html.escape(order.agent)}\n"
-                f"Данные МоегоСклада на {datetime.now(ZoneInfo('Europe/Moscow')):%d.%m.%Y %H:%M}"
-            ),
+            caption=format_order_caption(order, history, now=now.replace(tzinfo=None)),
             parse_mode=ParseMode.HTML,
         )
         await inline_query.answer([result], cache_time=10, is_personal=True)
@@ -6769,6 +6773,13 @@ async def customer_activity_monitor(bot: Bot) -> None:
             monday = now.date() - timedelta(days=now.weekday())
             report = activity_database.report(monday.isoformat())
             build_time_reached = now.weekday() != 0 or now.hour >= 3
+            sync_key = "inline_history_sync_date"
+            if now.hour >= 3 and activity_database.meta(sync_key) != now.date().isoformat():
+                changed = await asyncio.to_thread(
+                    sync_shipments, activity_database, client, now.replace(tzinfo=None)
+                )
+                activity_database.set_meta(sync_key, now.date().isoformat())
+                logging.info("Ежедневно обновлена история inline-карточек: %s отгрузок", changed)
             if not report and build_time_reached:
                 logging.info("Начинаю еженедельную синхронизацию отгрузок с 01.04.2026")
                 report = await asyncio.to_thread(

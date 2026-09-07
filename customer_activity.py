@@ -180,6 +180,48 @@ class ActivityDatabase:
         with self._connect() as db:
             return int(db.execute("SELECT COUNT(*) FROM shipments").fetchone()[0])
 
+    def inline_client_history(
+        self, agent_name: str, *, now: datetime | None = None
+    ) -> dict:
+        """Build a compact client history from the local shipment registry only."""
+        client_key, _ = client_parts(agent_name)
+        if not client_key:
+            return {}
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT * FROM shipments WHERE client_key=? ORDER BY moment",
+                (client_key,),
+            ).fetchall()
+        if not rows:
+            return {}
+        current = now or datetime.now()
+        parsed = [
+            (datetime.strptime(row["moment"][:19], "%Y-%m-%d %H:%M:%S"), row)
+            for row in rows
+        ]
+        episodes = _purchase_episodes(parsed)
+        recent_boundary = current - timedelta(days=90)
+        recent = [item for item in parsed if item[0] >= recent_boundary]
+        recent_episodes = _purchase_episodes(recent)
+        recent_revenue = sum(_money(item[1]["amount_minor"]) for item in recent)
+        gaps = [
+            (episodes[index][0].date() - episodes[index - 1][0].date()).days
+            for index in range(1, len(episodes))
+        ]
+        expected = round(float(median(gaps))) if gaps else None
+        return {
+            "last_moment": parsed[-1][0],
+            "days_since_last": max(0, (current.date() - parsed[-1][0].date()).days),
+            "recent_shipments": len(recent),
+            "recent_purchases": len(recent_episodes),
+            "recent_revenue": recent_revenue,
+            "average_purchase": (
+                recent_revenue / len(recent_episodes) if recent_episodes else 0
+            ),
+            "expected_days": expected,
+            "history_shipments": len(parsed),
+        }
+
     def save_report(self, report: ActivityReport) -> None:
         with self._connect() as db:
             db.execute(

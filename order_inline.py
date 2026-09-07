@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import io
 import re
 import textwrap
@@ -18,7 +19,7 @@ from PIL import Image, ImageDraw, ImageFont
 from moysklad_price import MoySkladClient, _canonical_href
 from prices_db import ItemSummary, normalize_price_text
 
-CARD_TEMPLATE_VERSION = "2"
+CARD_TEMPLATE_VERSION = "3"
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,7 @@ class InlineOrderCard:
     state: str
     channel: str
     organization: str
+    warehouse: str
     total: Decimal
     paid: Decimal
     groups: tuple[tuple[str, Decimal], ...]
@@ -39,6 +41,7 @@ class InlineOrderCard:
     def fingerprint(self) -> str:
         source = "|".join((
             CARD_TEMPLATE_VERSION, self.order_id, self.updated, self.organization,
+            self.warehouse,
             str(self.total), str(self.paid), repr(self.groups),
         ))
         return hashlib.sha256(source.encode("utf-8")).hexdigest()
@@ -100,7 +103,7 @@ def fetch_inline_order(
     rows = client._rows("entity/customerorder", {
         "limit": 20,
         "search": query,
-        "expand": "agent,state,salesChannel,organization",
+        "expand": "agent,state,salesChannel,organization,store",
     })
     if not rows:
         return None
@@ -129,6 +132,7 @@ def fetch_inline_order(
         state=_name(order.get("state")),
         channel=_name(order.get("salesChannel"), "Не указан"),
         organization=_name(order.get("organization"), "Не указана"),
+        warehouse=_name(order.get("store"), "Не указан"),
         total=_money(order.get("sum")),
         paid=_money(order.get("payedSum")),
         groups=groups,
@@ -160,6 +164,46 @@ def _rubles(value: Decimal) -> str:
     return f"{value:,.0f} ₽".replace(",", " ")
 
 
+def format_order_caption(
+    order: InlineOrderCard, history: dict, *, now: datetime | None = None
+) -> str:
+    """Complement the image with client history without repeating card fields."""
+    if not history:
+        return (
+            "🆕 <b>Новый клиент</b>\n\n"
+            "Проведённых отгрузок в доступной истории пока не найдено."
+        )
+    current = now or datetime.now()
+    last_moment = history.get("last_moment")
+    last_text = last_moment.strftime("%d.%m.%Y") if isinstance(last_moment, datetime) else "—"
+    days = int(history.get("days_since_last") or 0)
+    purchases = int(history.get("recent_purchases") or 0)
+    revenue = Decimal(str(history.get("recent_revenue") or 0))
+    average = Decimal(str(history.get("average_purchase") or 0))
+    expected = history.get("expected_days")
+    lines = [
+        "📊 <b>История клиента</b>",
+        "",
+        f"Последняя отгрузка — <b>{html.escape(last_text)}</b> ({days} дн. назад)",
+        f"За 90 дней — <b>{purchases}</b> закупок на <b>{_rubles(revenue)}</b>",
+    ]
+    if purchases:
+        lines.append(f"Средняя закупка — <b>{_rubles(average)}</b>")
+    if expected:
+        lines.append(f"Обычный ритм — примерно раз в <b>{int(expected)} дней</b>")
+    insight = "Клиент заказывает в своём обычном ритме."
+    if expected and days > int(expected) * 1.5:
+        insight = "🔄 Этот заказ оформлен после длительного перерыва."
+    elif average and order.total >= average * Decimal("1.3"):
+        change = ((order.total / average) - Decimal(1)) * Decimal(100)
+        insight = f"🔥 Текущий заказ на <b>{change:.0f}%</b> больше средней закупки клиента."
+    elif average and order.total <= average * Decimal("0.7"):
+        change = (Decimal(1) - (order.total / average)) * Decimal(100)
+        insight = f"Текущий заказ на <b>{change:.0f}%</b> меньше средней закупки клиента."
+    lines.extend(("", insight, "", f"Обновлено · {current:%d.%m.%Y %H:%M}"))
+    return "\n".join(lines)
+
+
 def _status_color(status: str) -> tuple[int, int, int]:
     value = status.casefold()
     if "ожида" in value:
@@ -171,6 +215,25 @@ def _status_color(status: str) -> tuple[int, int, int]:
     if "провер" in value:
         return (43, 174, 102)
     return (43, 174, 102)
+
+
+def _wrapped_heading(
+    draw: ImageDraw.ImageDraw, value: str, width: int
+) -> tuple[list[str], ImageFont.FreeTypeFont]:
+    words = value.split()
+    for size in range(52, 31, -2):
+        font = _font(size, bold=True)
+        if draw.textbbox((0, 0), value, font=font)[2] <= width:
+            return [value], font
+        choices = []
+        for split_at in range(1, len(words)):
+            lines = [" ".join(words[:split_at]), " ".join(words[split_at:])]
+            widest = max(draw.textbbox((0, 0), line, font=font)[2] for line in lines)
+            if widest <= width:
+                choices.append((abs(len(lines[0]) - len(lines[1])), lines))
+        if choices:
+            return min(choices, key=lambda item: item[0])[1], font
+    return [textwrap.shorten(value, width=62, placeholder="…")], _font(30, bold=True)
 
 
 def render_order_card(
@@ -201,29 +264,33 @@ def render_order_card(
     draw.rounded_rectangle(status_rect, radius=27, fill=(*_status_color(order.state), 235))
     draw.text(((status_rect[0] + status_rect[2]) // 2, (status_rect[1] + status_rect[3]) // 2), status, font=status_font, fill=white, anchor="mm")
 
-    client_font = _fit(draw, order.agent, 1040, 54, 32)
-    draw.text((640, 330), order.agent, font=client_font, fill=white, anchor="ma")
-    draw.text((640, 397), f"Менеджер · {order.channel}", font=_font(26), fill=muted, anchor="ma")
+    client_lines, client_font = _wrapped_heading(draw, order.agent, 1050)
+    client_y = 320 if len(client_lines) == 1 else 298
+    for line in client_lines:
+        draw.text((640, client_y), line, font=client_font, fill=white, anchor="ma")
+        client_y += 53
+    details_y = 400 if len(client_lines) == 1 else 418
+    draw.text((640, details_y), f"Менеджер · {order.channel}", font=_font(25), fill=muted, anchor="ma")
     organization = f"Организация · {order.organization}"
     organization_font = _fit(draw, organization, 1030, 25, 19)
-    draw.text((640, 438), organization, font=organization_font, fill=muted, anchor="ma")
+    draw.text((640, details_y + 39), organization, font=organization_font, fill=muted, anchor="ma")
+    warehouse = f"Склад · {order.warehouse}"
+    draw.text((640, details_y + 77), warehouse, font=_font(24), fill=muted, anchor="ma")
 
-    cards = (("ЗАКАЗАНО", order.total), ("ОПЛАЧЕНО", order.paid), ("ОСТАЛОСЬ", max(Decimal(0), order.total - order.paid)))
-    card_left, card_width, card_gap = 105, 340, 25
+    cards = (("СУММА ЗАКАЗА", order.total), ("ОПЛАЧЕНО", order.paid))
+    card_left, card_width, card_gap = 105, 522, 26
     for index, (label, amount) in enumerate(cards):
         left = card_left + index * (card_width + card_gap)
-        draw.rounded_rectangle((left, 492, left + card_width, 632), radius=25, fill=(255, 255, 255, 18), outline=(255, 255, 255, 34), width=2)
-        draw.text((left + card_width // 2, 526), label, font=_font(22, bold=True), fill=muted, anchor="mm")
+        draw.rounded_rectangle((left, 530, left + card_width, 670), radius=25, fill=(255, 255, 255, 18), outline=(255, 255, 255, 34), width=2)
+        draw.text((left + card_width // 2, 564), label, font=_font(22, bold=True), fill=muted, anchor="mm")
         amount_text = _rubles(amount)
-        draw.text((left + card_width // 2, 579), amount_text, font=_fit(draw, amount_text, 295, 37, 25), fill=white, anchor="mm")
+        draw.text((left + card_width // 2, 617), amount_text, font=_fit(draw, amount_text, 440, 39, 27), fill=white, anchor="mm")
 
-    draw.text((105, 687), "СОСТАВ ЗАКАЗА", font=_font(24, bold=True), fill=accent)
-    shown = list(order.groups[:4])
-    if len(order.groups) > 4:
-        shown[-1] = (f"Ещё {len(order.groups) - 3} групп", sum(value for _, value in order.groups[3:]))
+    draw.text((105, 718), "СОСТАВ ЗАКАЗА", font=_font(24, bold=True), fill=accent)
+    shown = list(order.groups[:5])
     if not shown:
         shown = [("Состав пока не классифицирован", order.total)]
-    y = 742
+    y = 768
     for name, amount in shown:
         clean_name = " ".join(name.split())
         if len(clean_name) > 40:
@@ -232,7 +299,9 @@ def render_order_card(
         amount_text = _rubles(amount)
         amount_width = draw.textbbox((0, 0), amount_text, font=_font(28, bold=True))[2]
         draw.text((1162 - amount_width, y), amount_text, font=_font(28, bold=True), fill=white)
-        y += 57
+        y += 46
+    if len(order.groups) > len(shown):
+        draw.text((118, y + 2), f"+ ещё {len(order.groups) - len(shown)} групп", font=_font(21), fill=muted)
 
     try:
         moment = datetime.fromisoformat(order.moment[:19]).strftime("%d.%m.%Y %H:%M")

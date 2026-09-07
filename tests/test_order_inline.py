@@ -1,11 +1,12 @@
 from decimal import Decimal
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 
 from PIL import Image
 
 from materials_db import MaterialsDB
-from order_inline import fetch_inline_order, render_order_card
+from order_inline import fetch_inline_order, format_order_caption, render_order_card
 from prices_db import ItemSummary
 
 
@@ -24,6 +25,7 @@ class FakeClient:
             "state": {"name": "Ожидает проверки"},
             "salesChannel": {"name": "Валера"},
             "organization": {"name": "ИП Иванов И.И."},
+            "store": {"name": "Мордор"},
             "positions": {"meta": {"href": "https://api.moysklad.ru/positions"}},
         }]
 
@@ -51,6 +53,7 @@ def test_fetch_and_render_inline_order_card():
     assert order.total == Decimal("186450")
     assert order.paid == Decimal("120000")
     assert order.organization == "ИП Иванов И.И."
+    assert order.warehouse == "Мордор"
     assert order.groups == (
         ("OGGO VLIQ", Decimal("100000")),
         ("Vaporesso устройства", Decimal("22500.0")),
@@ -73,3 +76,21 @@ def test_inline_card_file_id_cache(tmp_path):
     database.save_inline_order_card_file("order-1", "fingerprint", "telegram-file")
     assert database.inline_order_card_file("order-1", "fingerprint") == "telegram-file"
     assert database.inline_order_card_file("order-1", "changed") is None
+
+
+def test_caption_adds_history_without_repeating_current_order():
+    order = fetch_inline_order(FakeClient(), "18452", [])
+    caption = format_order_caption(order, {
+        "last_moment": datetime(2026, 8, 1, 10, 0),
+        "days_since_last": 10,
+        "recent_purchases": 3,
+        "recent_revenue": 150000,
+        "average_purchase": 50000,
+        "expected_days": 25,
+        "history_shipments": 3,
+    }, now=datetime(2026, 8, 11, 12, 0))
+    assert "За 90 дней" in caption
+    assert "50 000 ₽" in caption
+    assert "больше средней" in caption
+    assert "Заказ №" not in caption
+    assert "Ожидает проверки" not in caption
