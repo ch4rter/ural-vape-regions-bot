@@ -245,6 +245,12 @@ class MaterialsDB:
                     notified_updated_at TEXT,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS inline_order_cards (
+                    order_id TEXT PRIMARY KEY,
+                    fingerprint TEXT NOT NULL,
+                    telegram_file_id TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
                 """
             )
             columns = {row[1] for row in connection.execute("PRAGMA table_info(access_users)")}
@@ -532,6 +538,30 @@ class MaterialsDB:
                     state_href if notified else None,
                     order_updated_at if notified else None,
                 ),
+            )
+
+    def inline_order_card_file(self, order_id: str, fingerprint: str) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT telegram_file_id FROM inline_order_cards
+                   WHERE order_id = ? AND fingerprint = ?""",
+                (order_id, fingerprint),
+            ).fetchone()
+        return str(row["telegram_file_id"]) if row else None
+
+    def save_inline_order_card_file(
+        self, order_id: str, fingerprint: str, telegram_file_id: str
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO inline_order_cards(
+                       order_id, fingerprint, telegram_file_id, updated_at
+                   ) VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(order_id) DO UPDATE SET
+                       fingerprint=excluded.fingerprint,
+                       telegram_file_id=excluded.telegram_file_id,
+                       updated_at=CURRENT_TIMESTAMP""",
+                (order_id, fingerprint, telegram_file_id),
             )
 
     def set_access_sales_channel(

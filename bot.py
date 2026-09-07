@@ -25,11 +25,14 @@ from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     ChatMemberUpdated,
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineQuery,
+    InlineQueryResultCachedPhoto,
     InputMediaDocument,
     InputMediaPhoto,
     KeyboardButton,
@@ -73,6 +76,7 @@ from order_notifications import (
     fetch_changed_orders,
     review_notification_targets,
 )
+from order_inline import InlineOrderCard, fetch_inline_order, render_order_card
 from prices_db import (
     PRICE_SOURCE,
     WAREHOUSES,
@@ -123,6 +127,11 @@ bonus_reports_in_progress: set[int] = set()
 order_splits_in_progress: set[int] = set()
 sales_progress_cache: dict[str, tuple[datetime, list]] = {}
 sales_progress_refreshes: dict[tuple[int, int], datetime] = {}
+inline_moysklad_client: MoySkladClient | None = None
+inline_order_cache: dict[str, tuple[datetime, InlineOrderCard | None]] = {}
+inline_order_lock = asyncio.Lock()
+inline_order_background_path = BASE_DIR / "assets" / "order_card_background.png"
+inline_order_logo_path = BASE_DIR / "assets" / "ural_vape_logo_transparent.png"
 
 
 @dataclass
@@ -529,6 +538,81 @@ def has_internal_access(user_id: int | None, username: str | None = None) -> boo
             is_admin(user_id) or materials_db.authorize_user(user_id, username)
         )
     )
+
+
+async def cached_inline_order(query: str) -> InlineOrderCard | None:
+    normalized = query.strip().casefold()
+    cached = inline_order_cache.get(normalized)
+    if cached and datetime.now() - cached[0] < timedelta(seconds=60):
+        return cached[1]
+    if inline_moysklad_client is None:
+        return None
+    async with inline_order_lock:
+        cached = inline_order_cache.get(normalized)
+        if cached and datetime.now() - cached[0] < timedelta(seconds=60):
+            return cached[1]
+        order = await asyncio.wait_for(
+            asyncio.to_thread(
+                fetch_inline_order,
+                inline_moysklad_client,
+                query,
+                prices_db.item_summaries(),
+            ),
+            timeout=25,
+        )
+        inline_order_cache[normalized] = (datetime.now(), order)
+        return order
+
+
+@router.inline_query()
+async def inline_order_search(inline_query: InlineQuery, bot: Bot) -> None:
+    if not has_internal_access(inline_query.from_user.id, inline_query.from_user.username):
+        await inline_query.answer([], cache_time=5, is_personal=True)
+        return
+    query = re.sub(r"^заказ\s+", "", inline_query.query.strip(), flags=re.IGNORECASE).lstrip("№#")
+    if len(query) < 3:
+        await inline_query.answer([], cache_time=1, is_personal=True)
+        return
+    try:
+        order = await cached_inline_order(query)
+        if not order:
+            await inline_query.answer([], cache_time=5, is_personal=True)
+            return
+        file_id = materials_db.inline_order_card_file(order.order_id, order.fingerprint)
+        if not file_id:
+            image_bytes = await asyncio.to_thread(
+                render_order_card, order, inline_order_background_path, inline_order_logo_path
+            )
+            cache_chat_id = int(os.getenv("INLINE_ORDER_CACHE_CHAT_ID", str(SERVICE_CHAT_ID)))
+            uploaded = await bot.send_photo(
+                cache_chat_id,
+                BufferedInputFile(image_bytes, filename=f"order_{order.name}.jpg"),
+                disable_notification=True,
+            )
+            if not uploaded.photo:
+                raise RuntimeError("Telegram не вернул file_id карточки заказа")
+            file_id = uploaded.photo[-1].file_id
+            materials_db.save_inline_order_card_file(order.order_id, order.fingerprint, file_id)
+            with suppress(Exception):
+                await bot.delete_message(cache_chat_id, uploaded.message_id)
+        result = InlineQueryResultCachedPhoto(
+            id=order.fingerprint[:32],
+            photo_file_id=file_id,
+            title=f"Заказ №{order.name} · {order.agent}",
+            description=f"{order.state} · {order.total:,.0f} ₽".replace(",", " "),
+            caption=(
+                f"📋 <b>Заказ №{html.escape(order.name)}</b> · {html.escape(order.agent)}\n"
+                f"Данные МоегоСклада на {datetime.now(ZoneInfo('Europe/Moscow')):%d.%m.%Y %H:%M}"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        await inline_query.answer([result], cache_time=10, is_personal=True)
+    except asyncio.TimeoutError:
+        logging.warning("Тайм-аут inline-поиска заказа %s", query)
+        await inline_query.answer([], cache_time=1, is_personal=True)
+    except Exception:
+        logging.exception("Ошибка inline-поиска заказа %s", query)
+        await inline_query.answer([], cache_time=1, is_personal=True)
 
 
 def can_receive_activity_report(user_id: int | None) -> bool:
@@ -6723,7 +6807,7 @@ async def customer_activity_monitor(bot: Bot) -> None:
 
 async def main() -> None:
     global catalog, materials_db, prices_db, crm_database, activity_database, admin_ids
-    global crm_beta_ids
+    global crm_beta_ids, inline_moysklad_client
     global active_excel_path, managed_excel_path, price_storage_path, bonus_storage_path, activity_storage_path
     load_dotenv(BASE_DIR / ".env")
     token = os.getenv("BOT_TOKEN", "").strip()
@@ -6766,6 +6850,13 @@ async def main() -> None:
                 registered_chat.chat_id, cleaned_title, registered_chat.chat_type, registered_chat.is_active
             )
     prices_db = PricesDB(prices_db_path)
+    moysklad_token = os.getenv("MOYSKLAD_TOKEN", "").strip()
+    inline_moysklad_client = MoySkladClient(moysklad_token, timeout=12) if moysklad_token else None
+    if inline_moysklad_client and (
+        not inline_order_background_path.is_file() or not inline_order_logo_path.is_file()
+    ):
+        logging.warning("Inline-карточки заказов отключены: не найдены фирменные изображения в assets")
+        inline_moysklad_client = None
     crm_database_path = Path(os.getenv("CRM_DB", "data/crm.sqlite3"))
     if not crm_database_path.is_absolute():
         crm_database_path = BASE_DIR / crm_database_path
