@@ -32,7 +32,9 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InlineQuery,
+    InlineQueryResultArticle,
     InlineQueryResultCachedPhoto,
+    InputTextMessageContent,
     InputMediaDocument,
     InputMediaPhoto,
     KeyboardButton,
@@ -78,6 +80,17 @@ from order_notifications import (
     review_notification_targets,
 )
 from order_inline import InlineOrderCard, fetch_inline_order, format_order_caption, render_order_card
+from inventory_inline import (
+    InventorySnapshot,
+    InventoryReference,
+    build_inventory_reference,
+    build_inventory_snapshot,
+    inventory_group_text,
+    inventory_item_text,
+    load_inventory_reference,
+    save_inventory_reference,
+    search_inventory,
+)
 from prices_db import (
     PRICE_SOURCE,
     WAREHOUSES,
@@ -133,6 +146,13 @@ inline_order_cache: dict[str, tuple[datetime, InlineOrderCard | None]] = {}
 inline_order_lock = asyncio.Lock()
 inline_order_background_path = BASE_DIR / "assets" / "order_card_background.png"
 inline_order_logo_path = BASE_DIR / "assets" / "ural_vape_logo_transparent.png"
+inline_inventory_snapshot: InventorySnapshot | None = None
+inline_inventory_reference: InventoryReference | None = None
+inline_inventory_updated_at: datetime | None = None
+inline_inventory_refresh_task: asyncio.Task | None = None
+inline_inventory_reference_path = BASE_DIR / "data" / "inline_inventory_reference.json"
+inline_inventory_query_sequence = 0
+inline_inventory_user_queries: dict[int, int] = {}
 
 
 @dataclass
@@ -565,14 +585,141 @@ async def cached_inline_order(query: str) -> InlineOrderCard | None:
         return order
 
 
+async def refresh_inline_inventory() -> InventorySnapshot:
+    global inline_inventory_snapshot, inline_inventory_updated_at, inline_inventory_reference
+    if inline_moysklad_client is None:
+        raise RuntimeError("Не настроено подключение к МоемуСкладу")
+    catalog = prices_db.item_summaries()
+    today = datetime.now(ZoneInfo("Europe/Moscow")).date().isoformat()
+    if inline_inventory_reference is None:
+        inline_inventory_reference = await asyncio.to_thread(
+            load_inventory_reference, inline_inventory_reference_path
+        )
+    if inline_inventory_reference is None or inline_inventory_reference.built_on != today:
+        inline_inventory_reference = await asyncio.to_thread(
+            build_inventory_reference, inline_moysklad_client, catalog, built_on=today
+        )
+        await asyncio.to_thread(
+            save_inventory_reference, inline_inventory_reference_path, inline_inventory_reference
+        )
+    snapshot = await asyncio.to_thread(
+        build_inventory_snapshot, inline_moysklad_client, catalog, inline_inventory_reference
+    )
+    inline_inventory_snapshot = snapshot
+    inline_inventory_updated_at = datetime.now(ZoneInfo("Europe/Moscow")).replace(tzinfo=None)
+    logging.info(
+        "Inline-остатки обновлены: %s позиций, %s групп",
+        len(snapshot.items), len(snapshot.groups),
+    )
+    return snapshot
+
+
+def start_inline_inventory_refresh() -> asyncio.Task:
+    global inline_inventory_refresh_task
+    if inline_inventory_refresh_task is None or inline_inventory_refresh_task.done():
+        inline_inventory_refresh_task = asyncio.create_task(refresh_inline_inventory())
+        inline_inventory_refresh_task.add_done_callback(log_inline_inventory_refresh)
+    return inline_inventory_refresh_task
+
+
+def log_inline_inventory_refresh(task: asyncio.Task) -> None:
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error:
+        logging.error("Не удалось обновить inline-остатки: %s", error)
+
+
+async def cached_inline_inventory() -> InventorySnapshot | None:
+    if inline_moysklad_client is None:
+        return None
+    now = datetime.now(ZoneInfo("Europe/Moscow")).replace(tzinfo=None)
+    stale = (
+        inline_inventory_updated_at is None
+        or now - inline_inventory_updated_at >= timedelta(minutes=3)
+    )
+    if inline_inventory_snapshot is not None and not stale:
+        return inline_inventory_snapshot
+    try:
+        return await asyncio.wait_for(asyncio.shield(start_inline_inventory_refresh()), timeout=8)
+    except asyncio.TimeoutError:
+        return inline_inventory_snapshot
+
+
+async def answer_inventory_inline(inline_query: InlineQuery, query: str) -> None:
+    global inline_inventory_query_sequence
+    # Telegram sends a new inline update for almost every entered character.
+    # First validate the unfinished query against the local price catalog, then
+    # debounce per user so only the last query in a typing burst may read stock.
+    # Group search also contains item names in its local search index, so one
+    # local lookup validates both group and product queries.
+    if not prices_db.search_groups(query, limit=1):
+        await inline_query.answer([], cache_time=2, is_personal=True)
+        return
+    inline_inventory_query_sequence += 1
+    sequence = inline_inventory_query_sequence
+    inline_inventory_user_queries[inline_query.from_user.id] = sequence
+    await asyncio.sleep(0.7)
+    if inline_inventory_user_queries.get(inline_query.from_user.id) != sequence:
+        await inline_query.answer([], cache_time=1, is_personal=True)
+        return
+    snapshot = await cached_inline_inventory()
+    if snapshot is None:
+        await inline_query.answer([], cache_time=1, is_personal=True)
+        return
+    groups, items = search_inventory(snapshot, query)
+    updated = (inline_inventory_updated_at or datetime.now()).strftime("%d.%m.%Y %H:%M")
+    results = []
+    for group in groups:
+        quantities = " · ".join(
+            f"{label}: {quantity:g}"
+            for label, quantity in zip(("Москва", "СПб", "Урал"), group.quantities)
+        )
+        results.append(InlineQueryResultArticle(
+            id=f"stock-group-{group.key}",
+            title=f"📦 {group.name}",
+            description=f"Всего {group.total:g} шт. · {len(group.items)} вариантов · {quantities}",
+            input_message_content=InputTextMessageContent(
+                message_text=inventory_group_text(group, updated),
+                parse_mode=ParseMode.HTML,
+            ),
+        ))
+    for item in items:
+        item_id = secrets.token_hex(4) + str(abs(hash(item.key)) % 10_000_000)
+        quantities = " · ".join(
+            f"{label}: {quantity:g}"
+            for label, quantity in zip(("Москва", "СПб", "Урал"), item.quantities)
+        )
+        results.append(InlineQueryResultArticle(
+            id=f"stock-item-{item_id}",
+            title=item.name,
+            description=f"Всего {item.total:g} шт. · {quantities}",
+            input_message_content=InputTextMessageContent(
+                message_text=inventory_item_text(item, updated),
+                parse_mode=ParseMode.HTML,
+            ),
+        ))
+    await inline_query.answer(results[:20], cache_time=5, is_personal=True)
+
+
 @router.inline_query()
 async def inline_order_search(inline_query: InlineQuery, bot: Bot) -> None:
     if not has_internal_access(inline_query.from_user.id, inline_query.from_user.username):
         await inline_query.answer([], cache_time=5, is_personal=True)
         return
-    query = re.sub(r"^заказ\s+", "", inline_query.query.strip(), flags=re.IGNORECASE).lstrip("№#")
-    if len(query) < 3:
+    raw_query = inline_query.query.strip()
+    forced_order = bool(re.match(r"^заказ\s+", raw_query, flags=re.IGNORECASE))
+    query = re.sub(r"^(?:заказ|товар|группа)\s+", "", raw_query, flags=re.IGNORECASE).lstrip("№#")
+    minimum_length = 3
+    if len(query) < minimum_length:
         await inline_query.answer([], cache_time=1, is_personal=True)
+        return
+    if not forced_order and not query.isdigit():
+        try:
+            await answer_inventory_inline(inline_query, query)
+        except Exception:
+            logging.exception("Ошибка inline-поиска остатков %s", query)
+            await inline_query.answer([], cache_time=1, is_personal=True)
         return
     try:
         order = await cached_inline_order(query)

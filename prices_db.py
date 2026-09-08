@@ -194,6 +194,7 @@ class ItemSummary:
     group_name: str
     category_name: str
     warehouse_prices: dict[str, tuple[Decimal, Decimal]]
+    code: str = ""
 
 
 def price_header_indexes(headers: list[str]) -> tuple[int, int, int] | None:
@@ -713,13 +714,16 @@ class PricesDB:
             if identity not in merged:
                 merged[identity] = {
                     "id": row["id"], "name": row["name"], "group": row["display_name"],
-                    "category": row["category_name"], "prices": {},
+                    "category": row["category_name"], "prices": {}, "code": row["code"] or "",
                 }
             merged[identity]["prices"][row["warehouse"]] = (
                 Decimal(row["cash"]), Decimal(row["cashless"])
             )
         return [
-            ItemSummary(value["id"], value["name"], value["group"], value["category"], value["prices"])
+            ItemSummary(
+                value["id"], value["name"], value["group"], value["category"],
+                value["prices"], value["code"],
+            )
             for value in merged.values()
         ]
 
