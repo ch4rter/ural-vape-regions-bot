@@ -182,6 +182,12 @@ DEFAULT_PRICE_COMMAND_MESSAGE = (
     "📄 <b>Актуальный прайс</b>\n\n"
     "Ниже представлена последняя загруженная версия с базовыми ценами."
 )
+from price_inline import (
+    group_price_description,
+    group_price_text,
+    item_price_description,
+    item_price_text,
+)
 PERMISSION_LABELS = {
     "broadcasts": "Рассылки",
     "price_message": "Текст и вложение /прайс",
@@ -745,6 +751,47 @@ async def answer_inventory_inline(inline_query: InlineQuery, query: str) -> None
     await inline_query.answer(results[:20], cache_time=5, is_personal=True)
 
 
+async def answer_price_inline(inline_query: InlineQuery, query: str) -> None:
+    """Answer from the locally imported price; never call the MoySklad API."""
+    groups = prices_db.search_groups(query, limit=8)
+    items = prices_db.search_items(query, limit=12)
+    statuses = prices_db.import_statuses()
+    status = statuses.get(PRICE_SOURCE, {})
+    updated = str(status.get("price_date") or status.get("updated_at") or "").split("T", 1)[0]
+    if updated:
+        try:
+            updated = datetime.fromisoformat(updated).strftime("%d.%m.%Y")
+        except ValueError:
+            pass
+    else:
+        updated = datetime.now(ZoneInfo("Europe/Moscow")).strftime("%d.%m.%Y")
+    results = []
+    for group in groups:
+        details = prices_db.group_details(group.callback_id)
+        if not details or not details.tiers:
+            continue
+        results.append(InlineQueryResultArticle(
+            id=f"price-group-{group.callback_id}",
+            title=f"💰 {group.display_name}",
+            description=group_price_description(details),
+            input_message_content=InputTextMessageContent(
+                message_text=group_price_text(details, updated),
+                parse_mode=ParseMode.HTML,
+            ),
+        ))
+    for item in items:
+        results.append(InlineQueryResultArticle(
+            id=f"price-item-{item.callback_id}",
+            title=item.name,
+            description=item_price_description(item),
+            input_message_content=InputTextMessageContent(
+                message_text=item_price_text(item, updated),
+                parse_mode=ParseMode.HTML,
+            ),
+        ))
+    await inline_query.answer(results[:20], cache_time=10, is_personal=True)
+
+
 @router.inline_query()
 async def inline_order_search(inline_query: InlineQuery, bot: Bot) -> None:
     if not has_internal_access(inline_query.from_user.id, inline_query.from_user.username):
@@ -752,10 +799,18 @@ async def inline_order_search(inline_query: InlineQuery, bot: Bot) -> None:
         return
     raw_query = inline_query.query.strip()
     forced_order = bool(re.match(r"^заказ\s+", raw_query, flags=re.IGNORECASE))
-    query = re.sub(r"^(?:заказ|товар|группа)\s+", "", raw_query, flags=re.IGNORECASE).lstrip("№#")
+    forced_price = bool(re.match(r"^цена(?:\s+|$)", raw_query, flags=re.IGNORECASE))
+    query = re.sub(r"^(?:заказ|цена|товар|группа)\s+", "", raw_query, flags=re.IGNORECASE).lstrip("№#")
     minimum_length = 3
     if len(query) < minimum_length:
         await inline_query.answer([], cache_time=1, is_personal=True)
+        return
+    if forced_price:
+        try:
+            await answer_price_inline(inline_query, query)
+        except Exception:
+            logging.exception("Ошибка inline-поиска цены %s", query)
+            await inline_query.answer([], cache_time=1, is_personal=True)
         return
     if not forced_order and not query.isdigit():
         try:
