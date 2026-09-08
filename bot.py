@@ -47,6 +47,7 @@ from zoneinfo import ZoneInfo
 
 from crm_bot import configure_crm, router as crm_router
 from crm_db import CRMDatabase
+from contracts import ContractsDB, accountant_message, create_contract_file, digits
 from customer_activity import (
     ActivityDatabase,
     ActivityReport,
@@ -124,6 +125,7 @@ materials_db: MaterialsDB
 prices_db: PricesDB
 crm_database: CRMDatabase
 activity_database: ActivityDatabase
+contracts_database: ContractsDB
 admin_ids: set[int] = set()
 crm_beta_ids: set[int] = {5533726476}
 active_excel_path: Path
@@ -131,6 +133,8 @@ managed_excel_path: Path
 price_storage_path: Path
 bonus_storage_path: Path
 activity_storage_path: Path
+contracts_storage_path: Path
+contract_template_path = BASE_DIR / "templates" / "contract_seletkov.docx"
 price_updates_in_progress: set[str] = set()
 broadcasts_in_progress: set[int] = set()
 broadcast_album_buffers: dict[tuple[int, int, str], list[Message]] = {}
@@ -271,6 +275,34 @@ class LeadState(StatesGroup):
     region = State()
     company = State()
     outlets = State()
+
+
+class ContractState(StatesGroup):
+    entering = State()
+    searching = State()
+
+
+CONTRACT_COMMON_FIELDS = (
+    ("contract_number", "Номер договора", "Введите номер договора.", "Например: <code>291</code>"),
+    ("contract_date", "Дата договора", "Введите дату договора.", "Например: <code>08.09.2026</code>"),
+    ("buyer_name", "Покупатель", "Введите полное официальное наименование покупателя.", "Для ИП — ФИО без приставки «ИП»."),
+    ("representative_genitive", "Подписант", "Введите ФИО подписанта в родительном падеже.", "Например: <code>Сафина Рафиса Рауфовича</code>"),
+)
+CONTRACT_COMPANY_FIELDS = (
+    ("representative_position", "Должность", "Введите должность подписанта в родительном падеже.", "Например: <code>директора</code>"),
+    ("representative_basis", "Основание", "На основании чего действует подписант?", "Например: <code>Устава</code>"),
+)
+CONTRACT_REQUISITE_FIELDS = (
+    ("buyer_inn", "ИНН", "Введите ИНН покупателя.", "Только цифры или привычная запись с пробелами."),
+    ("buyer_kpp", "КПП", "Введите КПП покупателя.", "КПП требуется только для ООО."),
+    ("buyer_ogrn", "ОГРН / ОГРНИП", "Введите ОГРН или ОГРНИП покупателя.", "Бот автоматически уберёт пробелы."),
+    ("buyer_address", "Адрес", "Введите юридический адрес покупателя.", "Одним обычным сообщением."),
+    ("bank_account", "Расчётный счёт", "Введите расчётный счёт.", "Бот автоматически уберёт пробелы."),
+    ("correspondent_account", "Корреспондентский счёт", "Введите корреспондентский счёт.", "Бот автоматически уберёт пробелы."),
+    ("bik", "БИК", "Введите БИК банка.", "Бот автоматически уберёт пробелы."),
+    ("bank_name", "Банк", "Введите полное наименование банка.", "Например: <code>ООО «Банк Точка»</code>"),
+    ("edo_id", "Идентификатор ЭДО", "Введите идентификатор участника ЭДО.", "Он попадёт в готовое сообщение бухгалтеру."),
+)
 
 
 class AccessMiddleware(BaseMiddleware):
@@ -561,6 +593,14 @@ def has_internal_access(user_id: int | None, username: str | None = None) -> boo
     )
 
 
+def can_manage_contracts(user_id: int | None, username: str | None = None) -> bool:
+    if not user_id:
+        return False
+    if is_admin(user_id):
+        return True
+    return materials_db.user_role(user_id, username) == "assistant"
+
+
 async def cached_inline_order(query: str) -> InlineOrderCard | None:
     normalized = query.strip().casefold()
     cached = inline_order_cache.get(normalized)
@@ -818,6 +858,8 @@ def main_menu(user_id: int | None) -> InlineKeyboardMarkup:
                 text="📈 Мои отгрузки", callback_data="myship:menu"
             ))
         buttons.append(InlineKeyboardButton(text="🔔 Ожидания", callback_data="main:waitlist"))
+        if can_manage_contracts(user_id):
+            buttons.append(InlineKeyboardButton(text="📄 Договоры", callback_data="contracts:menu"))
         if can_receive_activity_report(user_id):
             buttons.append(InlineKeyboardButton(
                 text="👥 Новые кенты и кенты-потеряшки",
@@ -882,6 +924,398 @@ async def show_main(target: Message, user_id: int | None, *, edit: bool = False)
             reply_markup=persistent_home_keyboard(),
         )
         await target.answer("Выберите нужный раздел:", reply_markup=main_menu(user_id))
+
+
+def contract_fields(buyer_type: str) -> list[tuple[str, str, str, str]]:
+    fields = list(CONTRACT_COMMON_FIELDS)
+    if buyer_type == "ooo":
+        fields.extend(CONTRACT_COMPANY_FIELDS)
+    fields.extend(
+        field for field in CONTRACT_REQUISITE_FIELDS
+        if buyer_type == "ooo" or field[0] != "buyer_kpp"
+    )
+    return fields
+
+
+def contract_field(field_key: str, buyer_type: str):
+    return next((field for field in contract_fields(buyer_type) if field[0] == field_key), None)
+
+
+def contract_access_denied_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏠", callback_data="main:menu")]])
+
+
+async def require_contract_access(callback: CallbackQuery) -> bool:
+    if can_manage_contracts(callback.from_user.id, callback.from_user.username):
+        return True
+    await callback.answer("Раздел доступен помощникам и главному администратору.", show_alert=True)
+    return False
+
+
+def contracts_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Новый договор", callback_data="contracts:new", style="success")],
+        [InlineKeyboardButton(text="🔎 Найти договор", callback_data="contracts:search")],
+        [InlineKeyboardButton(text="📥 Выгрузить реестр", callback_data="contracts:export")],
+        compact_nav(),
+    ])
+
+
+def contracts_menu_text() -> str:
+    recent = contracts_database.recent(5)
+    lines = [
+        "📄 <b>Договоры поставки</b>", "",
+        "Формирование договоров от ИП Селеткова и реестр созданных документов.",
+    ]
+    if recent:
+        lines.extend(("", "<b>Последние договоры:</b>"))
+        lines.extend(
+            f"• №{html.escape(row.number)} от {html.escape(row.contract_date)} — "
+            f"{html.escape(row.buyer_name)}"
+            for row in recent
+        )
+    return "\n".join(lines)
+
+
+@router.callback_query(F.data == "contracts:menu")
+async def contracts_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_contract_access(callback):
+        return
+    await state.clear()
+    await callback.answer()
+    await edit_or_answer(callback.message, contracts_menu_text(), contracts_menu_keyboard())
+
+
+@router.callback_query(F.data == "contracts:new")
+async def contract_new(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_contract_access(callback):
+        return
+    await state.clear()
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="ИП", callback_data="contracts:type:ip"),
+            InlineKeyboardButton(text="ООО", callback_data="contracts:type:ooo"),
+        ],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="contracts:menu", style="danger")],
+    ])
+    await callback.answer()
+    await callback.message.edit_text(
+        "📄 <b>Новый договор</b>\n\nВыберите тип покупателя:", reply_markup=keyboard
+    )
+
+
+async def ask_contract_field(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    fields = contract_fields(data["buyer_type"])
+    edit_key = data.get("contract_edit_key")
+    index = int(data.get("contract_index", 0))
+    field = contract_field(edit_key, data["buyer_type"]) if edit_key else fields[index]
+    if not field:
+        await show_contract_review(message, state)
+        return
+    key, label, question, hint = field
+    keyboard_rows = []
+    if key == "contract_date":
+        keyboard_rows.append([InlineKeyboardButton(text="📅 Сегодня", callback_data="contracts:today")])
+    keyboard_rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="contracts:menu", style="danger")])
+    step = "Редактирование" if edit_key else f"Шаг {index + 1} из {len(fields)}"
+    await message.answer(
+        f"📄 <b>{html.escape(label)}</b> · {step}\n\n{question}\n\n<i>{hint}</i>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
+    )
+
+
+@router.callback_query(F.data.startswith("contracts:type:"))
+async def contract_type(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_contract_access(callback):
+        return
+    buyer_type = callback.data.rsplit(":", 1)[1]
+    if buyer_type not in {"ip", "ooo"}:
+        await callback.answer("Неизвестный тип покупателя.", show_alert=True)
+        return
+    await state.set_state(ContractState.entering)
+    await state.set_data({"buyer_type": buyer_type, "contract_index": 0})
+    await callback.answer()
+    await callback.message.edit_text(
+        f"✅ Покупатель: <b>{'ИП' if buyer_type == 'ip' else 'ООО'}</b>"
+    )
+    await ask_contract_field(callback.message, state)
+
+
+def normalize_contract_value(key: str, value: str, buyer_type: str) -> tuple[str | None, str | None]:
+    value = " ".join(value.strip().split())
+    if key == "contract_date":
+        if value.casefold() == "сегодня":
+            value = datetime.now(ZoneInfo("Europe/Moscow")).strftime("%d.%m.%Y")
+        try:
+            datetime.strptime(value, "%d.%m.%Y")
+        except ValueError:
+            return None, "Введите дату в формате ДД.ММ.ГГГГ, например 08.09.2026."
+        return value, None
+    digit_lengths = {
+        "buyer_inn": 12 if buyer_type == "ip" else 10,
+        "buyer_kpp": 9,
+        "buyer_ogrn": 15 if buyer_type == "ip" else 13,
+        "bank_account": 20,
+        "correspondent_account": 20,
+        "bik": 9,
+    }
+    if key in digit_lengths:
+        value = digits(value)
+        expected = digit_lengths[key]
+        if len(value) != expected:
+            return None, f"Ожидается {expected} цифр. Сейчас получено: {len(value)}."
+        return value, None
+    if key == "contract_number" and (not value or len(value) > 30):
+        return None, "Введите номер договора длиной не более 30 символов."
+    if key == "edo_id" and len(value) < 8:
+        return None, "Идентификатор ЭДО выглядит слишком коротким. Проверьте значение."
+    if len(value) < 2:
+        return None, "Ответ выглядит слишком коротким. Проверьте значение."
+    return value, None
+
+
+async def advance_contract(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    next_index = int(data.get("contract_index", 0)) + 1
+    fields = contract_fields(data["buyer_type"])
+    await state.update_data(contract_index=next_index)
+    if next_index >= len(fields):
+        await show_contract_review(message, state)
+    else:
+        await ask_contract_field(message, state)
+
+
+@router.message(StateFilter(ContractState.entering), F.text, F.text != HOME_BUTTON_TEXT)
+async def contract_value(message: Message, state: FSMContext) -> None:
+    if not can_manage_contracts(message.from_user.id, message.from_user.username):
+        await state.clear()
+        return
+    data = await state.get_data()
+    if data.get("contract_wait_duplicate"):
+        await message.answer("Используйте кнопки под предупреждением о повторном номере.")
+        return
+    fields = contract_fields(data["buyer_type"])
+    edit_key = data.get("contract_edit_key")
+    index = int(data.get("contract_index", 0))
+    key = edit_key or fields[index][0]
+    value, error = normalize_contract_value(key, message.text, data["buyer_type"])
+    if error:
+        await message.answer(f"⚠️ {html.escape(error)}")
+        return
+    await state.update_data(**{key: value})
+    if edit_key:
+        await state.update_data(contract_edit_key=None)
+        await show_contract_review(message, state)
+        return
+    if key == "contract_number":
+        duplicates = contracts_database.by_number(value)
+        if duplicates:
+            duplicate = duplicates[0]
+            await state.update_data(contract_wait_duplicate=True)
+            await message.answer(
+                "⚠️ <b>Такой номер уже встречался</b>\n\n"
+                f"№{html.escape(duplicate.number)} от {html.escape(duplicate.contract_date)}\n"
+                f"Покупатель: <b>{html.escape(duplicate.buyer_name)}</b>\n\n"
+                "Можно изменить номер или осознанно продолжить.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="Продолжить", callback_data="contracts:duplicate:continue", style="success")],
+                    [InlineKeyboardButton(text="Изменить номер", callback_data="contracts:duplicate:change")],
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="contracts:menu", style="danger")],
+                ]),
+            )
+            return
+    await advance_contract(message, state)
+
+
+@router.callback_query(F.data == "contracts:today", StateFilter(ContractState.entering))
+async def contract_today(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    fields = contract_fields(data["buyer_type"])
+    edit_key = data.get("contract_edit_key")
+    key = edit_key or fields[int(data.get("contract_index", 0))][0]
+    if key != "contract_date":
+        await callback.answer("Эта кнопка уже неактуальна.", show_alert=True)
+        return
+    await state.update_data(contract_date=datetime.now(ZoneInfo("Europe/Moscow")).strftime("%d.%m.%Y"))
+    await callback.answer("Дата установлена")
+    if edit_key:
+        await state.update_data(contract_edit_key=None)
+        await show_contract_review(callback.message, state)
+    else:
+        await advance_contract(callback.message, state)
+
+
+@router.callback_query(F.data.startswith("contracts:duplicate:"), StateFilter(ContractState.entering))
+async def contract_duplicate_choice(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    if not data.get("contract_wait_duplicate"):
+        await callback.answer("Предупреждение уже обработано.", show_alert=True)
+        return
+    action = callback.data.rsplit(":", 1)[1]
+    await state.update_data(contract_wait_duplicate=False)
+    await callback.answer()
+    if action == "change":
+        await callback.message.edit_text("Введите другой номер договора.")
+        await ask_contract_field(callback.message, state)
+    else:
+        await callback.message.edit_text("✅ Продолжаем с указанным номером.")
+        await advance_contract(callback.message, state)
+
+
+def contract_review_text(data: dict) -> str:
+    buyer_type = data["buyer_type"]
+    buyer_label = f"ИП {data['buyer_name']}" if buyer_type == "ip" else data["buyer_name"]
+    lines = [
+        "📄 <b>Проверьте договор</b>", "",
+        f"Номер: <b>№{html.escape(data['contract_number'])}</b>",
+        f"Дата: <b>{html.escape(data['contract_date'])}</b>",
+        "Поставщик: <b>ИП Селетков В.Г.</b>",
+        f"Покупатель: <b>{html.escape(buyer_label)}</b>",
+        f"ИНН: <code>{html.escape(data['buyer_inn'])}</code>",
+    ]
+    if data.get("buyer_kpp"):
+        lines.append(f"КПП: <code>{html.escape(data['buyer_kpp'])}</code>")
+    lines.extend([
+        f"ОГРН{'ИП' if buyer_type == 'ip' else ''}: <code>{html.escape(data['buyer_ogrn'])}</code>",
+        f"Адрес: {html.escape(data['buyer_address'])}", "",
+        f"Банк: <b>{html.escape(data['bank_name'])}</b>",
+        f"Р/с: <code>{html.escape(data['bank_account'])}</code>",
+        f"К/с: <code>{html.escape(data['correspondent_account'])}</code>",
+        f"БИК: <code>{html.escape(data['bik'])}</code>", "",
+        f"ЭДО: <code>{html.escape(data['edo_id'])}</code>",
+    ])
+    if contracts_database.by_number(data["contract_number"]):
+        lines.extend(("", "⚠️ <i>Этот номер уже есть в реестре. Вы подтвердили продолжение.</i>"))
+    return "\n".join(lines)
+
+
+async def show_contract_review(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    await state.set_state(ContractState.entering)
+    await message.answer(
+        contract_review_text(data),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Сформировать договор", callback_data="contracts:generate", style="success")],
+            [InlineKeyboardButton(text="✏️ Изменить данные", callback_data="contracts:edit")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="contracts:menu", style="danger")],
+        ]),
+    )
+
+
+@router.callback_query(F.data == "contracts:edit", StateFilter(ContractState.entering))
+async def contract_edit(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    fields = contract_fields(data["buyer_type"])
+    buttons = [InlineKeyboardButton(text=field[1], callback_data=f"contracts:field:{field[0]}") for field in fields]
+    rows = button_grid(buttons)
+    rows.append([InlineKeyboardButton(text="⬅️", callback_data="contracts:review")])
+    await callback.answer()
+    await callback.message.edit_text(
+        "✏️ <b>Что изменить?</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
+    )
+
+
+@router.callback_query(F.data.startswith("contracts:field:"), StateFilter(ContractState.entering))
+async def contract_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    key = callback.data.rsplit(":", 1)[1]
+    if not contract_field(key, data["buyer_type"]):
+        await callback.answer("Поле не найдено.", show_alert=True)
+        return
+    await state.update_data(contract_edit_key=key)
+    await callback.answer()
+    await ask_contract_field(callback.message, state)
+
+
+@router.callback_query(F.data == "contracts:review", StateFilter(ContractState.entering))
+async def contract_back_review(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await show_contract_review(callback.message, state)
+
+
+@router.callback_query(F.data == "contracts:generate", StateFilter(ContractState.entering))
+async def contract_generate(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_contract_access(callback):
+        return
+    data = await state.get_data()
+    required = [field[0] for field in contract_fields(data.get("buyer_type", ""))]
+    if any(not data.get(key) for key in required):
+        await callback.answer("Не все обязательные поля заполнены.", show_alert=True)
+        return
+    await callback.answer("Формирую договор…")
+    try:
+        destination = await asyncio.to_thread(
+            create_contract_file, contract_template_path, contracts_storage_path, data
+        )
+        creator_name = callback.from_user.full_name or callback.from_user.username or str(callback.from_user.id)
+        await asyncio.to_thread(
+            contracts_database.add, data, callback.from_user.id, creator_name, destination
+        )
+        await callback.message.answer_document(
+            FSInputFile(destination),
+            caption=(
+                "✅ <b>Договор сформирован</b>\n\n"
+                f"№{html.escape(data['contract_number'])} от {html.escape(data['contract_date'])}\n"
+                f"Покупатель: <b>{html.escape(data['buyer_name'])}</b>"
+            ),
+        )
+        message_for_accountant = accountant_message(data)
+        await callback.message.answer(
+            "📨 <b>Сообщение бухгалтеру</b>\n\n"
+            "Нажмите на текст, чтобы скопировать:\n"
+            f"<pre>{html.escape(message_for_accountant)}</pre>",
+            reply_markup=contracts_menu_keyboard(),
+        )
+        await state.clear()
+    except Exception:
+        logging.exception("Не удалось сформировать договор")
+        await callback.message.answer(
+            "❌ Не удалось сформировать договор. Данные сохранены в текущем диалоге — попробуйте ещё раз."
+        )
+
+
+@router.callback_query(F.data == "contracts:search")
+async def contract_search_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_contract_access(callback):
+        return
+    await state.set_state(ContractState.searching)
+    await callback.answer()
+    await callback.message.edit_text(
+        "🔎 <b>Поиск договора</b>\n\nВведите номер, ИНН или название покупателя.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="contracts:menu", style="danger")]]),
+    )
+
+
+@router.message(StateFilter(ContractState.searching), F.text, F.text != HOME_BUTTON_TEXT)
+async def contract_search_result(message: Message, state: FSMContext) -> None:
+    if not can_manage_contracts(message.from_user.id, message.from_user.username):
+        await state.clear()
+        return
+    rows = contracts_database.search(message.text)
+    if not rows:
+        await message.answer("Ничего не найдено. Введите другой запрос.")
+        return
+    lines = ["🔎 <b>Найденные договоры</b>", ""]
+    for row in rows:
+        lines.append(
+            f"• №{html.escape(row.number)} от {html.escape(row.contract_date)} — "
+            f"<b>{html.escape(row.buyer_name)}</b> · ИНН <code>{html.escape(row.buyer_inn)}</code>"
+        )
+    await state.clear()
+    await message.answer("\n".join(lines), reply_markup=contracts_menu_keyboard())
+
+
+@router.callback_query(F.data == "contracts:export")
+async def contract_export(callback: CallbackQuery) -> None:
+    if not await require_contract_access(callback):
+        return
+    await callback.answer("Готовлю реестр…")
+    destination = contracts_storage_path / f"Реестр договоров {datetime.now():%Y-%m-%d_%H-%M}.xlsx"
+    count = await asyncio.to_thread(contracts_database.export_excel, destination)
+    await callback.message.answer_document(
+        FSInputFile(destination), caption=f"📥 <b>Реестр договоров</b>\n\nЗаписей: <b>{count}</b>"
+    )
 
 
 @router.message(F.text == HOME_BUTTON_TEXT)
@@ -4469,6 +4903,10 @@ def build_backup_archive(archive_path: Path) -> None:
         activity_copy = temp_dir / "customer_activity.sqlite3"
         if activity_database_instance is not None:
             activity_database_instance.backup_to(activity_copy)
+        contracts_database_instance = globals().get("contracts_database")
+        contracts_copy = temp_dir / "contracts.sqlite3"
+        if contracts_database_instance is not None:
+            contracts_database_instance.backup_to(contracts_copy)
         metadata = temp_dir / "README.txt"
         metadata.write_text(
             "Резервная копия Ural Vape Regions Bot\n"
@@ -4479,6 +4917,8 @@ def build_backup_archive(archive_path: Path) -> None:
             "prices.sqlite3 — загруженные цены и товарные группы\n"
             "crm.sqlite3 — задачи, список обзвона и журнал действий CRM\n"
             "customer_activity.sqlite3 — локальный реестр отгрузок и недельных отчётов\n"
+            "contracts.sqlite3 — реестр сформированных договоров\n"
+            "contracts/ — сформированные договоры\n"
             "price_files/ — последний исходный общий прайс\n",
             encoding="utf-8",
         )
@@ -4491,6 +4931,12 @@ def build_backup_archive(archive_path: Path) -> None:
                 archive.write(crm_copy, crm_copy.name)
             if activity_copy.exists():
                 archive.write(activity_copy, activity_copy.name)
+            if contracts_copy.exists():
+                archive.write(contracts_copy, contracts_copy.name)
+            contract_files = globals().get("contracts_storage_path")
+            if contract_files and contract_files.exists():
+                for source in contract_files.glob("*.docx"):
+                    archive.write(source, f"contracts/{source.name}")
             storage = globals().get("price_storage_path")
             if storage and storage.exists():
                 for warehouse in (PRICE_SOURCE, "center", "west", "ural"):
@@ -4525,7 +4971,7 @@ async def download_backup(callback: CallbackQuery) -> None:
                 FSInputFile(archive_path),
                 caption=(
                     "✅ <b>Резервная копия готова</b>\n\n"
-                    "В архиве находятся база материалов, таблица территорий и общий прайс. "
+                    "В архиве находятся рабочие базы, договоры, таблица территорий и общий прайс. "
                     "Храните файл в надёжном месте."
                 ),
             )
@@ -6964,9 +7410,9 @@ async def customer_activity_monitor(bot: Bot) -> None:
 
 
 async def main() -> None:
-    global catalog, materials_db, prices_db, crm_database, activity_database, admin_ids
+    global catalog, materials_db, prices_db, crm_database, activity_database, contracts_database, admin_ids
     global crm_beta_ids, inline_moysklad_client
-    global active_excel_path, managed_excel_path, price_storage_path, bonus_storage_path, activity_storage_path
+    global active_excel_path, managed_excel_path, price_storage_path, bonus_storage_path, activity_storage_path, contracts_storage_path
     load_dotenv(BASE_DIR / ".env")
     token = os.getenv("BOT_TOKEN", "").strip()
     if not token:
@@ -6979,6 +7425,8 @@ async def main() -> None:
     bonus_storage_path = Path(os.getenv("MOYSKLAD_BONUS_STORAGE", "data/moysklad_bonus"))
     activity_database_path = Path(os.getenv("CUSTOMER_ACTIVITY_DB", "data/customer_activity.sqlite3"))
     activity_storage_path = Path(os.getenv("CUSTOMER_ACTIVITY_STORAGE", "data/customer_activity_reports"))
+    contracts_database_path = Path(os.getenv("CONTRACTS_DB", "data/contracts.sqlite3"))
+    contracts_storage_path = Path(os.getenv("CONTRACTS_STORAGE", "data/contracts"))
     if not excel_path.is_absolute(): excel_path = BASE_DIR / excel_path
     if not managed_excel_path.is_absolute(): managed_excel_path = BASE_DIR / managed_excel_path
     if not db_path.is_absolute(): db_path = BASE_DIR / db_path
@@ -6987,8 +7435,13 @@ async def main() -> None:
     if not bonus_storage_path.is_absolute(): bonus_storage_path = BASE_DIR / bonus_storage_path
     if not activity_database_path.is_absolute(): activity_database_path = BASE_DIR / activity_database_path
     if not activity_storage_path.is_absolute(): activity_storage_path = BASE_DIR / activity_storage_path
+    if not contracts_database_path.is_absolute(): contracts_database_path = BASE_DIR / contracts_database_path
+    if not contracts_storage_path.is_absolute(): contracts_storage_path = BASE_DIR / contracts_storage_path
     bonus_storage_path.mkdir(parents=True, exist_ok=True)
     activity_storage_path.mkdir(parents=True, exist_ok=True)
+    contracts_storage_path.mkdir(parents=True, exist_ok=True)
+    if not contract_template_path.is_file():
+        raise RuntimeError(f"Не найден шаблон договора: {contract_template_path}")
     admin_ids = {int(value.strip()) for value in os.getenv("ADMIN_IDS", "5533726476").split(",") if value.strip()}
     crm_beta_ids = {
         int(value.strip())
@@ -6999,6 +7452,7 @@ async def main() -> None:
     catalog = Catalog(active_excel_path)
     materials_db = MaterialsDB(db_path)
     activity_database = ActivityDatabase(activity_database_path)
+    contracts_database = ContractsDB(contracts_database_path)
     if materials_db.get_setting(PRICE_MESSAGE_SETTING) == LEGACY_DEFAULT_PRICE_COMMAND_MESSAGE:
         materials_db.set_setting(PRICE_MESSAGE_SETTING, DEFAULT_PRICE_COMMAND_MESSAGE)
     for registered_chat in materials_db.list_client_chats():
