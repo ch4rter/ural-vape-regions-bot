@@ -1,4 +1,4 @@
-"""Contract registry and DOCX generation for IP Seletkov."""
+"""Contract registry and DOCX generation for supported suppliers."""
 
 from __future__ import annotations
 
@@ -14,9 +14,23 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
 
-SUPPLIER_SHORT = "ИП Селетков В.Г."
-SUPPLIER_FULL = "Индивидуальный предприниматель Селетков Василий Геннадьевич"
-SUPPLIER_REGISTRATION = "320745600128861"
+SUPPLIERS = {
+    "seletkov": {
+        "short": "ИП Селетков В.Г.",
+        "accountant": "Селеткова",
+        "template": "contract_seletkov.docx",
+    },
+    "shmidt": {
+        "short": "ИП Шмидт А.В.",
+        "accountant": "Шмидта",
+        "template": "contract_shmidt.docx",
+    },
+}
+DEFAULT_SUPPLIER = "seletkov"
+
+
+def supplier(payload: dict) -> dict:
+    return SUPPLIERS.get(payload.get("supplier_key", DEFAULT_SUPPLIER), SUPPLIERS[DEFAULT_SUPPLIER])
 
 
 @dataclass(frozen=True)
@@ -24,6 +38,7 @@ class ContractRecord:
     id: int
     number: str
     contract_date: str
+    supplier_key: str
     buyer_type: str
     buyer_name: str
     buyer_inn: str
@@ -60,6 +75,11 @@ class ContractsDB:
                 CREATE INDEX IF NOT EXISTS contracts_inn_idx ON contracts(buyer_inn);
                 """
             )
+            columns = {row[1] for row in db.execute("PRAGMA table_info(contracts)")}
+            if "supplier_key" not in columns:
+                db.execute(
+                    "ALTER TABLE contracts ADD COLUMN supplier_key TEXT NOT NULL DEFAULT 'seletkov'"
+                )
 
     def _connect(self):
         db = sqlite3.connect(self.path, timeout=30)
@@ -69,17 +89,23 @@ class ContractsDB:
     @staticmethod
     def _record(row: sqlite3.Row) -> ContractRecord:
         return ContractRecord(
-            row["id"], row["number"], row["contract_date"], row["buyer_type"],
+            row["id"], row["number"], row["contract_date"], row["supplier_key"], row["buyer_type"],
             row["buyer_name"], row["buyer_inn"], row["edo_id"], row["creator_id"],
             row["creator_name"], row["file_path"], json.loads(row["payload_json"]),
             row["created_at"],
         )
 
-    def by_number(self, number: str) -> list[ContractRecord]:
+    def by_number(self, number: str, supplier_key: str | None = None) -> list[ContractRecord]:
         with self._connect() as db:
-            rows = db.execute(
-                "SELECT * FROM contracts WHERE number=? ORDER BY id DESC", (number.strip(),)
-            ).fetchall()
+            if supplier_key:
+                rows = db.execute(
+                    "SELECT * FROM contracts WHERE number=? AND supplier_key=? ORDER BY id DESC",
+                    (number.strip(), supplier_key),
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    "SELECT * FROM contracts WHERE number=? ORDER BY id DESC", (number.strip(),)
+                ).fetchall()
         return [self._record(row) for row in rows]
 
     def recent(self, limit: int = 20) -> list[ContractRecord]:
@@ -105,12 +131,13 @@ class ContractsDB:
         with self._connect() as db:
             cursor = db.execute(
                 """INSERT INTO contracts(
-                       number,contract_date,buyer_type,buyer_name,buyer_inn,edo_id,
+                       number,contract_date,supplier_key,buyer_type,buyer_name,buyer_inn,edo_id,
                        creator_id,creator_name,file_path,payload_json
-                   ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     payload["contract_number"], payload["contract_date"],
-                    payload["buyer_type"], payload["buyer_name"], payload["buyer_inn"],
+                    payload.get("supplier_key", DEFAULT_SUPPLIER), payload["buyer_type"],
+                    payload["buyer_name"], payload["buyer_inn"],
                     payload.get("edo_id", ""), creator_id, creator_name, str(file_path),
                     json.dumps(payload, ensure_ascii=False),
                 ),
@@ -123,12 +150,12 @@ class ContractsDB:
         sheet = workbook.active
         sheet.title = "Договоры"
         sheet.append([
-            "Номер", "Дата договора", "Тип", "Покупатель", "ИНН", "ЭДО",
+            "Номер", "Дата договора", "Поставщик", "Тип", "Покупатель", "ИНН", "ЭДО",
             "Создал", "Telegram ID", "Дата формирования", "Файл",
         ])
         for record in rows:
             sheet.append([
-                record.number, record.contract_date, record.buyer_type.upper(),
+                record.number, record.contract_date, SUPPLIERS.get(record.supplier_key, SUPPLIERS[DEFAULT_SUPPLIER])["short"], record.buyer_type.upper(),
                 record.buyer_name, record.buyer_inn, record.edo_id,
                 record.creator_name, record.creator_id, record.created_at, record.file_path,
             ])
@@ -137,8 +164,8 @@ class ContractsDB:
             cell.fill = PatternFill("solid", fgColor="374151")
             cell.alignment = Alignment(horizontal="center")
         sheet.freeze_panes = "A2"
-        sheet.auto_filter.ref = f"A1:J{max(1, sheet.max_row)}"
-        for column, width in {"A": 13, "B": 15, "C": 10, "D": 42, "E": 18, "F": 42, "G": 24, "H": 16, "I": 21, "J": 55}.items():
+        sheet.auto_filter.ref = f"A1:K{max(1, sheet.max_row)}"
+        for column, width in {"A": 13, "B": 15, "C": 23, "D": 10, "E": 42, "F": 18, "G": 42, "H": 24, "I": 16, "J": 21, "K": 55}.items():
             sheet.column_dimensions[column].width = width
         destination.parent.mkdir(parents=True, exist_ok=True)
         workbook.save(destination)
@@ -211,7 +238,7 @@ def buyer_short_name(payload: dict) -> str:
 def accountant_message(payload: dict) -> str:
     return (
         f"№{payload['contract_number']} от {payload['contract_date']}\n\n"
-        "От Селеткова\n\n"
+        f"От {supplier(payload)['accountant']}\n\n"
         f"{buyer_short_name(payload)}\n\n"
         f"{payload['buyer_inn']}\n\n"
         f"{payload['edo_id']}"

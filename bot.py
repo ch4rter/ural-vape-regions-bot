@@ -47,7 +47,7 @@ from zoneinfo import ZoneInfo
 
 from crm_bot import configure_crm, router as crm_router
 from crm_db import CRMDatabase
-from contracts import ContractsDB, accountant_message, create_contract_file, digits
+from contracts import SUPPLIERS, ContractsDB, accountant_message, create_contract_file, digits, supplier
 from customer_activity import (
     ActivityDatabase,
     ActivityReport,
@@ -134,7 +134,10 @@ price_storage_path: Path
 bonus_storage_path: Path
 activity_storage_path: Path
 contracts_storage_path: Path
-contract_template_path = BASE_DIR / "templates" / "contract_seletkov.docx"
+contract_template_paths = {
+    key: BASE_DIR / "templates" / settings["template"]
+    for key, settings in SUPPLIERS.items()
+}
 price_updates_in_progress: set[str] = set()
 broadcasts_in_progress: set[int] = set()
 broadcast_album_buffers: dict[tuple[int, int, str], list[Message]] = {}
@@ -965,7 +968,7 @@ def contracts_menu_text() -> str:
     recent = contracts_database.recent(5)
     lines = [
         "📄 <b>Договоры поставки</b>", "",
-        "Формирование договоров от ИП Селеткова и реестр созданных документов.",
+        "Формирование договоров от ИП Селеткова и ИП Шмидта и реестр созданных документов.",
     ]
     if recent:
         lines.extend(("", "<b>Последние договоры:</b>"))
@@ -992,6 +995,26 @@ async def contract_new(callback: CallbackQuery, state: FSMContext) -> None:
         return
     await state.clear()
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="ИП Селетков В.Г.", callback_data="contracts:supplier:seletkov")],
+        [InlineKeyboardButton(text="ИП Шмидт А.В.", callback_data="contracts:supplier:shmidt")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="contracts:menu", style="danger")],
+    ])
+    await callback.answer()
+    await callback.message.edit_text(
+        "📄 <b>Новый договор</b>\n\nВыберите поставщика:", reply_markup=keyboard
+    )
+
+
+@router.callback_query(F.data.startswith("contracts:supplier:"))
+async def contract_supplier(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_contract_access(callback):
+        return
+    supplier_key = callback.data.rsplit(":", 1)[1]
+    if supplier_key not in SUPPLIERS:
+        await callback.answer("Неизвестный поставщик.", show_alert=True)
+        return
+    await state.set_data({"supplier_key": supplier_key})
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="ИП", callback_data="contracts:type:ip"),
             InlineKeyboardButton(text="ООО", callback_data="contracts:type:ooo"),
@@ -1000,7 +1023,8 @@ async def contract_new(callback: CallbackQuery, state: FSMContext) -> None:
     ])
     await callback.answer()
     await callback.message.edit_text(
-        "📄 <b>Новый договор</b>\n\nВыберите тип покупателя:", reply_markup=keyboard
+        f"📄 <b>Новый договор</b>\n\nПоставщик: <b>{html.escape(SUPPLIERS[supplier_key]['short'])}</b>\n\n"
+        "Выберите тип покупателя:", reply_markup=keyboard
     )
 
 
@@ -1034,7 +1058,9 @@ async def contract_type(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Неизвестный тип покупателя.", show_alert=True)
         return
     await state.set_state(ContractState.entering)
-    await state.set_data({"buyer_type": buyer_type, "contract_index": 0})
+    data = await state.get_data()
+    supplier_key = data.get("supplier_key", "seletkov")
+    await state.set_data({"supplier_key": supplier_key, "buyer_type": buyer_type, "contract_index": 0})
     await callback.answer()
     await callback.message.edit_text(
         f"✅ Покупатель: <b>{'ИП' if buyer_type == 'ip' else 'ООО'}</b>"
@@ -1109,7 +1135,7 @@ async def contract_value(message: Message, state: FSMContext) -> None:
         await show_contract_review(message, state)
         return
     if key == "contract_number":
-        duplicates = contracts_database.by_number(value)
+        duplicates = contracts_database.by_number(value, data.get("supplier_key", "seletkov"))
         if duplicates:
             duplicate = duplicates[0]
             await state.update_data(contract_wait_duplicate=True)
@@ -1170,7 +1196,7 @@ def contract_review_text(data: dict) -> str:
         "📄 <b>Проверьте договор</b>", "",
         f"Номер: <b>№{html.escape(data['contract_number'])}</b>",
         f"Дата: <b>{html.escape(data['contract_date'])}</b>",
-        "Поставщик: <b>ИП Селетков В.Г.</b>",
+        f"Поставщик: <b>{html.escape(supplier(data)['short'])}</b>",
         f"Покупатель: <b>{html.escape(buyer_label)}</b>",
         f"ИНН: <code>{html.escape(data['buyer_inn'])}</code>",
     ]
@@ -1185,7 +1211,7 @@ def contract_review_text(data: dict) -> str:
         f"БИК: <code>{html.escape(data['bik'])}</code>", "",
         f"ЭДО: <code>{html.escape(data['edo_id'])}</code>",
     ])
-    if contracts_database.by_number(data["contract_number"]):
+    if contracts_database.by_number(data["contract_number"], data.get("supplier_key", "seletkov")):
         lines.extend(("", "⚠️ <i>Этот номер уже есть в реестре. Вы подтвердили продолжение.</i>"))
     return "\n".join(lines)
 
@@ -1245,8 +1271,9 @@ async def contract_generate(callback: CallbackQuery, state: FSMContext) -> None:
         return
     await callback.answer("Формирую договор…")
     try:
+        template_path = contract_template_paths[data.get("supplier_key", "seletkov")]
         destination = await asyncio.to_thread(
-            create_contract_file, contract_template_path, contracts_storage_path, data
+            create_contract_file, template_path, contracts_storage_path, data
         )
         creator_name = callback.from_user.full_name or callback.from_user.username or str(callback.from_user.id)
         await asyncio.to_thread(
@@ -7440,8 +7467,9 @@ async def main() -> None:
     bonus_storage_path.mkdir(parents=True, exist_ok=True)
     activity_storage_path.mkdir(parents=True, exist_ok=True)
     contracts_storage_path.mkdir(parents=True, exist_ok=True)
-    if not contract_template_path.is_file():
-        raise RuntimeError(f"Не найден шаблон договора: {contract_template_path}")
+    missing_contract_templates = [path for path in contract_template_paths.values() if not path.is_file()]
+    if missing_contract_templates:
+        raise RuntimeError(f"Не найдены шаблоны договоров: {missing_contract_templates}")
     admin_ids = {int(value.strip()) for value in os.getenv("ADMIN_IDS", "5533726476").split(",") if value.strip()}
     crm_beta_ids = {
         int(value.strip())

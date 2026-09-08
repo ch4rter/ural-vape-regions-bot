@@ -15,6 +15,7 @@ def payload(**updates):
     result = {
         "contract_number": "291",
         "contract_date": "08.09.2026",
+        "supplier_key": "seletkov",
         "buyer_type": "ip",
         "buyer_name": "Сафин Рафис Рауфович",
         "representative_genitive": "Сафина Рафиса Рауфовича",
@@ -69,6 +70,21 @@ def test_company_intro_and_accountant_message():
     assert "От Селеткова" in accountant_message(company)
 
 
+def test_shmidt_template_and_accountant_message(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    values = payload(supplier_key="shmidt")
+    destination = create_contract_file(
+        root / "templates/contract_shmidt.docx", tmp_path, values
+    )
+    text = document_text(destination)
+    assert "ИП Шмидт Андрей Владимирович" in text
+    assert "326200000045173" in text
+    assert "Сафин Рафис Рауфович" in text
+    assert "ТИАН ТРЕЙД" not in text
+    assert "{{" not in text
+    assert "От Шмидта" in accountant_message(values)
+
+
 def test_registry_allows_duplicate_number_and_exports(tmp_path):
     database = ContractsDB(tmp_path / "contracts.sqlite3")
     values = payload()
@@ -82,3 +98,12 @@ def test_registry_allows_duplicate_number_and_exports(tmp_path):
     assert database.export_excel(export) == 2
     workbook = load_workbook(export, read_only=True)
     assert workbook["Договоры"].max_row == 3
+
+
+def test_duplicate_numbers_are_scoped_by_supplier(tmp_path):
+    database = ContractsDB(tmp_path / "contracts.sqlite3")
+    database.add(payload(supplier_key="seletkov"), 1, "Помощник", tmp_path / "a.docx")
+    database.add(payload(supplier_key="shmidt"), 1, "Помощник", tmp_path / "b.docx")
+    assert len(database.by_number("291")) == 2
+    assert len(database.by_number("291", "seletkov")) == 1
+    assert len(database.by_number("291", "shmidt")) == 1
