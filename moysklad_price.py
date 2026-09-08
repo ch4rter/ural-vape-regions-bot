@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import urlencode, urlparse
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener, urlopen
 
 from openpyxl import Workbook
 from openpyxl.worksheet.datavalidation import DataValidation
@@ -186,6 +186,60 @@ class MoySkladClient:
 
     def assortment(self) -> list[dict]:
         return self._rows("entity/assortment")
+
+    def customer_order_print_templates(self) -> list[dict]:
+        metadata = self._get_json(f"{API_ROOT}/entity/customerorder/metadata")
+        result = []
+        for key in ("printTemplates", "customTemplates"):
+            values = metadata.get(key, []) if isinstance(metadata, dict) else []
+            result.extend(value for value in values if isinstance(value, dict))
+        return result
+
+    def export_customer_order_pdf_url(self, order_id: str, template: dict) -> str:
+        """Start a non-mutating print export and return MoySklad's temporary PDF URL."""
+        order_id = order_id.strip()
+        template_meta = template.get("meta") if isinstance(template, dict) else None
+        if not order_id or not isinstance(template_meta, dict):
+            raise MoySkladError("Не указан заказ или шаблон печатной формы.")
+        body = json.dumps(
+            {"template": {"meta": template_meta}, "extension": "pdf"},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        request = Request(
+            f"{API_ROOT}/entity/customerorder/{order_id}/export",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {self._token}",
+                "Accept": "application/json;charset=utf-8",
+                "Content-Type": "application/json;charset=utf-8",
+                "User-Agent": "UralVapeRegionsBot/1.0 (print-export)",
+            },
+            method="POST",
+        )
+
+        class NoRedirect(HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        opener = build_opener(HTTPSHandler(context=self._ssl_context), NoRedirect())
+        location = ""
+        try:
+            with opener.open(request, timeout=self._timeout) as response:
+                location = str(response.headers.get("Location") or response.geturl() or "")
+        except HTTPError as error:
+            if error.code not in {301, 302, 303, 307, 308}:
+                raise MoySkladError(
+                    f"МойСклад не сформировал печатную форму заказа: HTTP {error.code}",
+                    status=error.code,
+                ) from error
+            location = str(error.headers.get("Location") or "")
+        parsed = urlparse(location)
+        hostname = (parsed.hostname or "").casefold()
+        if parsed.scheme != "https" or not (
+            hostname == "moysklad.ru" or hostname.endswith(".moysklad.ru")
+        ):
+            raise MoySkladError("МойСклад не вернул безопасную ссылку на PDF.")
+        return location
 
     def product_folders(self) -> list[dict]:
         return self._rows("entity/productfolder")

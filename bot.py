@@ -34,6 +34,7 @@ from aiogram.types import (
     InlineQuery,
     InlineQueryResultArticle,
     InlineQueryResultCachedPhoto,
+    InlineQueryResultDocument,
     InputTextMessageContent,
     InputMediaDocument,
     InputMediaPhoto,
@@ -81,6 +82,12 @@ from order_notifications import (
     review_notification_targets,
 )
 from order_inline import InlineOrderCard, fetch_inline_order, format_order_caption, render_order_card
+from order_document_inline import (
+    order_document_caption,
+    order_document_description,
+    search_customer_orders,
+    select_print_template,
+)
 from inventory_inline import (
     InventorySnapshot,
     InventoryReference,
@@ -164,6 +171,9 @@ inline_inventory_reference_path = BASE_DIR / "data" / "inline_inventory_referenc
 inline_inventory_query_sequence = 0
 inline_inventory_user_queries: dict[int, int] = {}
 inline_inventory_reference_lock = asyncio.Lock()
+inline_document_search_cache: dict[str, tuple[datetime, list]] = {}
+inline_document_url_cache: dict[tuple[str, str, str], tuple[datetime, str]] = {}
+inline_customer_order_template: dict | None = None
 
 
 @dataclass
@@ -841,6 +851,88 @@ async def answer_price_inline(inline_query: InlineQuery, query: str) -> None:
     await inline_query.answer(results[:20], cache_time=10, is_personal=True)
 
 
+async def answer_order_document_inline(inline_query: InlineQuery, query: str) -> None:
+    """Return current customer-order print forms as inline PDF documents."""
+    global inline_inventory_query_sequence, inline_customer_order_template
+    if inline_moysklad_client is None:
+        await inline_query.answer([], cache_time=1, is_personal=True)
+        return
+    inline_inventory_query_sequence += 1
+    sequence = inline_inventory_query_sequence
+    inline_inventory_user_queries[inline_query.from_user.id] = sequence
+    await asyncio.sleep(0.9)
+    if inline_inventory_user_queries.get(inline_query.from_user.id) != sequence:
+        await inline_query.answer([], cache_time=1, is_personal=True)
+        return
+
+    now = datetime.now(ZoneInfo("Europe/Moscow")).replace(tzinfo=None)
+    cache_key = normalize_price_text(query)
+    cached = inline_document_search_cache.get(cache_key)
+    if cached and now - cached[0] < timedelta(seconds=20):
+        orders = cached[1]
+    else:
+        orders = await asyncio.wait_for(
+            asyncio.to_thread(search_customer_orders, inline_moysklad_client, query),
+            timeout=15,
+        )
+        inline_document_search_cache[cache_key] = (now, orders)
+    if not orders:
+        await inline_query.answer([], cache_time=2, is_personal=True)
+        return
+
+    if inline_customer_order_template is None:
+        templates = await asyncio.wait_for(
+            asyncio.to_thread(inline_moysklad_client.customer_order_print_templates),
+            timeout=12,
+        )
+        configured = os.getenv("MOYSKLAD_CUSTOMERORDER_PRINT_TEMPLATE", "Накладная").strip()
+        inline_customer_order_template = select_print_template(templates, configured)
+        if inline_customer_order_template is None:
+            available = ", ".join(str(value.get("name") or "") for value in templates)
+            logging.error(
+                "Не найдена печатная форма заказа покупателя %r. Доступны: %s",
+                configured, available or "нет шаблонов",
+            )
+            await inline_query.answer([], cache_time=2, is_personal=True)
+            return
+
+    template_href = str(inline_customer_order_template.get("meta", {}).get("href") or "")
+
+    async def document_url(order):
+        key = (order.order_id, order.updated, template_href)
+        existing = inline_document_url_cache.get(key)
+        if existing and now - existing[0] < timedelta(minutes=10):
+            return existing[1]
+        url = await asyncio.to_thread(
+            inline_moysklad_client.export_customer_order_pdf_url,
+            order.order_id,
+            inline_customer_order_template,
+        )
+        inline_document_url_cache[key] = (now, url)
+        return url
+
+    urls = await asyncio.wait_for(
+        asyncio.gather(*(document_url(order) for order in orders), return_exceptions=True),
+        timeout=20,
+    )
+    results = []
+    for order, url in zip(orders, urls):
+        if isinstance(url, Exception):
+            logging.warning("Не сформирована накладная заказа %s: %s", order.number, url)
+            continue
+        result_id = secrets.token_hex(4) + order.order_id.replace("-", "")[:24]
+        results.append(InlineQueryResultDocument(
+            id=f"order-doc-{result_id}"[:64],
+            title=f"📄 {order.agent} · заказ №{order.number}",
+            description=order_document_description(order),
+            document_url=url,
+            mime_type="application/pdf",
+            caption=order_document_caption(order),
+            parse_mode=ParseMode.HTML,
+        ))
+    await inline_query.answer(results, cache_time=1, is_personal=True)
+
+
 @router.inline_query()
 async def inline_order_search(inline_query: InlineQuery, bot: Bot) -> None:
     if not has_internal_access(inline_query.from_user.id, inline_query.from_user.username):
@@ -849,7 +941,8 @@ async def inline_order_search(inline_query: InlineQuery, bot: Bot) -> None:
     raw_query = inline_query.query.strip()
     forced_order = bool(re.match(r"^заказ\s+", raw_query, flags=re.IGNORECASE))
     forced_price = bool(re.match(r"^цена(?:\s+|$)", raw_query, flags=re.IGNORECASE))
-    query = re.sub(r"^(?:заказ|цена|товар|группа)\s+", "", raw_query, flags=re.IGNORECASE).lstrip("№#")
+    forced_document = bool(re.match(r"^накладная(?:\s+|$)", raw_query, flags=re.IGNORECASE))
+    query = re.sub(r"^(?:заказ|цена|накладная|товар|группа)\s+", "", raw_query, flags=re.IGNORECASE).lstrip("№#")
     minimum_length = 3
     if len(query) < minimum_length:
         await inline_query.answer([], cache_time=1, is_personal=True)
@@ -859,6 +952,16 @@ async def inline_order_search(inline_query: InlineQuery, bot: Bot) -> None:
             await answer_price_inline(inline_query, query)
         except Exception:
             logging.exception("Ошибка inline-поиска цены %s", query)
+            await inline_query.answer([], cache_time=1, is_personal=True)
+        return
+    if forced_document:
+        try:
+            await answer_order_document_inline(inline_query, query)
+        except asyncio.TimeoutError:
+            logging.warning("Тайм-аут inline-поиска накладной %s", query)
+            await inline_query.answer([], cache_time=1, is_personal=True)
+        except Exception:
+            logging.exception("Ошибка inline-поиска накладной %s", query)
             await inline_query.answer([], cache_time=1, is_personal=True)
         return
     if not forced_order and not query.isdigit():
