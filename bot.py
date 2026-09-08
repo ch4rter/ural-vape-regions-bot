@@ -877,8 +877,11 @@ async def answer_order_document_inline(inline_query: InlineQuery, query: str) ->
         )
         inline_document_search_cache[cache_key] = (now, orders)
     if not orders:
+        logging.info("Inline-накладная: по запросу %r заказы не найдены", query)
         await inline_query.answer([], cache_time=2, is_personal=True)
         return
+
+    logging.info("Inline-накладная: запрос %r, найдено заказов: %s", query, len(orders))
 
     if inline_customer_order_template is None:
         templates = await asyncio.wait_for(

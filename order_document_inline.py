@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import html
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
+from difflib import SequenceMatcher
 
 from moysklad_price import MoySkladClient
 
@@ -35,13 +37,68 @@ def _money(value: object) -> Decimal:
         return Decimal(0)
 
 
+def _search_text(value: object) -> str:
+    text = str(value or "").casefold().replace("ё", "е")
+    return " ".join(re.findall(r"[a-zа-я0-9]+", text))
+
+
+def _counterparty_score(name: object, query: str) -> float:
+    candidate = _search_text(name)
+    needle = _search_text(query)
+    if not candidate or not needle:
+        return 0
+    words = needle.split()
+    matched = sum(
+        1 for word in words
+        if word in candidate or any(
+            len(word) >= 4 and SequenceMatcher(None, word, part).ratio() >= 0.76
+            for part in candidate.split()
+        )
+    )
+    coverage = matched / len(words)
+    phrase_bonus = 0.35 if needle in candidate else 0
+    similarity = SequenceMatcher(None, needle, candidate).ratio() * 0.15
+    return coverage + phrase_bonus + similarity
+
+
+def _find_counterparties(client: MoySkladClient, query: str, *, limit: int = 5) -> list[dict]:
+    """Use a few broad API searches and rank the results locally.
+
+    MoySklad's ``search`` is not fuzzy and treats a multi-word phrase quite
+    strictly. Searching by distinctive word prefixes lets employees use a
+    shortened name or make a small typo without downloading the whole client
+    directory.
+    """
+    normalized = _search_text(query)
+    words = [word for word in normalized.split() if len(word) >= 3]
+    probes = [query.strip()]
+    for word in sorted(words, key=len, reverse=True):
+        probes.extend((word, word[: max(4, len(word) - 1)]))
+
+    candidates: dict[str, dict] = {}
+    for probe in dict.fromkeys(value for value in probes if len(value) >= 3):
+        for row in client._rows("entity/counterparty", {"limit": 25, "search": probe}):
+            key = str(row.get("id") or row.get("meta", {}).get("href") or "")
+            if key:
+                candidates[key] = row
+        if len(candidates) >= 25:
+            break
+
+    ranked = sorted(
+        candidates.values(),
+        key=lambda row: _counterparty_score(row.get("name"), query),
+        reverse=True,
+    )
+    return [row for row in ranked if _counterparty_score(row.get("name"), query) >= 0.45][:limit]
+
+
 def search_customer_orders(
     client: MoySkladClient, query: str, *, limit: int = 6
 ) -> list[OrderDocument]:
     query = " ".join(query.strip().split())
     if len(query) < 3:
         return []
-    counterparties = client._rows("entity/counterparty", {"limit": 5, "search": query})
+    counterparties = _find_counterparties(client, query, limit=5)
     orders = []
     for counterparty in counterparties:
         href = str(counterparty.get("meta", {}).get("href") or "")
@@ -55,6 +112,10 @@ def search_customer_orders(
         })
         orders.extend(rows)
     orders.sort(key=lambda row: str(row.get("moment") or ""), reverse=True)
+    unique_orders = {str(row.get("id") or ""): row for row in orders if row.get("id")}
+    orders = sorted(
+        unique_orders.values(), key=lambda row: str(row.get("moment") or ""), reverse=True
+    )
     return [
         OrderDocument(
             order_id=str(row.get("id") or ""),
