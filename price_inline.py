@@ -44,11 +44,14 @@ def group_price_text(details: GroupDetails, updated_at: str) -> str:
         ])
     else:
         lines.append("<b>Ценовые уровни:</b>")
-        for index, tier in enumerate(details.tiers, 1):
+        visible_tiers = details.tiers[:12]
+        for index, tier in enumerate(visible_tiers, 1):
             lines.append(
                 f"{index}. Нал — <b>{money(tier.cash)} ₽</b> · "
                 f"безнал — <b>{money(tier.cashless)} ₽</b>"
             )
+        if len(details.tiers) > len(visible_tiers):
+            lines.append(f"…ещё {len(details.tiers) - len(visible_tiers)} ценовых уровней")
     lines.extend(("", f"<blockquote>🕒 Цены актуальны на {html.escape(updated_at)}</blockquote>"))
     return "\n".join(lines)
 

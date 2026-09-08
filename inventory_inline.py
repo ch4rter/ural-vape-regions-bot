@@ -10,7 +10,13 @@ from datetime import date
 from decimal import Decimal
 from difflib import SequenceMatcher
 
-from moysklad_price import DEFAULT_STORES, MoySkladClient, _canonical_href
+from moysklad_price import (
+    DEFAULT_STORES,
+    MoySkladClient,
+    _canonical_href,
+    _price_type_names,
+    _sale_price,
+)
 from prices_db import ItemSummary, normalize_price_text
 
 
@@ -90,7 +96,12 @@ def _assortment_id(item: dict) -> str:
 
 
 def build_inventory_reference(
-    client: MoySkladClient, catalog: list[ItemSummary], *, built_on: str | None = None
+    client: MoySkladClient,
+    catalog: list[ItemSummary],
+    *,
+    built_on: str | None = None,
+    cash_price_type: str = "",
+    cashless_price_type: str = "",
 ) -> InventoryReference:
     stores = client.stores()
     by_name = {str(store.get("name", "")).strip().casefold(): store for store in stores}
@@ -104,8 +115,12 @@ def build_inventory_reference(
     for item in catalog:
         catalog_by_name.setdefault(normalize_price_text(item.name), []).append(item)
 
+    assortment_rows = client.assortment()
+    cash_name, cashless_name = _price_type_names(
+        assortment_rows, cash_price_type, cashless_price_type
+    )
     items_by_assortment = {}
-    for assortment in client.assortment():
+    for assortment in assortment_rows:
         identifier = _assortment_id(assortment)
         if not identifier:
             continue
@@ -116,7 +131,13 @@ def build_inventory_reference(
             local = candidates[0] if len(candidates) == 1 else None
         if local is None:
             continue
-        items_by_assortment[identifier] = local
+        cash = _sale_price(assortment, cash_name)
+        cashless = _sale_price(assortment, cashless_name)
+        api_prices = {"common": (cash, cashless)} if cash is not None and cashless is not None else {}
+        items_by_assortment[identifier] = ItemSummary(
+            local.callback_id, local.name, local.group_name, local.category_name,
+            api_prices, local.code,
+        )
     return InventoryReference(
         built_on or date.today().isoformat(), inventory_catalog_signature(catalog),
         store_ids, items_by_assortment,
@@ -126,6 +147,7 @@ def build_inventory_reference(
 def save_inventory_reference(path, reference: InventoryReference) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
+        "version": 2,
         "built_on": reference.built_on,
         "catalog_signature": reference.catalog_signature,
         "store_ids": list(reference.store_ids),
@@ -135,6 +157,8 @@ def save_inventory_reference(path, reference: InventoryReference) -> None:
                 "group_name": item.group_name,
                 "category_name": item.category_name,
                 "code": item.code,
+                "cash": str(item.warehouse_prices["common"][0]) if "common" in item.warehouse_prices else None,
+                "cashless": str(item.warehouse_prices["common"][1]) if "common" in item.warehouse_prices else None,
             }
             for identifier, item in reference.items_by_assortment.items()
         },
@@ -149,9 +173,13 @@ def load_inventory_reference(path) -> InventoryReference | None:
         return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("version") != 2:
+            return None
         items = {
             identifier: ItemSummary(
-                0, value["name"], value["group_name"], value["category_name"], {},
+                0, value["name"], value["group_name"], value["category_name"],
+                {"common": (Decimal(value["cash"]), Decimal(value["cashless"]))}
+                if value.get("cash") is not None and value.get("cashless") is not None else {},
                 value.get("code", ""),
             )
             for identifier, value in payload["items"].items()
@@ -266,18 +294,27 @@ def _quantity(value: Decimal) -> str:
     return f"{value:,.3f}".rstrip("0").rstrip(".").replace(",", " ")
 
 
-def _variants(value: int) -> str:
+def _counted_word(value: int, forms: tuple[str, str, str]) -> str:
     remainder_100 = value % 100
     remainder_10 = value % 10
     if 11 <= remainder_100 <= 14:
-        word = "вариантов"
+        word = forms[2]
     elif remainder_10 == 1:
-        word = "вариант"
+        word = forms[0]
     elif 2 <= remainder_10 <= 4:
-        word = "варианта"
+        word = forms[1]
     else:
-        word = "вариантов"
+        word = forms[2]
     return f"{value} {word}"
+
+
+def assortment_count(value: int, category_name: str) -> str:
+    normalized = normalize_price_text(category_name)
+    if any(marker in normalized for marker in ("жидкост", "конструктор", "ароматизатор", "однораз")):
+        return _counted_word(value, ("вкус", "вкуса", "вкусов"))
+    if any(marker in normalized for marker in ("электронные системы", "устройств", "желез")):
+        return _counted_word(value, ("цвет", "цвета", "цветов"))
+    return _counted_word(value, ("вариант", "варианта", "вариантов"))
 
 
 def inventory_item_text(item: InventoryItem, updated_at: str) -> str:
@@ -308,7 +345,7 @@ def inventory_group_text(group: InventoryGroup, updated_at: str) -> str:
         "",
         "<blockquote>"
         f"<b>{_quantity(group.total)} шт.</b> всего\n"
-        f"<b>{_variants(len(group.items))}</b> в наличии"
+        f"<b>{assortment_count(len(group.items), group.category_name)}</b> в наличии"
         "</blockquote>",
         "",
         "🏙 <b>По городам</b>",
@@ -317,7 +354,7 @@ def inventory_group_text(group: InventoryGroup, updated_at: str) -> str:
         lines.append(
             f"• {html.escape(STORE_LABELS[name])} — "
             f"<b>{_quantity(group.quantities[index])} шт.</b> · "
-            f"{_variants(group.variants_by_store[index])}"
+            f"{assortment_count(group.variants_by_store[index], group.category_name)}"
         )
     lines.extend(("", f"<blockquote>🕒 Актуально на {html.escape(updated_at)}</blockquote>"))
     return "\n".join(lines)

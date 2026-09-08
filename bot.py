@@ -86,6 +86,7 @@ from inventory_inline import (
     InventoryReference,
     build_inventory_reference,
     build_inventory_snapshot,
+    assortment_count,
     inventory_group_text,
     inventory_item_text,
     load_inventory_reference,
@@ -96,6 +97,8 @@ from prices_db import (
     PRICE_SOURCE,
     WAREHOUSES,
     GroupDetails,
+    ItemSummary,
+    PriceTier,
     PricesDB,
     generate_change_report_excel,
     generate_discounted_price,
@@ -160,6 +163,7 @@ inline_inventory_refresh_task: asyncio.Task | None = None
 inline_inventory_reference_path = BASE_DIR / "data" / "inline_inventory_reference.json"
 inline_inventory_query_sequence = 0
 inline_inventory_user_queries: dict[int, int] = {}
+inline_inventory_reference_lock = asyncio.Lock()
 
 
 @dataclass
@@ -639,18 +643,7 @@ async def refresh_inline_inventory() -> InventorySnapshot:
     if inline_moysklad_client is None:
         raise RuntimeError("Не настроено подключение к МоемуСкладу")
     catalog = prices_db.item_summaries()
-    today = datetime.now(ZoneInfo("Europe/Moscow")).date().isoformat()
-    if inline_inventory_reference is None:
-        inline_inventory_reference = await asyncio.to_thread(
-            load_inventory_reference, inline_inventory_reference_path
-        )
-    if inline_inventory_reference is None or inline_inventory_reference.built_on != today:
-        inline_inventory_reference = await asyncio.to_thread(
-            build_inventory_reference, inline_moysklad_client, catalog, built_on=today
-        )
-        await asyncio.to_thread(
-            save_inventory_reference, inline_inventory_reference_path, inline_inventory_reference
-        )
+    inline_inventory_reference = await ensure_inline_inventory_reference(catalog)
     snapshot = await asyncio.to_thread(
         build_inventory_snapshot, inline_moysklad_client, catalog, inline_inventory_reference
     )
@@ -661,6 +654,33 @@ async def refresh_inline_inventory() -> InventorySnapshot:
         len(snapshot.items), len(snapshot.groups),
     )
     return snapshot
+
+
+async def ensure_inline_inventory_reference(catalog=None) -> InventoryReference:
+    """Load the daily assortment and prices cache, refreshing it at most once a day."""
+    global inline_inventory_reference
+    if inline_moysklad_client is None:
+        raise RuntimeError("Не настроено подключение к МоемуСкладу")
+    today = datetime.now(ZoneInfo("Europe/Moscow")).date().isoformat()
+    if inline_inventory_reference is None:
+        inline_inventory_reference = await asyncio.to_thread(
+            load_inventory_reference, inline_inventory_reference_path
+        )
+    if inline_inventory_reference is None or inline_inventory_reference.built_on != today:
+        async with inline_inventory_reference_lock:
+            if inline_inventory_reference is None or inline_inventory_reference.built_on != today:
+                inline_inventory_reference = await asyncio.to_thread(
+                    build_inventory_reference,
+                    inline_moysklad_client,
+                    catalog if catalog is not None else prices_db.item_summaries(),
+                    built_on=today,
+                    cash_price_type=os.getenv("MOYSKLAD_CASH_PRICE_TYPE", "").strip(),
+                    cashless_price_type=os.getenv("MOYSKLAD_CASHLESS_PRICE_TYPE", "").strip(),
+                )
+                await asyncio.to_thread(
+                    save_inventory_reference, inline_inventory_reference_path, inline_inventory_reference
+                )
+    return inline_inventory_reference
 
 
 def start_inline_inventory_refresh() -> asyncio.Task:
@@ -727,7 +747,7 @@ async def answer_inventory_inline(inline_query: InlineQuery, query: str) -> None
         results.append(InlineQueryResultArticle(
             id=f"stock-group-{group.key}",
             title=f"📦 {group.name}",
-            description=f"Всего {group.total:g} шт. · {len(group.items)} вариантов · {quantities}",
+            description=f"Всего {group.total:g} шт. · {assortment_count(len(group.items), group.category_name)} · {quantities}",
             input_message_content=InputTextMessageContent(
                 message_text=inventory_group_text(group, updated),
                 parse_mode=ParseMode.HTML,
@@ -752,24 +772,53 @@ async def answer_inventory_inline(inline_query: InlineQuery, query: str) -> None
 
 
 async def answer_price_inline(inline_query: InlineQuery, query: str) -> None:
-    """Answer from the locally imported price; never call the MoySklad API."""
+    """Answer from the daily read-only MoySklad assortment and price cache."""
+    global inline_inventory_query_sequence
+    if not prices_db.search_groups(query, limit=1):
+        await inline_query.answer([], cache_time=2, is_personal=True)
+        return
+    inline_inventory_query_sequence += 1
+    sequence = inline_inventory_query_sequence
+    inline_inventory_user_queries[inline_query.from_user.id] = sequence
+    await asyncio.sleep(0.7)
+    if inline_inventory_user_queries.get(inline_query.from_user.id) != sequence:
+        await inline_query.answer([], cache_time=1, is_personal=True)
+        return
+    reference = await ensure_inline_inventory_reference()
+    api_items_by_key = {}
+    for item in reference.items_by_assortment.values():
+        key = item.code.strip().casefold() or normalize_price_text(item.name)
+        if item.warehouse_prices:
+            api_items_by_key[key] = item
     groups = prices_db.search_groups(query, limit=8)
-    items = prices_db.search_items(query, limit=12)
-    statuses = prices_db.import_statuses()
-    status = statuses.get(PRICE_SOURCE, {})
-    updated = str(status.get("price_date") or status.get("updated_at") or "").split("T", 1)[0]
-    if updated:
-        try:
-            updated = datetime.fromisoformat(updated).strftime("%d.%m.%Y")
-        except ValueError:
-            pass
-    else:
-        updated = datetime.now(ZoneInfo("Europe/Moscow")).strftime("%d.%m.%Y")
+    local_items = prices_db.search_items(query, limit=12)
+    items = []
+    for item in local_items:
+        key = item.code.strip().casefold() or normalize_price_text(item.name)
+        api_item = api_items_by_key.get(key)
+        if api_item:
+            items.append(api_item)
+    updated = datetime.fromisoformat(reference.built_on).strftime("%d.%m.%Y")
     results = []
     for group in groups:
-        details = prices_db.group_details(group.callback_id)
-        if not details or not details.tiers:
+        matching = [
+            item for item in api_items_by_key.values()
+            if normalize_price_text(item.group_name) == normalize_price_text(group.display_name)
+            and normalize_price_text(item.category_name) == normalize_price_text(group.category_name)
+        ]
+        tiers = {}
+        for item in matching:
+            cash, cashless = item.warehouse_prices[PRICE_SOURCE]
+            tiers.setdefault((cash, cashless), set()).add(
+                item.code.strip().casefold() or normalize_price_text(item.name)
+            )
+        price_tiers = tuple(
+            PriceTier(cash, cashless, len(identities))
+            for (cash, cashless), identities in sorted(tiers.items())
+        )
+        if not price_tiers:
             continue
+        details = GroupDetails(group, price_tiers, len(matching))
         results.append(InlineQueryResultArticle(
             id=f"price-group-{group.callback_id}",
             title=f"💰 {group.display_name}",

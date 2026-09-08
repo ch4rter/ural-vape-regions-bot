@@ -30,14 +30,20 @@ class FakeInventoryClient:
         ]
 
     def assortment(self):
+        prices = [
+            {"priceType": {"name": "от 50т.р. нал"}, "value": 22500},
+            {"priceType": {"name": "от 50т.р. безнал"}, "value": 23500},
+        ]
         return [
             {
                 "name": "Картридж XROS 0.6 2 мл", "code": "001",
                 "meta": {"href": "https://api.moysklad.ru/entity/product/a"},
+                "salePrices": prices,
             },
             {
                 "name": "Картридж XROS 0.8 2 мл", "code": "002",
                 "meta": {"href": "https://api.moysklad.ru/entity/product/b"},
+                "salePrices": prices,
             },
         ]
 
@@ -78,7 +84,18 @@ def test_daily_reference_can_be_reused_without_assortment_requests(tmp_path):
     restored = load_inventory_reference(path)
     assert restored is not None
     assert restored.built_on == "2026-09-08"
+    assert restored.items_by_assortment["a"].warehouse_prices["common"] == (
+        Decimal("225"), Decimal("235")
+    )
     client.stores = lambda: (_ for _ in ()).throw(AssertionError("stores reread"))
     client.assortment = lambda: (_ for _ in ()).throw(AssertionError("assortment reread"))
     snapshot = build_inventory_snapshot(client, catalog, restored)
     assert snapshot.groups[0].total == Decimal("27")
+
+
+def test_assortment_words_depend_on_category():
+    from inventory_inline import assortment_count
+
+    assert assortment_count(12, "Жидкости") == "12 вкусов"
+    assert assortment_count(3, "Электронные системы") == "3 цвета"
+    assert assortment_count(2, "Картриджи") == "2 варианта"
