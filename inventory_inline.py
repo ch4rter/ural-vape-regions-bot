@@ -266,37 +266,58 @@ def _quantity(value: Decimal) -> str:
     return f"{value:,.3f}".rstrip("0").rstrip(".").replace(",", " ")
 
 
+def _variants(value: int) -> str:
+    remainder_100 = value % 100
+    remainder_10 = value % 10
+    if 11 <= remainder_100 <= 14:
+        word = "вариантов"
+    elif remainder_10 == 1:
+        word = "вариант"
+    elif 2 <= remainder_10 <= 4:
+        word = "варианта"
+    else:
+        word = "вариантов"
+    return f"{value} {word}"
+
+
 def inventory_item_text(item: InventoryItem, updated_at: str) -> str:
     lines = [
-        f"📦 <b>{html.escape(item.name)}</b>",
+        "📦 <b>Остатки товара</b>",
+        "",
+        f"<b>{html.escape(item.name)}</b>",
         f"<i>{html.escape(item.group_name)}</i>",
         "",
-        f"<b>Всего доступно: {_quantity(item.total)} шт.</b>",
+        f"<blockquote><b>{_quantity(item.total)} шт.</b> доступно на трёх складах</blockquote>",
         "",
+        "🏙 <b>По городам</b>",
     ]
     lines.extend(
-        f"{html.escape(STORE_LABELS[name])} — <b>{_quantity(quantity)} шт.</b>"
+        f"• {html.escape(STORE_LABELS[name])} — <b>{_quantity(quantity)} шт.</b>"
         for name, quantity in zip(DEFAULT_STORES, item.quantities)
     )
-    lines.extend(("", f"Обновлено · {html.escape(updated_at)}"))
+    lines.extend(("", f"<blockquote>🕒 Актуально на {html.escape(updated_at)}</blockquote>"))
     return "\n".join(lines)
 
 
 def inventory_group_text(group: InventoryGroup, updated_at: str) -> str:
     lines = [
-        f"📦 <b>{html.escape(group.name)}</b>",
+        "📦 <b>Остатки товарной группы</b>",
+        "",
+        f"<b>{html.escape(group.name)}</b>",
         f"<i>{html.escape(group.category_name)}</i>",
         "",
-        f"<b>Всего доступно: {_quantity(group.total)} шт.</b>",
-        f"Уникальных вариантов: <b>{len(group.items)}</b>",
+        "<blockquote>"
+        f"<b>{_quantity(group.total)} шт.</b> всего\n"
+        f"<b>{_variants(len(group.items))}</b> в наличии"
+        "</blockquote>",
         "",
-        "<b>По складам:</b>",
+        "🏙 <b>По городам</b>",
     ]
     for index, name in enumerate(DEFAULT_STORES):
         lines.append(
-            f"{html.escape(STORE_LABELS[name])} — "
+            f"• {html.escape(STORE_LABELS[name])} — "
             f"<b>{_quantity(group.quantities[index])} шт.</b> · "
-            f"{group.variants_by_store[index]} вариантов"
+            f"{_variants(group.variants_by_store[index])}"
         )
-    lines.extend(("", f"Обновлено · {html.escape(updated_at)}"))
+    lines.extend(("", f"<blockquote>🕒 Актуально на {html.escape(updated_at)}</blockquote>"))
     return "\n".join(lines)
