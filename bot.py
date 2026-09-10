@@ -780,7 +780,8 @@ async def answer_inventory_inline(inline_query: InlineQuery, query: str) -> None
     mapped_groups = set(rules)
     excluded_groups = {key for key, rule in rules.items() if rule.excluded}
     for group in groups:
-        if rule_key(group.name, group.category_name) in mapped_groups:
+        group_keys = {rule_key(group.name, group.category_name, group.folder_path, group.folder_id), rule_key(group.name, group.category_name)}
+        if group_keys & mapped_groups:
             continue
         quantities = " · ".join(
             f"{label}: {quantity:g}"
@@ -796,7 +797,8 @@ async def answer_inventory_inline(inline_query: InlineQuery, query: str) -> None
             ),
         ))
     for item in items:
-        if rule_key(item.group_name, item.category_name) in excluded_groups:
+        item_keys = {rule_key(item.group_name, item.category_name, item.folder_path, item.folder_id), rule_key(item.group_name, item.category_name)}
+        if item_keys & excluded_groups:
             continue
         item_id = secrets.token_hex(4) + str(abs(hash(item.key)) % 10_000_000)
         quantities = " · ".join(

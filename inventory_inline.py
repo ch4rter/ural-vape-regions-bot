@@ -35,6 +35,8 @@ class InventoryItem:
     group_name: str
     category_name: str
     quantities: tuple[Decimal, ...]
+    folder_path: str = ""
+    folder_id: str = ""
 
     @property
     def total(self) -> Decimal:
@@ -47,6 +49,8 @@ class InventoryGroup:
     name: str
     category_name: str
     items: tuple[InventoryItem, ...]
+    folder_path: str = ""
+    folder_id: str = ""
 
     @property
     def quantities(self) -> tuple[Decimal, ...]:
@@ -123,6 +127,10 @@ def _api_group(assortment: dict) -> tuple[str, str]:
     return parts[-1], parts[-2] if len(parts) > 1 else "Номенклатура"
 
 
+def _folder_id(assortment: dict) -> str:
+    return _canonical_href(str((assortment.get("productFolder") or {}).get("meta", {}).get("href", ""))).rsplit("/", 1)[-1]
+
+
 def build_inventory_reference(
     client: MoySkladClient,
     catalog: list[ItemSummary],
@@ -160,6 +168,8 @@ def build_inventory_reference(
             candidates = catalog_by_name.get(normalize_price_text(str(assortment.get("name") or "")), [])
             local = candidates[0] if len(candidates) == 1 else None
         api_group, api_category = _api_group(assortment)
+        folder_path = str(assortment.get("pathName") or "").strip(" /")
+        folder_id = _folder_id(assortment)
         name = str(assortment.get("name") or "").strip()
         if not name:
             continue
@@ -171,7 +181,7 @@ def build_inventory_reference(
             local.name if local else name,
             api_group if api_group != "Без группы" else (local.group_name if local else api_group),
             api_category if api_group != "Без группы" else (local.category_name if local else api_category),
-            api_prices, local.code if local else code,
+            api_prices, local.code if local else code, folder_path, folder_id,
         )
     return InventoryReference(
         built_on or date.today().isoformat(), inventory_catalog_signature(catalog),
@@ -182,7 +192,7 @@ def build_inventory_reference(
 def save_inventory_reference(path, reference: InventoryReference) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "version": 3,
+        "version": 4,
         "built_on": reference.built_on,
         "catalog_signature": reference.catalog_signature,
         "store_ids": list(reference.store_ids),
@@ -192,6 +202,8 @@ def save_inventory_reference(path, reference: InventoryReference) -> None:
                 "group_name": item.group_name,
                 "category_name": item.category_name,
                 "code": item.code,
+                "folder_path": item.folder_path,
+                "folder_id": item.folder_id,
                 "cash": str(item.warehouse_prices["common"][0]) if "common" in item.warehouse_prices else None,
                 "cashless": str(item.warehouse_prices["common"][1]) if "common" in item.warehouse_prices else None,
             }
@@ -208,14 +220,14 @@ def load_inventory_reference(path) -> InventoryReference | None:
         return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        if payload.get("version") != 3:
+        if payload.get("version") != 4:
             return None
         items = {
             identifier: ItemSummary(
                 0, value["name"], value["group_name"], value["category_name"],
                 {"common": (Decimal(value["cash"]), Decimal(value["cashless"]))}
                 if value.get("cash") is not None and value.get("cashless") is not None else {},
-                value.get("code", ""),
+                value.get("code", ""), value.get("folder_path", ""), value.get("folder_id", ""),
             )
             for identifier, value in payload["items"].items()
         }
@@ -256,21 +268,22 @@ def build_inventory_snapshot(
         if existing:
             balances = tuple(existing.quantities[index] + balances[index] for index in range(len(store_ids)))
         matched[key] = InventoryItem(
-            key, local.name, local.group_name, local.category_name, balances
+            key, local.name, local.group_name, local.category_name, balances,
+            local.folder_path, local.folder_id,
         )
 
     items = tuple(sorted(matched.values(), key=lambda item: normalize_price_text(item.name)))
-    grouped: dict[tuple[str, str], list[InventoryItem]] = {}
+    grouped: dict[tuple[str, str, str, str], list[InventoryItem]] = {}
     for item in items:
-        grouped.setdefault((item.group_name, item.category_name), []).append(item)
+        grouped.setdefault((item.group_name, item.category_name, item.folder_path, item.folder_id), []).append(item)
     groups = tuple(
         InventoryGroup(
-            hashlib.sha256(f"{category}|{name}".encode()).hexdigest()[:16],
+            hashlib.sha256(f"{category}|{name}|{path}|{folder_id}".encode()).hexdigest()[:16],
             name,
             category,
-            tuple(values),
+            tuple(values), path, folder_id,
         )
-        for (name, category), values in sorted(
+        for (name, category, path, folder_id), values in sorted(
             grouped.items(), key=lambda value: normalize_price_text(value[0][0])
         )
     )
@@ -281,7 +294,9 @@ def inventory_cards(snapshot: InventorySnapshot, rules: dict[str, InventoryGroup
     cards: dict[str, dict[str, list[InventoryItem]]] = {}
     meta = {}
     for group in snapshot.groups:
-        rule = rules.get(rule_key(group.name, group.category_name))
+        rule = rules.get(rule_key(group.name, group.category_name, group.folder_path, group.folder_id))
+        if rule is None:
+            rule = rules.get(rule_key(group.name, group.category_name))
         if not rule or rule.excluded: continue
         line_key = normalize_price_text(rule.line_name)
         cards.setdefault(rule.card_name, {}).setdefault(line_key, []).extend(group.items)

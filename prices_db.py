@@ -195,6 +195,8 @@ class ItemSummary:
     category_name: str
     warehouse_prices: dict[str, tuple[Decimal, Decimal]]
     code: str = ""
+    folder_path: str = ""
+    folder_id: str = ""
 
 
 def price_header_indexes(headers: list[str]) -> tuple[int, int, int] | None:

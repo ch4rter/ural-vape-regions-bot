@@ -20,9 +20,13 @@ class InventoryGroupingRule:
     kind: str
     unit: str
     excluded: bool = False
+    source_path: str = ""
+    source_folder_id: str = ""
 
 
-def rule_key(group: str, category: str) -> str:
+def rule_key(group: str, category: str, path: str = "", folder_id: str = "") -> str:
+    if folder_id: return "id:" + folder_id.strip().casefold()
+    if path: return "path:" + normalize_price_text(path)
     return normalize_price_text(group) + "|" + normalize_price_text(category)
 
 
@@ -33,23 +37,26 @@ def load_grouping(path: Path) -> dict[str, InventoryGroupingRule]:
     result = {}
     for value in data.get("rules", []):
         rule = InventoryGroupingRule(**value)
-        result[rule_key(rule.source_group, rule.source_category)] = rule
+        result[rule_key(rule.source_group, rule.source_category, rule.source_path, rule.source_folder_id)] = rule
     return result
 
 
 def export_grouping(path: Path, catalog: list[ItemSummary], current: dict[str, InventoryGroupingRule]) -> int:
-    groups = sorted({(x.group_name, x.category_name) for x in catalog}, key=lambda x: normalize_price_text(x[0]))
+    groups = {}
+    for item in catalog:
+        key = rule_key(item.group_name, item.category_name, item.folder_path, item.folder_id)
+        groups.setdefault(key, [item.group_name, item.category_name, item.folder_path, item.folder_id, []])[4].append(item.name)
     wb = Workbook(); ws = wb.active; ws.title = "Правила"
-    ws.append(["Текущая группа", "Категория", "Не учитывать", "Общая карточка", "Название линейки", "Тип ассортимента", "Единица"])
-    for group, category in groups:
-        old = current.get(rule_key(group, category))
-        ws.append([group, category, "Да" if old and old.excluded else "Нет", old.card_name if old else "", old.line_name if old else group,
+    ws.append(["Полный путь папки", "ID папки", "Текущая группа", "Категория", "Позиций", "Примеры товаров", "Не учитывать", "Общая карточка", "Название линейки", "Тип ассортимента", "Единица"])
+    for key, (group, category, path_value, folder_id, names) in sorted(groups.items(), key=lambda x: normalize_price_text(x[1][2] or x[1][0])):
+        old = current.get(key) or current.get(rule_key(group, category))
+        ws.append([path_value, folder_id, group, category, len(names), "; ".join(names[:3]), "Да" if old and old.excluded else "Нет", old.card_name if old else "", old.line_name if old else group,
                    old.kind if old else category, old.unit if old else "шт."])
     for c in ws[1]:
         c.font = Font(bold=True, color="FFFFFF"); c.fill = PatternFill("solid", fgColor="374151")
         c.alignment = Alignment(horizontal="center")
     ws.freeze_panes = "A2"; ws.auto_filter.ref = ws.dimensions
-    for col, width in zip("ABCDEFG", (38, 28, 16, 32, 42, 24, 16)): ws.column_dimensions[col].width = width
+    for col, width in zip("ABCDEFGHIJK", (60, 38, 38, 28, 12, 65, 16, 32, 42, 24, 16)): ws.column_dimensions[col].width = width
     guide = wb.create_sheet("Инструкция")
     guide.append(["Заполняйте «Общая карточка» только у групп, которые нужно объединить."])
     guide.append(["Одинаковая общая карточка собирает несколько линеек в один inline-результат."])
@@ -75,7 +82,9 @@ def save_grouping(source: Path, destination: Path) -> int:
         if not card and not excluded: continue
         rule = InventoryGroupingRule(get("текущая группа"), get("категория"), card,
             get("название линейки") or get("текущая группа"), get("тип ассортимента") or get("категория"),
-            get("единица") or "шт.", excluded)
+            get("единица") or "шт.", excluded,
+            get("полный путь папки") if "полный путь папки" in headers else "",
+            get("id папки") if "id папки" in headers else "")
         if not rule.source_group: raise ValueError("Обнаружена строка без текущей группы.")
         rules.append(rule)
     wb.close()

@@ -47,7 +47,7 @@ def test_excluded_group_is_saved_without_card(tmp_path):
     source = tmp_path / "rules.xlsx"
     export_grouping(source, [ItemSummary(1, "Товар", "Служебная", "Прочее", {}, "1")], {})
     workbook = load_workbook(source)
-    workbook["Правила"]["C2"] = "Да"
+    workbook["Правила"]["G2"] = "Да"
     workbook.save(source)
     target = tmp_path / "rules.json"
     assert save_grouping(source, target) == 1
