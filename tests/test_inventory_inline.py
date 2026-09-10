@@ -99,3 +99,23 @@ def test_assortment_words_depend_on_category():
     assert assortment_count(12, "Жидкости") == "12 вкусов"
     assert assortment_count(3, "Электронные системы") == "3 цвета"
     assert assortment_count(2, "Картриджи") == "2 варианта"
+
+
+def test_reference_includes_zero_stock_items_missing_from_price_catalog():
+    client = FakeInventoryClient()
+    rows = client.assortment()
+    rows.append({
+        "name": "OGGO VLIQ ICE Арбуз 20 мг", "code": "zero",
+        "pathName": "Жидкости/OGGO VLIQ ICE 20 мг",
+        "meta": {"href": "https://api.moysklad.ru/entity/product/zero"},
+        "salePrices": [],
+    })
+    client.assortment = lambda: rows
+    reference = build_inventory_reference(client, [], built_on="2026-09-10")
+    item = reference.items_by_assortment["zero"]
+    assert item.group_name == "OGGO VLIQ ICE 20 мг"
+    assert item.category_name == "Жидкости"
+    snapshot = build_inventory_snapshot(client, [], reference)
+    group = next(value for value in snapshot.groups if value.name == "OGGO VLIQ ICE 20 мг")
+    assert len(group.items) == 1
+    assert group.total == 0

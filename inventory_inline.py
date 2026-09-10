@@ -111,6 +111,13 @@ def _assortment_id(item: dict) -> str:
     return _canonical_href(str(item.get("meta", {}).get("href", ""))).rsplit("/", 1)[-1]
 
 
+def _api_group(assortment: dict) -> tuple[str, str]:
+    parts = [value.strip() for value in str(assortment.get("pathName") or "").split("/") if value.strip()]
+    if not parts:
+        return "Без группы", "Номенклатура"
+    return parts[-1], parts[-2] if len(parts) > 1 else "Номенклатура"
+
+
 def build_inventory_reference(
     client: MoySkladClient,
     catalog: list[ItemSummary],
@@ -137,6 +144,8 @@ def build_inventory_reference(
     )
     items_by_assortment = {}
     for assortment in assortment_rows:
+        if assortment.get("archived") is True:
+            continue
         identifier = _assortment_id(assortment)
         if not identifier:
             continue
@@ -145,14 +154,19 @@ def build_inventory_reference(
         if local is None:
             candidates = catalog_by_name.get(normalize_price_text(str(assortment.get("name") or "")), [])
             local = candidates[0] if len(candidates) == 1 else None
-        if local is None:
+        api_group, api_category = _api_group(assortment)
+        name = str(assortment.get("name") or "").strip()
+        if not name:
             continue
         cash = _sale_price(assortment, cash_name)
         cashless = _sale_price(assortment, cashless_name)
         api_prices = {"common": (cash, cashless)} if cash is not None and cashless is not None else {}
         items_by_assortment[identifier] = ItemSummary(
-            local.callback_id, local.name, local.group_name, local.category_name,
-            api_prices, local.code,
+            local.callback_id if local else 0,
+            local.name if local else name,
+            api_group if api_group != "Без группы" else (local.group_name if local else api_group),
+            api_category if api_group != "Без группы" else (local.category_name if local else api_category),
+            api_prices, local.code if local else code,
         )
     return InventoryReference(
         built_on or date.today().isoformat(), inventory_catalog_signature(catalog),
@@ -163,7 +177,7 @@ def build_inventory_reference(
 def save_inventory_reference(path, reference: InventoryReference) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "version": 2,
+        "version": 3,
         "built_on": reference.built_on,
         "catalog_signature": reference.catalog_signature,
         "store_ids": list(reference.store_ids),
@@ -189,7 +203,7 @@ def load_inventory_reference(path) -> InventoryReference | None:
         return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        if payload.get("version") != 2:
+        if payload.get("version") != 3:
             return None
         items = {
             identifier: ItemSummary(

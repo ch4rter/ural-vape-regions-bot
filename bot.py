@@ -6717,7 +6717,13 @@ async def inventory_grouping_export(callback: CallbackQuery) -> None:
     await callback.answer("Готовлю таблицу…")
     with tempfile.TemporaryDirectory() as temporary:
         path = Path(temporary) / "Группировка inline-остатков.xlsx"
-        count = await asyncio.to_thread(export_grouping, path, prices_db.item_summaries(), load_grouping(inline_inventory_grouping_path))
+        try:
+            reference = await ensure_inline_inventory_reference(prices_db.item_summaries())
+        except Exception as error:
+            await callback.message.answer("❌ Не удалось получить полную номенклатуру:\n\n" + html.escape(str(error)))
+            return
+        complete_catalog = list(reference.items_by_assortment.values())
+        count = await asyncio.to_thread(export_grouping, path, complete_catalog, load_grouping(inline_inventory_grouping_path))
         await callback.message.answer_document(FSInputFile(path, filename=path.name), caption=f"📦 Товарных групп: <b>{count}</b>. Заполняйте только группы, которые нужно объединить.")
 
 
