@@ -79,6 +79,11 @@ class InventoryLine:
     kind: str
     unit: str
     items: tuple[InventoryItem, ...]
+    card_name: str = ""
+
+    @property
+    def key(self) -> str:
+        return hashlib.sha256(f"{self.card_name}|{self.name}".encode()).hexdigest()[:16]
 
 
 @dataclass(frozen=True)
@@ -278,11 +283,13 @@ def inventory_cards(snapshot: InventorySnapshot, rules: dict[str, InventoryGroup
     for group in snapshot.groups:
         rule = rules.get(rule_key(group.name, group.category_name))
         if not rule or rule.excluded: continue
-        cards.setdefault(rule.card_name, {}).setdefault(rule.line_name, []).extend(group.items)
-        meta[(rule.card_name, rule.line_name)] = rule
+        line_key = normalize_price_text(rule.line_name)
+        cards.setdefault(rule.card_name, {}).setdefault(line_key, []).extend(group.items)
+        meta.setdefault((rule.card_name, line_key), rule)
     result = []
     for card, lines in cards.items():
-        values = tuple(InventoryLine(name, meta[(card, name)].kind, meta[(card, name)].unit, tuple(items)) for name, items in lines.items())
+        values = tuple(InventoryLine(meta[(card, key)].line_name, meta[(card, key)].kind,
+            meta[(card, key)].unit, tuple(items), card) for key, items in lines.items())
         result.append(InventoryCard(hashlib.sha256(card.encode()).hexdigest()[:16], card, values))
     return tuple(sorted(result, key=lambda x: normalize_price_text(x.name)))
 
@@ -293,6 +300,15 @@ def search_inventory_cards(cards: tuple[InventoryCard, ...], query: str, limit: 
         score = _score(query, card.name + " " + " ".join(line.name for line in card.lines))
         if score is not None: found.append((score, card))
     return [x for _, x in sorted(found, key=lambda x: x[0], reverse=True)[:limit]]
+
+
+def search_inventory_lines(cards: tuple[InventoryCard, ...], query: str, limit: int = 12) -> list[InventoryLine]:
+    found = []
+    for card in cards:
+        for line in card.lines:
+            score = _score(query, f"{card.name} {line.name} " + " ".join(item.name for item in line.items))
+            if score is not None: found.append((score, line))
+    return [line for _, line in sorted(found, key=lambda value: value[0], reverse=True)[:limit]]
 
 
 def _score(query: str, value: str) -> float | None:
@@ -422,3 +438,8 @@ def inventory_card_text(card: InventoryCard, updated_at: str) -> str:
             lines.append(f"• {STORE_LABELS[store]} — <b>{_quantity(quantity)} {html.escape(line.unit)}</b> · {available}/{total_variants} {noun}")
     lines.extend(("", f"<blockquote>🕒 Актуально на {html.escape(updated_at)}</blockquote>"))
     return "\n".join(lines)
+
+
+def inventory_line_text(line: InventoryLine, updated_at: str) -> str:
+    card = InventoryCard(line.key, line.card_name, (line,))
+    return inventory_card_text(card, updated_at)

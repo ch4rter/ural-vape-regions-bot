@@ -97,11 +97,13 @@ from inventory_inline import (
     inventory_group_text,
     inventory_item_text,
     inventory_card_text,
+    inventory_line_text,
     inventory_cards,
     load_inventory_reference,
     save_inventory_reference,
     search_inventory,
     search_inventory_cards,
+    search_inventory_lines,
 )
 from inventory_grouping import export_grouping, load_grouping, rule_key, save_grouping
 from prices_db import (
@@ -754,7 +756,9 @@ async def answer_inventory_inline(inline_query: InlineQuery, query: str) -> None
         return
     groups, items = search_inventory(snapshot, query)
     rules = await asyncio.to_thread(load_grouping, inline_inventory_grouping_path)
-    cards = search_inventory_cards(inventory_cards(snapshot, rules), query)
+    all_cards = inventory_cards(snapshot, rules)
+    cards = search_inventory_cards(all_cards, query)
+    lines = search_inventory_lines(all_cards, query)
     updated = (inline_inventory_updated_at or datetime.now()).strftime("%d.%m.%Y %H:%M")
     results = []
     for card in cards:
@@ -765,7 +769,16 @@ async def answer_inventory_inline(inline_query: InlineQuery, query: str) -> None
                 message_text=inventory_card_text(card, updated), parse_mode=ParseMode.HTML,
             ),
         ))
+    for line in lines:
+        results.append(InlineQueryResultArticle(
+            id=f"stock-line-{line.key}", title=f"▫️ {line.name}",
+            description=f"{line.card_name} · остатки и ассортимент по складам",
+            input_message_content=InputTextMessageContent(
+                message_text=inventory_line_text(line, updated), parse_mode=ParseMode.HTML,
+            ),
+        ))
     mapped_groups = set(rules)
+    excluded_groups = {key for key, rule in rules.items() if rule.excluded}
     for group in groups:
         if rule_key(group.name, group.category_name) in mapped_groups:
             continue
@@ -783,7 +796,7 @@ async def answer_inventory_inline(inline_query: InlineQuery, query: str) -> None
             ),
         ))
     for item in items:
-        if rule_key(item.group_name, item.category_name) in mapped_groups:
+        if rule_key(item.group_name, item.category_name) in excluded_groups:
             continue
         item_id = secrets.token_hex(4) + str(abs(hash(item.key)) % 10_000_000)
         quantities = " · ".join(

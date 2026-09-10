@@ -1,7 +1,8 @@
 from decimal import Decimal
 
 from inventory_grouping import InventoryGroupingRule, export_grouping, load_grouping, rule_key, save_grouping
-from inventory_inline import InventoryGroup, InventoryItem, InventorySnapshot, inventory_card_text, inventory_cards
+from inventory_inline import (InventoryGroup, InventoryItem, InventorySnapshot,
+    inventory_card_text, inventory_cards, search_inventory_lines)
 
 
 def test_grouping_roundtrip_and_card_counts(tmp_path):
@@ -21,6 +22,23 @@ def test_grouping_roundtrip_and_card_counts(tmp_path):
     text = inventory_card_text(card, "10.09.2026 12:00")
     assert "10 флаконов" in text
     assert "1/2 вкуса" in text
+    assert search_inventory_lines((card,), "OGGO 20 мг")[0].name == "OGGO VLIQ ICE 20 мг"
+
+
+def test_duplicate_technical_groups_merge_into_one_line():
+    first = InventoryItem("1", "Манго", "OGGO X Dojo 10000", "OGGO", (Decimal(1), Decimal(0), Decimal(0)))
+    second = InventoryItem("2", "Арбуз", "OGGO x Dojo 10000", "OGGO", (Decimal(0), Decimal(1), Decimal(0)))
+    snapshot = InventorySnapshot((first, second), (
+        InventoryGroup("1", first.group_name, first.category_name, (first,)),
+        InventoryGroup("2", second.group_name, second.category_name, (second,)),
+    ))
+    rules = {
+        rule_key(first.group_name, first.category_name): InventoryGroupingRule(first.group_name, "OGGO", "OGGO x DOJO", "OGGO x DOJO 10000", "Одноразки", "шт."),
+        rule_key(second.group_name, second.category_name): InventoryGroupingRule(second.group_name, "OGGO", "OGGO x DOJO", "oggo X dojo 10000", "Одноразки", "шт."),
+    }
+    card = inventory_cards(snapshot, rules)[0]
+    assert len(card.lines) == 1
+    assert len(card.lines[0].items) == 2
 
 
 def test_excluded_group_is_saved_without_card(tmp_path):
