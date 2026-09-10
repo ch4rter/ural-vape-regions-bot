@@ -81,6 +81,7 @@ def test_shmidt_template_and_accountant_message(tmp_path):
     assert "326200000045173" in text
     assert "Сафин Рафис Рауфович" in text
     assert "ТИАН ТРЕЙД" not in text
+    assert "?" not in text
     assert "{{" not in text
     assert "От Шмидта" in accountant_message(values)
 

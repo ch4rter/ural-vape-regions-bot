@@ -96,10 +96,14 @@ from inventory_inline import (
     assortment_count,
     inventory_group_text,
     inventory_item_text,
+    inventory_card_text,
+    inventory_cards,
     load_inventory_reference,
     save_inventory_reference,
     search_inventory,
+    search_inventory_cards,
 )
+from inventory_grouping import export_grouping, load_grouping, save_grouping
 from prices_db import (
     PRICE_SOURCE,
     WAREHOUSES,
@@ -168,6 +172,7 @@ inline_inventory_reference: InventoryReference | None = None
 inline_inventory_updated_at: datetime | None = None
 inline_inventory_refresh_task: asyncio.Task | None = None
 inline_inventory_reference_path = BASE_DIR / "data" / "inline_inventory_reference.json"
+inline_inventory_grouping_path = BASE_DIR / "data" / "inline_inventory_grouping.json"
 inline_inventory_query_sequence = 0
 inline_inventory_user_queries: dict[int, int] = {}
 inline_inventory_reference_lock = asyncio.Lock()
@@ -276,6 +281,7 @@ class AdminState(StatesGroup):
     bonus_classification_upload = State()
     order_split_upload = State()
     sales_goal_amount = State()
+    inventory_grouping_upload = State()
 
 
 class BroadcastState(StatesGroup):
@@ -747,9 +753,22 @@ async def answer_inventory_inline(inline_query: InlineQuery, query: str) -> None
         await inline_query.answer([], cache_time=1, is_personal=True)
         return
     groups, items = search_inventory(snapshot, query)
+    rules = await asyncio.to_thread(load_grouping, inline_inventory_grouping_path)
+    cards = search_inventory_cards(inventory_cards(snapshot, rules), query)
     updated = (inline_inventory_updated_at or datetime.now()).strftime("%d.%m.%Y %H:%M")
     results = []
+    for card in cards:
+        results.append(InlineQueryResultArticle(
+            id=f"stock-card-{card.key}", title=f"📦 {card.name}",
+            description=f"Линеек: {len(card.lines)} · остатки и ассортимент по складам",
+            input_message_content=InputTextMessageContent(
+                message_text=inventory_card_text(card, updated), parse_mode=ParseMode.HTML,
+            ),
+        ))
+    mapped_groups = {normalize_price_text(rule.source_group) for rule in rules.values()}
     for group in groups:
+        if normalize_price_text(group.name) in mapped_groups:
+            continue
         quantities = " · ".join(
             f"{label}: {quantity:g}"
             for label, quantity in zip(("Москва", "СПб", "Урал"), group.quantities)
@@ -4569,6 +4588,7 @@ def products_keyboard(
             admin_buttons.append(InlineKeyboardButton(text="📈 Премиальный отчёт", callback_data="bonus:menu"))
         if actor_id is None or is_admin(actor_id):
             admin_buttons.append(InlineKeyboardButton(text="🎯 Цели продаж", callback_data="adm:sales_goals"))
+            admin_buttons.append(InlineKeyboardButton(text="📦 Группировка остатков", callback_data="adm:inventory_grouping"))
         rows.extend(button_grid(admin_buttons))
         if actor_id is None or is_admin(actor_id):
             rows.append([InlineKeyboardButton(text="💾 Скачать резервную копию", callback_data="adm:backup")])
@@ -6670,6 +6690,59 @@ async def manage_access_user(callback: CallbackQuery, state: FSMContext) -> None
         ]),
     )
     await callback.answer()
+
+
+def inventory_grouping_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬇️ Скачать таблицу правил", callback_data="adm:inventory_grouping_export")],
+        [InlineKeyboardButton(text="⬆️ Загрузить таблицу правил", callback_data="adm:inventory_grouping_upload")],
+        compact_nav("main:admin"),
+    ])
+
+
+@router.callback_query(F.data == "adm:inventory_grouping")
+async def inventory_grouping_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin(callback): return
+    await state.clear(); rules = load_grouping(inline_inventory_grouping_path)
+    await edit_or_answer(callback.message,
+        "📦 <b>Группировка inline-остатков</b>\n\n"
+        f"Активных правил: <b>{len(rules)}</b>. Скачайте таблицу, объедините технические группы "
+        "в коммерческие карточки и загрузите файл обратно.", inventory_grouping_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adm:inventory_grouping_export")
+async def inventory_grouping_export(callback: CallbackQuery) -> None:
+    if not await require_admin(callback): return
+    await callback.answer("Готовлю таблицу…")
+    with tempfile.TemporaryDirectory() as temporary:
+        path = Path(temporary) / "Группировка inline-остатков.xlsx"
+        count = await asyncio.to_thread(export_grouping, path, prices_db.item_summaries(), load_grouping(inline_inventory_grouping_path))
+        await callback.message.answer_document(FSInputFile(path, filename=path.name), caption=f"📦 Товарных групп: <b>{count}</b>. Заполняйте только группы, которые нужно объединить.")
+
+
+@router.callback_query(F.data == "adm:inventory_grouping_upload")
+async def inventory_grouping_upload_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin(callback): return
+    await state.set_state(AdminState.inventory_grouping_upload)
+    await edit_or_answer(callback.message, "⬆️ <b>Загрузка правил</b>\n\nПришлите заполненный Excel-файл.",
+        InlineKeyboardMarkup(inline_keyboard=[compact_nav("adm:inventory_grouping")]))
+    await callback.answer()
+
+
+@router.message(AdminState.inventory_grouping_upload)
+async def inventory_grouping_upload_receive(message: Message, state: FSMContext, bot: Bot) -> None:
+    if not is_admin(message.from_user.id) or message.chat.type != "private": return
+    if not message.document or not (message.document.file_name or "").lower().endswith(".xlsx"):
+        await message.answer("Пришлите таблицу в формате <code>.xlsx</code>."); return
+    with tempfile.TemporaryDirectory() as temporary:
+        source = Path(temporary) / "grouping.xlsx"
+        await bot.download(message.document.file_id, destination=source)
+        try: count = await asyncio.to_thread(save_grouping, source, inline_inventory_grouping_path)
+        except Exception as error:
+            await message.answer("❌ Таблица не прошла проверку:\n\n" + html.escape(str(error))); return
+    await state.clear()
+    await message.answer(f"✅ <b>Правила сохранены</b>\n\nОбъединено технических групп: <b>{count}</b>.", reply_markup=inventory_grouping_keyboard())
 
 
 @router.callback_query(F.data.startswith("adm:access_channel:"))

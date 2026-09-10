@@ -71,6 +71,14 @@ def test_select_print_template_requires_unambiguous_match():
     assert select_print_template(templates, "несуществующая") is None
 
 
+def test_select_print_template_falls_back_to_standard_customer_order():
+    templates = [{
+        "name": "Заказ покупателя",
+        "meta": {"href": "https://api.moysklad.ru/api/remap/1.2/entity/customerorder/metadata/embeddedtemplate/1"},
+    }]
+    assert select_print_template(templates, "Накладная") == templates[0]
+
+
 def test_search_customer_orders_accepts_incomplete_and_mistyped_name():
     client = FuzzyFakeClient()
     rows = search_customer_orders(client, "vepe zone")

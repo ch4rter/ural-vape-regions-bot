@@ -141,7 +141,18 @@ def select_print_template(templates: list[dict], configured_name: str = "Нак�
     if exact:
         return exact[0]
     partial = [value for name, value in named if needle and needle in name.casefold()]
-    return partial[0] if len(partial) == 1 else None
+    if len(partial) == 1:
+        return partial[0]
+    # A fresh MoySklad account often has only the standard customer-order form.
+    # It is the safe built-in equivalent when no custom "Накладная" exists.
+    if needle == "накладная":
+        order_forms = [
+            value for name, value in named
+            if name.casefold() in {"заказ покупателя", "заказ покупателя (счет)"}
+        ]
+        if order_forms:
+            return order_forms[0]
+    return None
 
 
 def rubles(value: Decimal) -> str:

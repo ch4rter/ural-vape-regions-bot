@@ -18,6 +18,7 @@ from moysklad_price import (
     _sale_price,
 )
 from prices_db import ItemSummary, normalize_price_text
+from inventory_grouping import InventoryGroupingRule, rule_key
 
 
 STORE_LABELS = {
@@ -70,6 +71,21 @@ class InventoryGroup:
 class InventorySnapshot:
     items: tuple[InventoryItem, ...]
     groups: tuple[InventoryGroup, ...]
+
+
+@dataclass(frozen=True)
+class InventoryLine:
+    name: str
+    kind: str
+    unit: str
+    items: tuple[InventoryItem, ...]
+
+
+@dataclass(frozen=True)
+class InventoryCard:
+    key: str
+    name: str
+    lines: tuple[InventoryLine, ...]
 
 
 @dataclass(frozen=True)
@@ -214,11 +230,8 @@ def build_inventory_snapshot(
         positions[assortment_id][store_ids.index(store_id)] = quantity
 
     matched: dict[str, InventoryItem] = {}
-    for identifier, values in positions.items():
-        balances = tuple(values)
-        if sum(balances) <= 0:
-            continue
-        local = reference.items_by_assortment[identifier]
+    for identifier, local in reference.items_by_assortment.items():
+        balances = tuple(positions.get(identifier, [Decimal(0)] * len(store_ids)))
         key = local.code.strip().casefold() or normalize_price_text(local.name)
         existing = matched.get(key)
         if existing:
@@ -243,6 +256,29 @@ def build_inventory_snapshot(
         )
     )
     return InventorySnapshot(items, groups)
+
+
+def inventory_cards(snapshot: InventorySnapshot, rules: dict[str, InventoryGroupingRule]) -> tuple[InventoryCard, ...]:
+    cards: dict[str, dict[str, list[InventoryItem]]] = {}
+    meta = {}
+    for group in snapshot.groups:
+        rule = rules.get(rule_key(group.name, group.category_name))
+        if not rule: continue
+        cards.setdefault(rule.card_name, {}).setdefault(rule.line_name, []).extend(group.items)
+        meta[(rule.card_name, rule.line_name)] = rule
+    result = []
+    for card, lines in cards.items():
+        values = tuple(InventoryLine(name, meta[(card, name)].kind, meta[(card, name)].unit, tuple(items)) for name, items in lines.items())
+        result.append(InventoryCard(hashlib.sha256(card.encode()).hexdigest()[:16], card, values))
+    return tuple(sorted(result, key=lambda x: normalize_price_text(x.name)))
+
+
+def search_inventory_cards(cards: tuple[InventoryCard, ...], query: str, limit: int = 8) -> list[InventoryCard]:
+    found = []
+    for card in cards:
+        score = _score(query, card.name + " " + " ".join(line.name for line in card.lines))
+        if score is not None: found.append((score, card))
+    return [x for _, x in sorted(found, key=lambda x: x[0], reverse=True)[:limit]]
 
 
 def _score(query: str, value: str) -> float | None:
@@ -356,5 +392,19 @@ def inventory_group_text(group: InventoryGroup, updated_at: str) -> str:
             f"<b>{_quantity(group.quantities[index])} шт.</b> · "
             f"{assortment_count(group.variants_by_store[index], group.category_name)}"
         )
+    lines.extend(("", f"<blockquote>🕒 Актуально на {html.escape(updated_at)}</blockquote>"))
+    return "\n".join(lines)
+
+
+def inventory_card_text(card: InventoryCard, updated_at: str) -> str:
+    lines = ["📦 <b>Остатки по линейкам</b>", "", f"<b>{html.escape(card.name)}</b>"]
+    for line in card.lines:
+        lines.extend(("", f"<b>{html.escape(line.name)}</b>"))
+        total_variants = len(line.items)
+        for index, store in enumerate(DEFAULT_STORES):
+            quantity = sum((item.quantities[index] for item in line.items), Decimal(0))
+            available = sum(1 for item in line.items if item.quantities[index] > 0)
+            noun = assortment_count(total_variants, line.kind).split(" ", 1)[1]
+            lines.append(f"• {STORE_LABELS[store]} — <b>{_quantity(quantity)} {html.escape(line.unit)}</b> · {available}/{total_variants} {noun}")
     lines.extend(("", f"<blockquote>🕒 Актуально на {html.escape(updated_at)}</blockquote>"))
     return "\n".join(lines)

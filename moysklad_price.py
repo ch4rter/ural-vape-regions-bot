@@ -188,11 +188,10 @@ class MoySkladClient:
         return self._rows("entity/assortment")
 
     def customer_order_print_templates(self) -> list[dict]:
-        metadata = self._get_json(f"{API_ROOT}/entity/customerorder/metadata")
-        result = []
-        for key in ("printTemplates", "customTemplates"):
-            values = metadata.get(key, []) if isinstance(metadata, dict) else []
-            result.extend(value for value in values if isinstance(value, dict))
+        """Return embedded and custom print templates for customer orders."""
+        result: list[dict] = []
+        for kind in ("embeddedtemplate", "customtemplate"):
+            result.extend(self._rows(f"entity/customerorder/metadata/{kind}"))
         return result
 
     def export_customer_order_pdf_url(self, order_id: str, template: dict) -> str:
