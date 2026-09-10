@@ -277,7 +277,7 @@ def inventory_cards(snapshot: InventorySnapshot, rules: dict[str, InventoryGroup
     meta = {}
     for group in snapshot.groups:
         rule = rules.get(rule_key(group.name, group.category_name))
-        if not rule: continue
+        if not rule or rule.excluded: continue
         cards.setdefault(rule.card_name, {}).setdefault(rule.line_name, []).extend(group.items)
         meta[(rule.card_name, rule.line_name)] = rule
     result = []

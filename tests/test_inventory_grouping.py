@@ -21,3 +21,18 @@ def test_grouping_roundtrip_and_card_counts(tmp_path):
     text = inventory_card_text(card, "10.09.2026 12:00")
     assert "10 флаконов" in text
     assert "1/2 вкуса" in text
+
+
+def test_excluded_group_is_saved_without_card(tmp_path):
+    from openpyxl import load_workbook
+    from prices_db import ItemSummary
+    source = tmp_path / "rules.xlsx"
+    export_grouping(source, [ItemSummary(1, "Товар", "Служебная", "Прочее", {}, "1")], {})
+    workbook = load_workbook(source)
+    workbook["Правила"]["C2"] = "Да"
+    workbook.save(source)
+    target = tmp_path / "rules.json"
+    assert save_grouping(source, target) == 1
+    rule = next(iter(load_grouping(target).values()))
+    assert rule.excluded is True
+    assert rule.card_name == ""

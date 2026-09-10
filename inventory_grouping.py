@@ -19,6 +19,7 @@ class InventoryGroupingRule:
     line_name: str
     kind: str
     unit: str
+    excluded: bool = False
 
 
 def rule_key(group: str, category: str) -> str:
@@ -39,19 +40,20 @@ def load_grouping(path: Path) -> dict[str, InventoryGroupingRule]:
 def export_grouping(path: Path, catalog: list[ItemSummary], current: dict[str, InventoryGroupingRule]) -> int:
     groups = sorted({(x.group_name, x.category_name) for x in catalog}, key=lambda x: normalize_price_text(x[0]))
     wb = Workbook(); ws = wb.active; ws.title = "Правила"
-    ws.append(["Текущая группа", "Категория", "Общая карточка", "Название линейки", "Тип ассортимента", "Единица"])
+    ws.append(["Текущая группа", "Категория", "Не учитывать", "Общая карточка", "Название линейки", "Тип ассортимента", "Единица"])
     for group, category in groups:
         old = current.get(rule_key(group, category))
-        ws.append([group, category, old.card_name if old else "", old.line_name if old else group,
+        ws.append([group, category, "Да" if old and old.excluded else "Нет", old.card_name if old else "", old.line_name if old else group,
                    old.kind if old else category, old.unit if old else "шт."])
     for c in ws[1]:
         c.font = Font(bold=True, color="FFFFFF"); c.fill = PatternFill("solid", fgColor="374151")
         c.alignment = Alignment(horizontal="center")
     ws.freeze_panes = "A2"; ws.auto_filter.ref = ws.dimensions
-    for col, width in zip("ABCDEF", (38, 28, 32, 42, 24, 16)): ws.column_dimensions[col].width = width
+    for col, width in zip("ABCDEFG", (38, 28, 16, 32, 42, 24, 16)): ws.column_dimensions[col].width = width
     guide = wb.create_sheet("Инструкция")
     guide.append(["Заполняйте «Общая карточка» только у групп, которые нужно объединить."])
     guide.append(["Одинаковая общая карточка собирает несколько линеек в один inline-результат."])
+    guide.append(["Поставьте «Да» в колонке «Не учитывать», чтобы полностью скрыть группу из inline-остатков."])
     guide.append(["Тип: жидкости/конструкторы/одноразки → вкусы; устройства → цвета; остальное → варианты."])
     path.parent.mkdir(parents=True, exist_ok=True); wb.save(path); return len(groups)
 
@@ -66,10 +68,14 @@ def save_grouping(source: Path, destination: Path) -> int:
     for row in ws.iter_rows(min_row=2, values_only=True):
         get = lambda name: str(row[headers[name]] or "").strip()
         card = get("общая карточка")
-        if not card: continue
+        excluded_value = get("не учитывать").casefold() if "не учитывать" in headers else "нет"
+        if excluded_value not in {"", "нет", "да"}:
+            raise ValueError("В колонке «Не учитывать» допустимы только значения «Да» или «Нет».")
+        excluded = excluded_value == "да"
+        if not card and not excluded: continue
         rule = InventoryGroupingRule(get("текущая группа"), get("категория"), card,
             get("название линейки") or get("текущая группа"), get("тип ассортимента") or get("категория"),
-            get("единица") or "шт.")
+            get("единица") or "шт.", excluded)
         if not rule.source_group: raise ValueError("Обнаружена строка без текущей группы.")
         rules.append(rule)
     wb.close()

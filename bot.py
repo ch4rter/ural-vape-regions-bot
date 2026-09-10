@@ -103,7 +103,7 @@ from inventory_inline import (
     search_inventory,
     search_inventory_cards,
 )
-from inventory_grouping import export_grouping, load_grouping, save_grouping
+from inventory_grouping import export_grouping, load_grouping, rule_key, save_grouping
 from prices_db import (
     PRICE_SOURCE,
     WAREHOUSES,
@@ -765,9 +765,9 @@ async def answer_inventory_inline(inline_query: InlineQuery, query: str) -> None
                 message_text=inventory_card_text(card, updated), parse_mode=ParseMode.HTML,
             ),
         ))
-    mapped_groups = {normalize_price_text(rule.source_group) for rule in rules.values()}
+    mapped_groups = set(rules)
     for group in groups:
-        if normalize_price_text(group.name) in mapped_groups:
+        if rule_key(group.name, group.category_name) in mapped_groups:
             continue
         quantities = " · ".join(
             f"{label}: {quantity:g}"
@@ -783,6 +783,8 @@ async def answer_inventory_inline(inline_query: InlineQuery, query: str) -> None
             ),
         ))
     for item in items:
+        if rule_key(item.group_name, item.category_name) in mapped_groups:
+            continue
         item_id = secrets.token_hex(4) + str(abs(hash(item.key)) % 10_000_000)
         quantities = " · ".join(
             f"{label}: {quantity:g}"
