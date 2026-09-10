@@ -1,11 +1,15 @@
 from decimal import Decimal
 
 from price_inline import (
+    grouped_card_price_text,
+    grouped_price_cards,
+    search_grouped_prices,
     group_price_description,
     group_price_text,
     item_price_description,
     item_price_text,
 )
+from inventory_grouping import InventoryGroupingRule, rule_key
 from prices_db import GroupDetails, GroupSummary, ItemSummary, PriceTier
 
 
@@ -33,3 +37,18 @@ def test_item_base_prices():
     assert "Базовая цена товара" in text
     assert "Нал — <b>225 ₽</b>" in text
     assert "Безнал — <b>235 ₽</b>" in text
+
+
+def test_grouped_prices_use_inventory_rules_and_keep_price_tiers():
+    items = [
+        ItemSummary(1, "Манго", "Dojo 10000", "OGGO", {"common": (Decimal("500"), Decimal("520"))}, "1", "Одноразки/OGGO/Dojo 10000", "f1"),
+        ItemSummary(2, "Арбуз", "Dojo 10000", "OGGO", {"common": (Decimal("550"), Decimal("570"))}, "2", "Одноразки/OGGO/Dojo 10000", "f1"),
+    ]
+    rule = InventoryGroupingRule("Dojo 10000", "OGGO", "OGGO x DOJO", "OGGO x DOJO 10000", "Одноразки", "шт.", False, items[0].folder_path, "f1")
+    cards = grouped_price_cards(items, {rule_key(rule.source_group, rule.source_category, rule.source_path, rule.source_folder_id): rule})
+    found_cards, found_lines = search_grouped_prices(cards, "OGGO DOJO 10000")
+    assert found_cards and found_lines
+    text = grouped_card_price_text(found_cards[0], "10.09.2026")
+    assert "OGGO x DOJO 10000" in text
+    assert "500 ₽" in text and "570 ₽" in text
+    assert "1 вкус" in text

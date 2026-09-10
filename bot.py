@@ -204,10 +204,16 @@ DEFAULT_PRICE_COMMAND_MESSAGE = (
     "Ниже представлена последняя загруженная версия с базовыми ценами."
 )
 from price_inline import (
+    grouped_card_price_text,
+    grouped_line_price_text,
+    grouped_price_cards,
+    grouped_price_description,
     group_price_description,
     group_price_text,
     item_price_description,
     item_price_text,
+    search_grouped_prices,
+    search_price_items,
 )
 PERMISSION_LABELS = {
     "broadcasts": "Рассылки",
@@ -778,7 +784,9 @@ async def answer_inventory_inline(inline_query: InlineQuery, query: str) -> None
             ),
         ))
     mapped_groups = set(rules)
+    mapped_groups.update(rule_key(rule.source_group, rule.source_category) for rule in rules.values())
     excluded_groups = {key for key, rule in rules.items() if rule.excluded}
+    excluded_groups.update(rule_key(rule.source_group, rule.source_category) for rule in rules.values() if rule.excluded)
     for group in groups:
         group_keys = {rule_key(group.name, group.category_name, group.folder_path, group.folder_id), rule_key(group.name, group.category_name)}
         if group_keys & mapped_groups:
@@ -837,16 +845,34 @@ async def answer_price_inline(inline_query: InlineQuery, query: str) -> None:
         if item.warehouse_prices:
             api_items_by_key[key] = item
     groups = prices_db.search_groups(query, limit=8)
-    local_items = prices_db.search_items(query, limit=12)
-    items = []
-    for item in local_items:
-        key = item.code.strip().casefold() or normalize_price_text(item.name)
-        api_item = api_items_by_key.get(key)
-        if api_item:
-            items.append(api_item)
+    all_api_items = list(api_items_by_key.values())
+    items = search_price_items(all_api_items, query)
+    rules = await asyncio.to_thread(load_grouping, inline_inventory_grouping_path)
+    price_cards, price_lines = search_grouped_prices(grouped_price_cards(all_api_items, rules), query)
     updated = datetime.fromisoformat(reference.built_on).strftime("%d.%m.%Y")
     results = []
+    for card in price_cards:
+        results.append(InlineQueryResultArticle(
+            id=f"price-card-{card.key}", title=f"💰 {card.name}",
+            description=grouped_price_description(card.lines),
+            input_message_content=InputTextMessageContent(
+                message_text=grouped_card_price_text(card, updated), parse_mode=ParseMode.HTML),
+        ))
+    for line in price_lines:
+        results.append(InlineQueryResultArticle(
+            id=f"price-line-{line.key}", title=f"▫️ {line.name}",
+            description=grouped_price_description((line,)),
+            input_message_content=InputTextMessageContent(
+                message_text=grouped_line_price_text(line, updated), parse_mode=ParseMode.HTML),
+        ))
+    mapped_groups = set(rules)
+    mapped_groups.update(rule_key(rule.source_group, rule.source_category) for rule in rules.values())
+    excluded_groups = {key for key, rule in rules.items() if rule.excluded}
+    excluded_groups.update(rule_key(rule.source_group, rule.source_category) for rule in rules.values() if rule.excluded)
     for group in groups:
+        group_keys = {rule_key(group.display_name, group.category_name)}
+        if group_keys & mapped_groups:
+            continue
         matching = [
             item for item in api_items_by_key.values()
             if normalize_price_text(item.group_name) == normalize_price_text(group.display_name)
@@ -875,6 +901,9 @@ async def answer_price_inline(inline_query: InlineQuery, query: str) -> None:
             ),
         ))
     for item in items:
+        item_keys = {rule_key(item.group_name, item.category_name, item.folder_path, item.folder_id), rule_key(item.group_name, item.category_name)}
+        if item_keys & excluded_groups:
+            continue
         results.append(InlineQueryResultArticle(
             id=f"price-item-{item.callback_id}",
             title=item.name,
