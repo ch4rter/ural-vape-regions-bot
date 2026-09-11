@@ -3902,12 +3902,15 @@ def build_broadcast_report(destination: Path, results: list[dict]) -> None:
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Результат"
-    sheet.append(["Получатель", "Chat ID", "Результат", "Ошибка"])
+    sheet.append(["Имя / название чата", "Username", "Telegram ID / Chat ID", "Результат", "Ошибка"])
     for item in results:
-        sheet.append([item["title"], item["chat_id"], item["status"], item["error"]])
+        sheet.append([
+            item["title"], item.get("username", ""), item["chat_id"],
+            item["status"], item["error"],
+        ])
     sheet.freeze_panes = "A2"
     sheet.auto_filter.ref = sheet.dimensions
-    for column, width in zip(("A", "B", "C", "D"), (55, 24, 18, 70)):
+    for column, width in zip(("A", "B", "C", "D", "E"), (55, 26, 24, 18, 70)):
         sheet.column_dimensions[column].width = width
     workbook.save(destination)
     workbook.close()
@@ -3945,17 +3948,19 @@ async def run_client_broadcast(callback: CallbackQuery, state: FSMContext, bot: 
             known_user = user_registry.get(chat_id)
             if audience_kind == "users" and known_user:
                 title = known_user.full_name or (f"@{known_user.username}" if known_user.username else str(chat_id))
+                username = f"@{known_user.username}" if known_user.username else ""
             else:
                 title = chat.title if chat else "Неизвестный чат"
+                username = ""
             if audience_kind != "users" and chat and not chat.is_active:
-                results.append({"title": title, "chat_id": chat_id, "status": "Пропущен", "error": "Бот удалён из чата"})
+                results.append({"title": title, "username": username, "chat_id": chat_id, "status": "Пропущен", "error": "Бот удалён из чата"})
                 failed += 1
             else:
                 try:
                     await copy_broadcast_source(
                         bot, chat_id, source_chat_id, source_message_ids
                     )
-                    results.append({"title": title, "chat_id": chat_id, "status": "Отправлено", "error": ""})
+                    results.append({"title": title, "username": username, "chat_id": chat_id, "status": "Отправлено", "error": ""})
                     sent += 1
                 except TelegramRetryAfter as error:
                     await asyncio.sleep(error.retry_after)
@@ -3963,13 +3968,13 @@ async def run_client_broadcast(callback: CallbackQuery, state: FSMContext, bot: 
                         await copy_broadcast_source(
                             bot, chat_id, source_chat_id, source_message_ids
                         )
-                        results.append({"title": title, "chat_id": chat_id, "status": "Отправлено", "error": ""})
+                        results.append({"title": title, "username": username, "chat_id": chat_id, "status": "Отправлено", "error": ""})
                         sent += 1
                     except Exception as retry_error:
-                        results.append({"title": title, "chat_id": chat_id, "status": "Ошибка", "error": str(retry_error)[:500]})
+                        results.append({"title": title, "username": username, "chat_id": chat_id, "status": "Ошибка", "error": str(retry_error)[:500]})
                         failed += 1
                 except Exception as error:
-                    results.append({"title": title, "chat_id": chat_id, "status": "Ошибка", "error": str(error)[:500]})
+                    results.append({"title": title, "username": username, "chat_id": chat_id, "status": "Ошибка", "error": str(error)[:500]})
                     failed += 1
             if number % 20 == 0 and number < len(chat_ids):
                 await edit_or_answer(

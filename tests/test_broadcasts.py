@@ -59,11 +59,13 @@ def test_chat_export_and_broadcast_report(tmp_path):
 
         report_path = tmp_path / "report.xlsx"
         build_broadcast_report(report_path, [{
-            "title": "Клиент", "chat_id": -100123,
+            "title": "Клиент", "username": "@client", "chat_id": 123456,
             "status": "Отправлено", "error": "",
         }])
         report = load_workbook(report_path, data_only=True)
-        assert report.active["C2"].value == "Отправлено"
+        assert report.active["B2"].value == "@client"
+        assert report.active["C2"].value == 123456
+        assert report.active["D2"].value == "Отправлено"
         report.close()
 
         bot.materials_db.remember_telegram_user(987654, "buyer", "Покупатель")
