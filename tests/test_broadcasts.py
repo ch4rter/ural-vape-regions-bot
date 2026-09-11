@@ -4,7 +4,7 @@ from openpyxl import Workbook, load_workbook
 
 from bot import (
     SERVICE_CHAT_ID, build_broadcast_report, build_chats_excel,
-    build_leads_excel, copy_broadcast_source, material_batches,
+    build_bot_users_excel, build_leads_excel, copy_broadcast_source, material_batches,
     parse_audience_excel,
     send_material_batch,
 )
@@ -65,6 +65,16 @@ def test_chat_export_and_broadcast_report(tmp_path):
         report = load_workbook(report_path, data_only=True)
         assert report.active["C2"].value == "Отправлено"
         report.close()
+
+        bot.materials_db.remember_telegram_user(987654, "buyer", "Покупатель")
+        bot.materials_db.mark_telegram_user_activated(987654)
+        users_path = tmp_path / "users.xlsx"
+        assert build_bot_users_excel(users_path) == 1
+        users = load_workbook(users_path, data_only=True)
+        assert users.active["A2"].value == 987654
+        assert users.active["B2"].value == "@buyer"
+        assert users.active["C2"].value == "Покупатель"
+        users.close()
 
         bot.materials_db.save_lead_profile(
             123456, "client", "Иван", "Владелец", "Тамбов",

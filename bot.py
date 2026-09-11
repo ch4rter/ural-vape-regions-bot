@@ -3487,7 +3487,10 @@ def broadcast_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton(text="🎯 По характеристикам", callback_data="broadcast:segments")],
         [
+            InlineKeyboardButton(text="📥 Пользователи", callback_data="broadcast:export_users"),
             InlineKeyboardButton(text="📥 Все чаты", callback_data="broadcast:export_chats"),
+        ],
+        [
             InlineKeyboardButton(text="⚠️ Без характеристик", callback_data="broadcast:export_untagged"),
         ],
         compact_nav(),
@@ -3509,7 +3512,7 @@ async def open_broadcasts(callback: CallbackQuery, state: FSMContext) -> None:
         f"Зарегистрировано чатов: <b>{len(materials_db.list_client_chats())}</b>\n"
         f"Активировали бота: <b>{len(materials_db.list_activated_telegram_users())}</b>\n"
         f"Служебный чат: <b>{html.escape(service_chat_text())}</b>\n\n"
-        "Аудитория каждой рассылки определяется новым Excel-файлом с колонкой Chat ID.",
+        "Можно отправить сообщение всем пользователям бота или подготовить отдельный список клиентских чатов.",
         reply_markup=broadcast_menu_keyboard(callback.from_user.id),
     )
     await callback.answer()
@@ -3543,6 +3546,55 @@ def build_chats_excel(destination: Path, chats: list | None = None) -> None:
     sheet.column_dimensions["H"].width = 14
     workbook.save(destination)
     workbook.close()
+
+
+def build_bot_users_excel(destination: Path) -> int:
+    users = materials_db.list_activated_telegram_users()
+    profiles = {profile.user_id: profile for profile in materials_db.list_lead_profiles()}
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Пользователи бота"
+    sheet.append([
+        "Telegram ID", "Username", "Имя", "Добавлен в аудиторию",
+        "Должность", "Регион / город", "Компания", "Торговые точки", "Менеджер",
+    ])
+    for user in users:
+        profile = profiles.get(user.user_id)
+        sheet.append([
+            user.user_id,
+            f"@{user.username}" if user.username else "",
+            user.full_name,
+            user.activated_at,
+            profile.position if profile else "",
+            profile.region if profile else "",
+            profile.company if profile else "",
+            profile.outlets if profile else "",
+            profile.manager if profile else "",
+        ])
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = sheet.dimensions
+    for column, width in zip(
+        ("A", "B", "C", "D", "E", "F", "G", "H", "I"),
+        (18, 25, 35, 22, 24, 30, 40, 24, 20),
+    ):
+        sheet.column_dimensions[column].width = width
+    workbook.save(destination)
+    workbook.close()
+    return len(users)
+
+
+@router.callback_query(F.data == "broadcast:export_users")
+async def export_bot_users(callback: CallbackQuery) -> None:
+    if not await require_broadcaster(callback):
+        return
+    await callback.answer("Готовлю список…")
+    with tempfile.TemporaryDirectory() as temp_name:
+        destination = Path(temp_name) / "пользователи бота.xlsx"
+        count = await asyncio.to_thread(build_bot_users_excel, destination)
+        await callback.message.answer_document(
+            FSInputFile(destination, filename=destination.name),
+            caption=f"👤 Пользователей в аудитории: <b>{count}</b>",
+        )
 
 
 @router.callback_query(F.data == "broadcast:export_chats")
