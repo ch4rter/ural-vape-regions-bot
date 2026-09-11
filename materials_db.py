@@ -1032,6 +1032,14 @@ class MaterialsDB:
                 (user_id,),
             )
 
+    def list_unconfirmed_telegram_users(self) -> list[tuple[int, str | None, str]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT user_id,username,full_name FROM known_telegram_users
+                   WHERE activated_at IS NULL ORDER BY user_id"""
+            ).fetchall()
+        return [(row["user_id"], row["username"], row["full_name"]) for row in rows]
+
     def list_activated_telegram_users(self) -> list[TelegramUser]:
         with self._connect() as connection:
             rows = connection.execute(
