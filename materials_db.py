@@ -99,6 +99,14 @@ class UnmatchedRegion:
     updated_at: str
 
 
+@dataclass(frozen=True)
+class TelegramUser:
+    user_id: int
+    username: str | None
+    full_name: str
+    activated_at: str
+
+
 class MaterialsDB:
     def __init__(self, path: Path):
         self.path = path
@@ -183,7 +191,8 @@ class MaterialsDB:
                     user_id INTEGER PRIMARY KEY,
                     username TEXT,
                     full_name TEXT NOT NULL DEFAULT '',
-                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    activated_at TEXT
                 );
                 CREATE TABLE IF NOT EXISTS unmatched_regions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -308,6 +317,14 @@ class MaterialsDB:
                 connection.execute("ALTER TABLE client_chats ADD COLUMN added_by_id INTEGER")
             if "added_by_username" not in chat_columns:
                 connection.execute("ALTER TABLE client_chats ADD COLUMN added_by_username TEXT")
+            known_columns = {row[1] for row in connection.execute("PRAGMA table_info(known_telegram_users)")}
+            if "activated_at" not in known_columns:
+                connection.execute("ALTER TABLE known_telegram_users ADD COLUMN activated_at TEXT")
+                connection.execute(
+                    """UPDATE known_telegram_users SET activated_at=updated_at
+                       WHERE user_id IN (SELECT user_id FROM lead_profiles)
+                          OR user_id IN (SELECT telegram_id FROM access_users WHERE telegram_id IS NOT NULL)"""
+                )
 
     def add_access_user(self, value: str) -> AccessUser:
         value = value.strip()
@@ -1007,6 +1024,21 @@ class MaterialsDB:
                 (normalized,),
             ).fetchone()
         return row["user_id"] if row else None
+
+    def mark_telegram_user_activated(self, user_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE known_telegram_users SET activated_at=COALESCE(activated_at,CURRENT_TIMESTAMP) WHERE user_id=?",
+                (user_id,),
+            )
+
+    def list_activated_telegram_users(self) -> list[TelegramUser]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT user_id,username,full_name,activated_at FROM known_telegram_users
+                   WHERE activated_at IS NOT NULL ORDER BY activated_at"""
+            ).fetchall()
+        return [TelegramUser(row["user_id"], row["username"], row["full_name"], row["activated_at"]) for row in rows]
 
     @staticmethod
     def _lead_profile(row: sqlite3.Row) -> LeadProfile:

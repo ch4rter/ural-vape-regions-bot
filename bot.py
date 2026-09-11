@@ -352,6 +352,8 @@ class AccessMiddleware(BaseMiddleware):
         user = event.from_user
         if user:
             materials_db.remember_telegram_user(user.id, user.username, user.full_name)
+            if isinstance(event, Message) and event.chat.type == "private":
+                materials_db.mark_telegram_user_activated(user.id)
         if getattr(event, "chat", None) and event.chat.type != "private":
             text = event.text or "" if isinstance(event, Message) else ""
             is_price_command = bool(re.match(r"^/прайс(?:@\w+)?\s*$", text, re.IGNORECASE))
@@ -3481,8 +3483,9 @@ def broadcast_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton(text="➕ Создать", callback_data="broadcast:new"),
-            InlineKeyboardButton(text="🎯 По характеристикам", callback_data="broadcast:segments"),
+            InlineKeyboardButton(text="👤 Всем пользователям", callback_data="broadcast:all_users"),
         ],
+        [InlineKeyboardButton(text="🎯 По характеристикам", callback_data="broadcast:segments")],
         [
             InlineKeyboardButton(text="📥 Все чаты", callback_data="broadcast:export_chats"),
             InlineKeyboardButton(text="⚠️ Без характеристик", callback_data="broadcast:export_untagged"),
@@ -3504,6 +3507,7 @@ async def open_broadcasts(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.edit_text(
         "📣 <b>Рассылки клиентам</b>\n\n"
         f"Зарегистрировано чатов: <b>{len(materials_db.list_client_chats())}</b>\n"
+        f"Активировали бота: <b>{len(materials_db.list_activated_telegram_users())}</b>\n"
         f"Служебный чат: <b>{html.escape(service_chat_text())}</b>\n\n"
         "Аудитория каждой рассылки определяется новым Excel-файлом с колонкой Chat ID.",
         reply_markup=broadcast_menu_keyboard(callback.from_user.id),
@@ -3829,7 +3833,7 @@ async def test_broadcast(callback: CallbackQuery, state: FSMContext, bot: Bot) -
         await callback.answer("Не удалось отправить тест. Проверьте доступ бота к служебной группе.", show_alert=True); return
     await callback.message.edit_text(
         "✅ <b>Тест отправлен в служебную группу</b>\n\n"
-        f"Получателей в Excel: <b>{len(data.get('broadcast_chat_ids', []))}</b>\n\n"
+        f"Получателей: <b>{len(data.get('broadcast_chat_ids', []))}</b>\n\n"
         "Проверьте сообщение в группе и подтвердите массовую рассылку.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🚀 Начать рассылку", callback_data="broadcast:confirm_send", style="success")],
@@ -3846,7 +3850,7 @@ def build_broadcast_report(destination: Path, results: list[dict]) -> None:
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Результат"
-    sheet.append(["Название чата", "Chat ID", "Результат", "Ошибка"])
+    sheet.append(["Получатель", "Chat ID", "Результат", "Ошибка"])
     for item in results:
         sheet.append([item["title"], item["chat_id"], item["status"], item["error"]])
     sheet.freeze_panes = "A2"
@@ -3865,6 +3869,8 @@ async def run_client_broadcast(callback: CallbackQuery, state: FSMContext, bot: 
         await callback.answer("Рассылка уже выполняется.", show_alert=True); return
     data = await state.get_data()
     chat_ids = data.get("broadcast_chat_ids", [])
+    audience_kind = data.get("broadcast_audience_kind", "chats")
+    user_registry = {user.user_id: user for user in materials_db.list_activated_telegram_users()}
     source_chat_id = data.get("source_chat_id")
     source_message_ids = data.get("source_message_ids") or [data.get("source_message_id")]
     source_message_ids = [value for value in source_message_ids if value]
@@ -3884,8 +3890,12 @@ async def run_client_broadcast(callback: CallbackQuery, state: FSMContext, bot: 
     try:
         for number, chat_id in enumerate(chat_ids, 1):
             chat = registry.get(chat_id)
-            title = chat.title if chat else "Неизвестный чат"
-            if chat and not chat.is_active:
+            known_user = user_registry.get(chat_id)
+            if audience_kind == "users" and known_user:
+                title = known_user.full_name or (f"@{known_user.username}" if known_user.username else str(chat_id))
+            else:
+                title = chat.title if chat else "Неизвестный чат"
+            if audience_kind != "users" and chat and not chat.is_active:
                 results.append({"title": title, "chat_id": chat_id, "status": "Пропущен", "error": "Бот удалён из чата"})
                 failed += 1
             else:
@@ -3923,7 +3933,7 @@ async def run_client_broadcast(callback: CallbackQuery, state: FSMContext, bot: 
     await edit_or_answer(
         callback.message,
         "✅ <b>Рассылка завершена</b>\n\n"
-        f"Всего чатов: <b>{len(chat_ids)}</b>\n"
+        f"Всего получателей: <b>{len(chat_ids)}</b>\n"
         f"Успешно отправлено: <b>{sent}</b>\n"
         f"Ошибок и пропусков: <b>{failed}</b>\n\n"
         "Подробности находятся в Excel-отчёте.",
@@ -5533,6 +5543,30 @@ async def my_shipments_menu(callback: CallbackQuery, state: FSMContext) -> None:
         f"Канал продаж: <b>{html.escape(channel[0])}</b>\n\n"
         "Выберите месяц. Галочкой отмечены месяцы с настроенной классификацией.",
         reply_markup=my_shipments_months_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "broadcast:all_users")
+async def broadcast_all_users(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_broadcaster(callback): return
+    users = materials_db.list_activated_telegram_users()
+    if not users:
+        await callback.answer("Пользователей для рассылки пока нет.", show_alert=True); return
+    await state.clear()
+    await state.update_data(
+        broadcast_chat_ids=[user.user_id for user in users],
+        broadcast_audience_kind="users",
+    )
+    await state.set_state(BroadcastState.content_upload)
+    await edit_or_answer(
+        callback.message,
+        "👤 <b>Рассылка пользователям бота</b>\n\n"
+        f"Получателей: <b>{len(users)}</b>. В список включены пользователи, которые открывали бота в личных сообщениях.\n\n"
+        "📨 <b>Шаг 2 из 3</b>\nОтправьте готовый пост: текст, фото, видео или документ с подписью.",
+        InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="❌ Отменить", callback_data="main:broadcasts", style="danger")
+        ]]),
     )
     await callback.answer()
 

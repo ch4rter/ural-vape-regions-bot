@@ -189,6 +189,17 @@ def test_known_telegram_user_resolves_manager_username(tmp_path):
     assert db.telegram_user_id_by_username("SHMIDTUV") == 101
 
 
+def test_private_bot_users_are_tracked_separately(tmp_path):
+    db = MaterialsDB(tmp_path / "materials.sqlite3")
+    db.remember_telegram_user(101, "client", "Клиент")
+    assert db.list_activated_telegram_users() == []
+    db.mark_telegram_user_activated(101)
+    users = db.list_activated_telegram_users()
+    assert len(users) == 1
+    assert users[0].user_id == 101
+    assert users[0].full_name == "Клиент"
+
+
 def test_waitlist_is_scoped_to_manager_and_remembers_matches(tmp_path):
     db = MaterialsDB(tmp_path / "materials.sqlite3")
     first = db.add_wait_entry(
