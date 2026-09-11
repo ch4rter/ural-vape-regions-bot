@@ -161,7 +161,7 @@ def test_custom_month_categories_are_saved_and_used(tmp_path):
         client=FakeBonusClient(), raw_documents=([demand], []),
     )
     workbook = load_workbook(report, read_only=True)
-    headers = [cell.value for cell in workbook["Отчёт"][3]]
+    headers = [cell.value for cell in workbook["Отгрузки"][3]]
     assert "Новинки месяца" in headers
     assert "OGGO Аромы/жижи" not in headers
     workbook.close()
@@ -197,18 +197,28 @@ def test_build_bonus_report_splits_categories(tmp_path):
     assert result.return_count == 0
     assert result.unclassified_paths == ()
     workbook = load_workbook(destination, data_only=False)
-    assert workbook.sheetnames[:2] == ["Сводка", "Отчёт"]
-    personal_summary = workbook["Сводка"]
-    assert personal_summary["A4"].value == "Отгрузок"
-    assert personal_summary["A5"].value == 1
-    assert personal_summary["C5"].value == 1500
-    assert personal_summary["A27"].value == "Клиент"
-    assert personal_summary["B27"].value == 1
-    assert personal_summary["C27"].value == 1500
-    sheet = workbook["Отчёт"]
+    assert workbook.sheetnames == ["Дашборд", "Отгрузки", "Данные"]
+    dashboard = workbook["Дашборд"]
+    assert dashboard.freeze_panes is None
+    assert len(dashboard._charts) == 0
+    dashboard_headers = {cell.value: cell.column for cell in dashboard[9]}
+    assert dashboard.cell(10, dashboard_headers["Менеджер"]).value == "Валера"
+    assert dashboard.cell(10, dashboard_headers["Клиенты"]).value == 1
+    assert dashboard.cell(10, dashboard_headers["Отгрузки"]).value == 1
+    assert Decimal(str(dashboard.cell(10, dashboard_headers["Выручка"]).value)) == Decimal("1500")
+    assert Decimal(str(dashboard.cell(10, dashboard_headers["Оплачено"]).value)) == Decimal("1000")
+    assert Decimal(str(dashboard.cell(10, dashboard_headers["Долг"]).value)) == Decimal("500")
+    sheet = workbook["Отгрузки"]
+    assert sheet.freeze_panes == "A4"
     headers = {cell.value: cell.column for cell in sheet[3]}
+    assert Decimal(str(sheet.cell(4, headers["Сумма документа"]).value)) == Decimal("1500")
+    assert Decimal(str(sheet.cell(4, headers["Оплачено"]).value)) == Decimal("1000")
+    assert Decimal(str(sheet.cell(4, headers["Задолженность"]).value)) == Decimal("500")
     assert Decimal(str(sheet.cell(4, headers["OGGO Аромы/жижи"]).value)) == Decimal("900")
     assert Decimal(str(sheet.cell(4, headers["Прочее"]).value)) == Decimal("600")
+    assert Decimal(str(dashboard.cell(10, dashboard_headers["OGGO Аромы/жижи"]).value)) == Decimal("900")
+    assert Decimal(str(dashboard.cell(10, dashboard_headers["Прочее"]).value)) == Decimal("600")
+    assert len(workbook["Данные"].tables) == 4
     workbook.close()
 
     renamed = dict(demand)
@@ -241,15 +251,16 @@ def test_build_bonus_report_splits_categories(tmp_path):
     )
     assert common.document_count == 2
     workbook = load_workbook(common_destination, data_only=False)
-    assert workbook.sheetnames[:3] == ["Сводка", "Отчёт", "Валера"]
-    summary = workbook["Сводка"]
+    assert workbook.sheetnames == ["Дашборд", "Отгрузки", "Данные"]
+    summary = workbook["Дашборд"]
     assert summary["A10"].value == "Валера"
     assert summary["B10"].value == 1
     assert summary["C10"].value == 2
     assert summary["D10"].value == 2000
-    assert summary["A27"].value == "Клиент"
-    assert summary["B27"].value == "Валера"
-    assert summary["C27"].value == 2
-    assert summary["D27"].value == 2000
-    assert workbook["Валера"]["F4"].value == "Валера"
+    assert summary["E10"].value == 1000
+    assert summary["F10"].value == 1000
+    detail = workbook["Отгрузки"]
+    detail_headers = {cell.value: cell.column for cell in detail[3]}
+    assert sum(Decimal(str(detail.cell(row, detail_headers["Сумма документа"]).value)) for row in (4, 5)) == Decimal("2000")
+    assert sum(Decimal(str(detail.cell(row, detail_headers["Оплачено"]).value)) for row in (4, 5)) == Decimal("1000")
     workbook.close()

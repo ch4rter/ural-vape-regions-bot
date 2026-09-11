@@ -14,6 +14,8 @@ from openpyxl.chart import BarChart, Reference
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
+from bonus_report_v2 import build_bonus_workbook_v2
+
 from moysklad_price import BONUS_CATEGORIES, MoySkladClient, MoySkladError, _canonical_href
 
 
@@ -701,7 +703,7 @@ def _fill_summary_sheet(
     sheet.sheet_view.showGridLines = False
 
 
-def build_bonus_report(
+def build_bonus_report_legacy(
     token: str,
     month: str,
     channel: str,
@@ -758,6 +760,49 @@ def build_bonus_report(
     destination.parent.mkdir(parents=True, exist_ok=True)
     workbook.save(destination)
     workbook.close()
+    return BonusReportResult(
+        path=destination,
+        document_count=len(documents),
+        shipment_count=sum(row.kind == "Отгрузка" for row in documents),
+        return_count=sum(row.kind == "Возврат" for row in documents),
+        unclassified_paths=tuple(sorted(unknown, key=str.casefold)),
+    )
+
+
+def build_bonus_report(
+    token: str,
+    month: str,
+    channel: str,
+    classification_path: Path,
+    destination: Path,
+    *,
+    sales_channel_href: str = "",
+    client: MoySkladClient | None = None,
+    raw_documents: tuple[list[dict], list[dict]] | None = None,
+) -> BonusReportResult:
+    """Build the production premium report using the established calculation pipeline."""
+    client = client or MoySkladClient(token)
+    classification = load_classification(classification_path)
+    raw = raw_documents or fetch_month_documents(client, month, sales_channel_href)
+    documents, unknown = prepare_documents(
+        client, raw, classification, channel, sales_channel_href
+    )
+    if not documents:
+        raise MoySkladError(
+            f"За {month_title(month)} по каналу продаж «{channel}» проведённых документов не найдено."
+        )
+    categories = [
+        category for category in classification.categories
+        if category != EXCLUDED_CATEGORY
+    ]
+    categories.extend([OTHER_CATEGORY, UNCLASSIFIED_CATEGORY])
+    build_bonus_workbook_v2(
+        destination,
+        documents,
+        categories,
+        month_title(month).capitalize(),
+        "Все менеджеры" if channel == ALL_CHANNELS else channel,
+    )
     return BonusReportResult(
         path=destination,
         document_count=len(documents),

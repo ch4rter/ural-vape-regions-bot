@@ -6190,7 +6190,7 @@ async def bonus_generate_report(callback: CallbackQuery, state: FSMContext) -> N
             )
             warning = (
                 f"\n⚠️ Неклассифицированных папок: <b>{len(result.unclassified_paths)}</b>. "
-                "Они вынесены на отдельный лист."
+                "Они отмечены в детализации."
                 if result.unclassified_paths else "\n✅ Все товарные папки классифицированы."
             )
             await callback.message.answer_document(
