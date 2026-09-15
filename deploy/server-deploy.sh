@@ -27,6 +27,10 @@ if [[ ! -d "$APP_DIR/.git" ]]; then
     exit 4
 fi
 
+# The SSH deploy account has a private home directory. Move into the application
+# directory before invoking commands as APP_USER so pytest can resolve its start path.
+cd "$APP_DIR"
+
 if [[ -n "$(run_as_app git -C "$APP_DIR" status --porcelain --untracked-files=no)" ]]; then
     echo "Tracked server files contain manual changes; deployment stopped." >&2
     exit 5
