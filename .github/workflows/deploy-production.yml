@@ -55,9 +55,11 @@ jobs:
       - name: Deploy tested revision
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           REVISION: ${{ github.sha }}
         run: |
           ssh -i ~/.ssh/ural_vape_deploy \
+            -p "$DEPLOY_PORT" \
             "$DEPLOY_USER@$DEPLOY_HOST" \
             "sudo /usr/local/sbin/deploy-ural-vape-regions-bot '$REVISION'"
