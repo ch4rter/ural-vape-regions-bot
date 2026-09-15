@@ -22,10 +22,12 @@ from inventory_grouping import InventoryGroupingRule, rule_key
 
 
 STORE_LABELS = {
-    "Мордор": "Москва",
+    "Мордор": "Урал",
     "Годзибасы": "Санкт-Петербург",
-    "Жможики": "Урал",
+    "Жможики": "Москва",
 }
+
+STORE_DISPLAY_ORDER = tuple(STORE_LABELS[name] for name in DEFAULT_STORES)
 
 
 @dataclass(frozen=True)

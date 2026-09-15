@@ -91,6 +91,7 @@ from order_document_inline import (
 from inventory_inline import (
     InventorySnapshot,
     InventoryReference,
+    STORE_DISPLAY_ORDER,
     build_inventory_reference,
     build_inventory_snapshot,
     assortment_count,
@@ -795,7 +796,7 @@ async def answer_inventory_inline(inline_query: InlineQuery, query: str) -> None
             continue
         quantities = " · ".join(
             f"{label}: {quantity:g}"
-            for label, quantity in zip(("Москва", "СПб", "Урал"), group.quantities)
+            for label, quantity in zip(STORE_DISPLAY_ORDER, group.quantities)
         )
         results.append(InlineQueryResultArticle(
             id=f"stock-group-{group.key}",
@@ -813,7 +814,7 @@ async def answer_inventory_inline(inline_query: InlineQuery, query: str) -> None
         item_id = secrets.token_hex(4) + str(abs(hash(item.key)) % 10_000_000)
         quantities = " · ".join(
             f"{label}: {quantity:g}"
-            for label, quantity in zip(("Москва", "СПб", "Урал"), item.quantities)
+            for label, quantity in zip(STORE_DISPLAY_ORDER, item.quantities)
         )
         results.append(InlineQueryResultArticle(
             id=f"stock-item-{item_id}",

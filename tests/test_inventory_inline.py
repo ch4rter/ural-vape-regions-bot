@@ -70,6 +70,9 @@ def test_inventory_snapshot_search_and_public_labels():
     assert "Урал" in group_text
     assert "Мордор" not in group_text
     assert "₽" not in group_text + item_text
+    assert "Урал — <b>12 шт.</b>" in group_text
+    assert "Санкт-Петербург — <b>8 шт.</b>" in group_text
+    assert "Москва — <b>7 шт.</b>" in group_text
 
 
 def test_daily_reference_can_be_reused_without_assortment_requests(tmp_path):
