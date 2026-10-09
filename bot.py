@@ -57,7 +57,7 @@ from customer_activity import (
     sync_shipments,
 )
 from google_crm import GoogleCRM
-from materials_db import Material, MaterialsDB
+from materials_db import Material, MaterialsDB, MemoryEntry
 from moysklad_price import (
     MoySkladClient,
     MoySkladError,
@@ -291,6 +291,12 @@ class AdminState(StatesGroup):
     order_split_upload = State()
     sales_goal_amount = State()
     inventory_grouping_upload = State()
+    memory_name = State()
+    memory_start_date = State()
+    memory_end_date = State()
+    memory_edit_name = State()
+    memory_edit_dates = State()
+    memory_edit_epitaph = State()
 
 
 class BroadcastState(StatesGroup):
@@ -380,6 +386,11 @@ class AccessMiddleware(BaseMiddleware):
                 return await handler(event, data)
             is_progress_command = bool(re.match(r"^/progress(?:@\w+)?\s*$", text, re.IGNORECASE))
             if is_progress_command and user and (
+                is_admin(user.id) or materials_db.authorize_user(user.id, user.username)
+            ):
+                return await handler(event, data)
+            is_memory_command = bool(re.match(r"^/memory(?:@\w+)?\s*$", text, re.IGNORECASE))
+            if is_memory_command and user and (
                 is_admin(user.id) or materials_db.authorize_user(user.id, user.username)
             ):
                 return await handler(event, data)
@@ -2025,6 +2036,55 @@ RPS_LABELS = {
     "paper": "📄 Бумага",
 }
 RPS_BEATS = {"rock": "scissors", "scissors": "paper", "paper": "rock"}
+
+MEMORY_EPITAPHS = (
+    "Ушёл туда, где нет утренних планёрок",
+    "Покинул чат, но остался в пересылаемых сообщениях",
+    "Его последний отчёт всё ещё ждут",
+    "Так и не заполнил таблицу до конца",
+    "Теперь его точно никто не тегнет",
+    "Обрёл вечный покой от рабочих уведомлений",
+    "Не выдержал ещё одного сообщения «есть минутка?»",
+    "Его задачи перешли к другому. Его легенда — нет",
+    "Покинул компанию, но не корпоративные мемы",
+    "Последний раз был в сети в рабочее время",
+)
+
+
+def normalize_memory_date(value: str) -> str | None:
+    try:
+        return datetime.strptime(value.strip(), "%d.%m.%Y").strftime("%d.%m.%Y")
+    except ValueError:
+        return None
+
+
+def format_memory_text(entries: list[MemoryEntry]) -> str:
+    heading = (
+        "🪦 <b>КЛАДБИЩЕ URAL VAPE</b>\n\n"
+        "Здесь покоятся те, кто когда-то был частью нашей команды.\n"
+        "Они покинули рабочие чаты, но навсегда остались в истории компании."
+    )
+    if not entries:
+        return heading + "\n\n🌫 Здесь пока подозрительно тихо."
+    memorials = []
+    for entry in entries:
+        memorials.append(
+            f"🥀 <b>{html.escape(entry.name)}</b>\n"
+            f"{html.escape(entry.start_date)} — {html.escape(entry.end_date)}\n"
+            f"<i>«{html.escape(entry.epitaph)}»</i>"
+        )
+    return (
+        heading + "\n\n" + "\n\n".join(memorials)
+        + "\n\n🕯 Их аккаунты деактивированы,\nно память о них всё ещё активна."
+    )
+
+
+@router.message(Command("memory"))
+async def show_secret_memory(message: Message) -> None:
+    user = message.from_user
+    if not user or not has_internal_access(user.id, user.username):
+        return
+    await message.answer(format_memory_text(materials_db.list_memory_entries()))
 
 
 def rps_keyboard(token: str) -> InlineKeyboardMarkup:
@@ -4703,6 +4763,7 @@ def products_keyboard(
         if actor_id is None or is_admin(actor_id):
             admin_buttons.append(InlineKeyboardButton(text="🎯 Цели продаж", callback_data="adm:sales_goals"))
             admin_buttons.append(InlineKeyboardButton(text="📦 Группировка остатков", callback_data="adm:inventory_grouping"))
+            admin_buttons.append(InlineKeyboardButton(text="🪦 Кладбище Ural Vape", callback_data="adm:memory"))
         rows.extend(button_grid(admin_buttons))
         if actor_id is None or is_admin(actor_id):
             rows.append([InlineKeyboardButton(text="💾 Скачать резервную копию", callback_data="adm:backup")])
@@ -6536,6 +6597,287 @@ async def admin_menu(callback: CallbackQuery, state: FSMContext) -> None:
         ),
     )
     await callback.answer()
+
+
+def memory_admin_keyboard(entries: list[MemoryEntry]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=f"🥀 {entry.name}", callback_data=f"adm:memory:e:{entry.id}")]
+        for entry in entries
+    ]
+    rows.extend([
+        [
+            InlineKeyboardButton(text="➕ Добавить", callback_data="adm:memory:add"),
+            InlineKeyboardButton(text="👁 Посмотреть", callback_data="adm:memory:preview"),
+        ],
+        compact_nav("main:admin"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def memory_entry_keyboard(entry_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✏️ Имя", callback_data=f"adm:memory:name:{entry_id}"),
+            InlineKeyboardButton(text="📅 Даты", callback_data=f"adm:memory:dates:{entry_id}"),
+        ],
+        [InlineKeyboardButton(text="📝 Эпитафия", callback_data=f"adm:memory:text:{entry_id}")],
+        [InlineKeyboardButton(text="🎲 Другая эпитафия", callback_data=f"adm:memory:reroll:{entry_id}")],
+        [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"adm:memory:delete:{entry_id}", style="danger")],
+        [InlineKeyboardButton(text="⬅️", callback_data="adm:memory")],
+    ])
+
+
+def memory_entry_admin_text(entry: MemoryEntry) -> str:
+    return (
+        "🥀 <b>Запись в книге памяти</b>\n\n"
+        f"<b>{html.escape(entry.name)}</b>\n"
+        f"{html.escape(entry.start_date)} — {html.escape(entry.end_date)}\n\n"
+        f"<i>«{html.escape(entry.epitaph)}»</i>"
+    )
+
+
+async def show_memory_admin(callback: CallbackQuery) -> None:
+    entries = materials_db.list_memory_entries()
+    await callback.message.edit_text(
+        "🪦 <b>Кладбище Ural Vape</b>\n\n"
+        f"Записей: <b>{len(entries)}</b>\n"
+        "Здесь можно пополнять летопись и редактировать эпитафии.",
+        reply_markup=memory_admin_keyboard(entries),
+    )
+
+
+async def show_memory_entry(callback: CallbackQuery, entry_id: int) -> bool:
+    entry = materials_db.get_memory_entry(entry_id)
+    if not entry:
+        await callback.answer("Запись уже удалена.", show_alert=True)
+        return False
+    await callback.message.edit_text(
+        memory_entry_admin_text(entry), reply_markup=memory_entry_keyboard(entry.id)
+    )
+    return True
+
+
+def memory_callback_id(callback: CallbackQuery) -> int | None:
+    try:
+        return int((callback.data or "").rsplit(":", 1)[1])
+    except (ValueError, IndexError):
+        return None
+
+
+@router.callback_query(F.data == "adm:memory")
+async def memory_admin(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin(callback):
+        return
+    await state.clear()
+    await show_memory_admin(callback)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adm:memory:preview")
+async def memory_preview(callback: CallbackQuery) -> None:
+    if not await require_admin(callback):
+        return
+    await callback.message.edit_text(
+        format_memory_text(materials_db.list_memory_entries()),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️", callback_data="adm:memory")]
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adm:memory:add")
+async def memory_add(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin(callback):
+        return
+    await state.set_state(AdminState.memory_name)
+    await callback.message.edit_text(
+        "🥀 <b>Новая запись</b>\n\nВведите имя сотрудника одним сообщением.\n\n"
+        "Для отмены используйте /cancel."
+    )
+    await callback.answer()
+
+
+@router.message(AdminState.memory_name)
+async def memory_add_name(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    name = (message.text or "").strip()
+    if not name:
+        await message.answer("Введите имя обычным текстовым сообщением.")
+        return
+    await state.update_data(memory_name=name)
+    await state.set_state(AdminState.memory_start_date)
+    await message.answer(
+        "📅 Когда сотрудник начал работать?\n\nВведите дату в формате <code>ДД.ММ.ГГГГ</code>."
+    )
+
+
+@router.message(AdminState.memory_start_date)
+async def memory_add_start_date(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    value = normalize_memory_date(message.text or "")
+    if not value:
+        await message.answer("Не понял дату. Используйте формат <code>ДД.ММ.ГГГГ</code>.")
+        return
+    await state.update_data(memory_start_date=value)
+    await state.set_state(AdminState.memory_end_date)
+    await message.answer(
+        "🪦 Когда завершилась его славная корпоративная история?\n\n"
+        "Введите дату в формате <code>ДД.ММ.ГГГГ</code>."
+    )
+
+
+@router.message(AdminState.memory_end_date)
+async def memory_add_end_date(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    end_date = normalize_memory_date(message.text or "")
+    if not end_date:
+        await message.answer("Не понял дату. Используйте формат <code>ДД.ММ.ГГГГ</code>.")
+        return
+    data = await state.get_data()
+    entry = materials_db.add_memory_entry(
+        data["memory_name"], data["memory_start_date"], end_date,
+        secrets.choice(MEMORY_EPITAPHS),
+    )
+    await state.clear()
+    await message.answer(
+        "✅ Запись добавлена в корпоративную вечность.\n\n" + memory_entry_admin_text(entry),
+        reply_markup=memory_entry_keyboard(entry.id),
+    )
+
+
+@router.callback_query(F.data.startswith("adm:memory:e:"))
+async def memory_open_entry(callback: CallbackQuery) -> None:
+    if not await require_admin(callback):
+        return
+    entry_id = memory_callback_id(callback)
+    if entry_id is not None:
+        await show_memory_entry(callback, entry_id)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:memory:name:"))
+async def memory_edit_name_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin(callback):
+        return
+    entry_id = memory_callback_id(callback)
+    if not entry_id or not materials_db.get_memory_entry(entry_id):
+        await callback.answer("Запись не найдена.", show_alert=True)
+        return
+    await state.set_state(AdminState.memory_edit_name)
+    await state.update_data(memory_entry_id=entry_id)
+    await callback.message.edit_text("✏️ Введите новое имя одним сообщением.")
+    await callback.answer()
+
+
+@router.message(AdminState.memory_edit_name)
+async def memory_edit_name_finish(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    name = (message.text or "").strip()
+    if not name:
+        await message.answer("Имя не может быть пустым.")
+        return
+    data = await state.get_data()
+    entry = materials_db.update_memory_entry(data["memory_entry_id"], name=name)
+    await state.clear()
+    await message.answer(memory_entry_admin_text(entry), reply_markup=memory_entry_keyboard(entry.id))
+
+
+@router.callback_query(F.data.startswith("adm:memory:dates:"))
+async def memory_edit_dates_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin(callback):
+        return
+    entry_id = memory_callback_id(callback)
+    if not entry_id or not materials_db.get_memory_entry(entry_id):
+        await callback.answer("Запись не найдена.", show_alert=True)
+        return
+    await state.set_state(AdminState.memory_edit_dates)
+    await state.update_data(memory_entry_id=entry_id)
+    await callback.message.edit_text(
+        "📅 Введите обе даты через пробел:\n\n<code>12.03.2024 07.10.2026</code>"
+    )
+    await callback.answer()
+
+
+@router.message(AdminState.memory_edit_dates)
+async def memory_edit_dates_finish(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    values = re.findall(r"\d{2}\.\d{2}\.\d{4}", message.text or "")
+    dates = [normalize_memory_date(value) for value in values]
+    if len(dates) != 2 or not all(dates):
+        await message.answer(
+            "Не понял даты. Отправьте их так: <code>12.03.2024 07.10.2026</code>."
+        )
+        return
+    data = await state.get_data()
+    entry = materials_db.update_memory_entry(
+        data["memory_entry_id"], start_date=dates[0], end_date=dates[1]
+    )
+    await state.clear()
+    await message.answer(memory_entry_admin_text(entry), reply_markup=memory_entry_keyboard(entry.id))
+
+
+@router.callback_query(F.data.startswith("adm:memory:text:"))
+async def memory_edit_text_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin(callback):
+        return
+    entry_id = memory_callback_id(callback)
+    if not entry_id or not materials_db.get_memory_entry(entry_id):
+        await callback.answer("Запись не найдена.", show_alert=True)
+        return
+    await state.set_state(AdminState.memory_edit_epitaph)
+    await state.update_data(memory_entry_id=entry_id)
+    await callback.message.edit_text("📝 Введите новую эпитафию без кавычек.")
+    await callback.answer()
+
+
+@router.message(AdminState.memory_edit_epitaph)
+async def memory_edit_text_finish(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    epitaph = (message.text or "").strip()
+    if not epitaph:
+        await message.answer("Эпитафия не может быть пустой.")
+        return
+    data = await state.get_data()
+    entry = materials_db.update_memory_entry(data["memory_entry_id"], epitaph=epitaph)
+    await state.clear()
+    await message.answer(memory_entry_admin_text(entry), reply_markup=memory_entry_keyboard(entry.id))
+
+
+@router.callback_query(F.data.startswith("adm:memory:reroll:"))
+async def memory_reroll(callback: CallbackQuery) -> None:
+    if not await require_admin(callback):
+        return
+    entry_id = memory_callback_id(callback)
+    entry = materials_db.get_memory_entry(entry_id) if entry_id else None
+    if not entry:
+        await callback.answer("Запись не найдена.", show_alert=True)
+        return
+    alternatives = [text for text in MEMORY_EPITAPHS if text != entry.epitaph]
+    entry = materials_db.update_memory_entry(entry.id, epitaph=secrets.choice(alternatives))
+    await callback.message.edit_text(
+        memory_entry_admin_text(entry), reply_markup=memory_entry_keyboard(entry.id)
+    )
+    await callback.answer("Эпитафия заменена")
+
+
+@router.callback_query(F.data.startswith("adm:memory:delete:"))
+async def memory_delete(callback: CallbackQuery) -> None:
+    if not await require_admin(callback):
+        return
+    entry_id = memory_callback_id(callback)
+    if not entry_id or not materials_db.get_memory_entry(entry_id):
+        await callback.answer("Запись не найдена.", show_alert=True)
+        return
+    materials_db.delete_memory_entry(entry_id)
+    await show_memory_admin(callback)
+    await callback.answer("Запись удалена")
 
 
 def build_leads_excel(destination: Path) -> int:

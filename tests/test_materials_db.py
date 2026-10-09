@@ -26,6 +26,26 @@ def test_product_section_material_lifecycle(tmp_path):
     assert db.get_material(document.id) is None
 
 
+def test_memory_entry_lifecycle(tmp_path):
+    db = MaterialsDB(tmp_path / "materials.sqlite3")
+    entry = db.add_memory_entry(
+        "Андрей Смирнов", "12.03.2024", "07.10.2026",
+        "Ушёл туда, где нет утренних планёрок",
+    )
+
+    assert db.list_memory_entries() == [entry]
+    updated = db.update_memory_entry(
+        entry.id, name="Андрей", epitaph="Покинул чат, но остался в истории"
+    )
+    assert updated.name == "Андрей"
+    assert updated.epitaph == "Покинул чат, но остался в истории"
+    assert updated.start_date == "12.03.2024"
+
+    db.delete_memory_entry(entry.id)
+    assert db.get_memory_entry(entry.id) is None
+    assert db.list_memory_entries() == []
+
+
 def test_material_album_is_stored_ordered_and_deleted_as_one_item(tmp_path):
     db = MaterialsDB(tmp_path / "materials.sqlite3")
     product = db.add_product("OGGO")

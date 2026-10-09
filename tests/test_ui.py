@@ -5,13 +5,15 @@ from bot import (
     compact_nav,
     confirm_keyboard,
     group_welcome_text,
+    format_memory_text,
     main_menu,
+    normalize_memory_date,
     persistent_home_keyboard,
     rps_keyboard,
     rps_result,
     upload_keyboard,
 )
-from materials_db import MaterialsDB
+from materials_db import MaterialsDB, MemoryEntry
 
 
 def test_public_main_menu_only_shows_public_sections():
@@ -79,6 +81,26 @@ def test_compact_navigation_uses_icon_only_buttons():
     row = compact_nav("section:back", forward_data="section:next", search_data="main:prices")
     assert [button.text for button in row] == ["⬅️", "➡️", "🔎", "🏠"]
     assert row[-1].callback_data == "main:menu"
+
+
+def test_memory_text_is_escaped_and_formatted():
+    text = format_memory_text([
+        MemoryEntry(
+            1, "Иван <Тест>", "01.02.2024", "03.10.2026",
+            "Ушёл & не вернулся", "2026-10-09 10:00:00",
+        )
+    ])
+
+    assert "КЛАДБИЩЕ URAL VAPE" in text
+    assert "Иван &lt;Тест&gt;" in text
+    assert "01.02.2024 — 03.10.2026" in text
+    assert "Ушёл &amp; не вернулся" in text
+
+
+def test_memory_date_normalization():
+    assert normalize_memory_date(" 9.10.2026 ") == "09.10.2026"
+    assert normalize_memory_date("09.10.2026") == "09.10.2026"
+    assert normalize_memory_date("31.02.2026") is None
 
 
 def test_semantic_button_colors_are_used_for_confirmation_and_danger():

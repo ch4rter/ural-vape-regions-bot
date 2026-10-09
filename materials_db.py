@@ -107,6 +107,16 @@ class TelegramUser:
     activated_at: str
 
 
+@dataclass(frozen=True)
+class MemoryEntry:
+    id: int
+    name: str
+    start_date: str
+    end_date: str
+    epitaph: str
+    created_at: str
+
+
 class MaterialsDB:
     def __init__(self, path: Path):
         self.path = path
@@ -259,6 +269,14 @@ class MaterialsDB:
                     fingerprint TEXT NOT NULL,
                     telegram_file_id TEXT NOT NULL,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS memory_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    start_date TEXT NOT NULL,
+                    end_date TEXT NOT NULL,
+                    epitaph TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
                 """
             )
@@ -1257,6 +1275,61 @@ class MaterialsDB:
                 )
             else:
                 connection.execute("DELETE FROM materials WHERE id = ?", (material_id,))
+
+    def add_memory_entry(
+        self, name: str, start_date: str, end_date: str, epitaph: str
+    ) -> MemoryEntry:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """INSERT INTO memory_entries(name, start_date, end_date, epitaph)
+                   VALUES (?, ?, ?, ?)""",
+                (name.strip(), start_date.strip(), end_date.strip(), epitaph.strip()),
+            )
+            entry_id = cursor.lastrowid
+        return self.get_memory_entry(entry_id)
+
+    def get_memory_entry(self, entry_id: int) -> MemoryEntry | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT id, name, start_date, end_date, epitaph, created_at
+                   FROM memory_entries WHERE id = ?""",
+                (entry_id,),
+            ).fetchone()
+        return self._memory_entry(row) if row else None
+
+    def list_memory_entries(self) -> list[MemoryEntry]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT id, name, start_date, end_date, epitaph, created_at
+                   FROM memory_entries ORDER BY id DESC"""
+            ).fetchall()
+        return [self._memory_entry(row) for row in rows]
+
+    def update_memory_entry(self, entry_id: int, **changes: str) -> MemoryEntry | None:
+        allowed = {"name", "start_date", "end_date", "epitaph"}
+        values = {
+            key: value.strip() for key, value in changes.items()
+            if key in allowed and value is not None
+        }
+        if values:
+            assignments = ", ".join(f"{key} = ?" for key in values)
+            with self._connect() as connection:
+                connection.execute(
+                    f"UPDATE memory_entries SET {assignments} WHERE id = ?",
+                    (*values.values(), entry_id),
+                )
+        return self.get_memory_entry(entry_id)
+
+    def delete_memory_entry(self, entry_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM memory_entries WHERE id = ?", (entry_id,))
+
+    @staticmethod
+    def _memory_entry(row: sqlite3.Row) -> MemoryEntry:
+        return MemoryEntry(
+            row["id"], row["name"], row["start_date"], row["end_date"],
+            row["epitaph"], row["created_at"],
+        )
 
     @staticmethod
     def _material(row: sqlite3.Row) -> Material:
