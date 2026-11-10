@@ -386,7 +386,7 @@ class AccessMiddleware(BaseMiddleware):
             is_game_command = bool(re.match(r"^/game(?:@\w+)?\s*$", text, re.IGNORECASE))
             if is_game_command:
                 return await handler(event, data)
-            is_progress_command = bool(re.match(r"^/progress(?:@\w+)?\s*$", text, re.IGNORECASE))
+            is_progress_command = bool(re.match(r"^/progress2?(?:@\w+)?\s*$", text, re.IGNORECASE))
             if is_progress_command and user and (
                 is_admin(user.id) or materials_db.authorize_user(user.id, user.username)
             ):
@@ -2270,11 +2270,9 @@ async def progress_widget_snapshot(month: str, page: int, force: bool) -> dict:
         raise ValueError("Invalid progress month")
     goal = parse_goal(materials_db.get_setting(sales_goal_key(month)))
     rows = await load_progress_rows(month, force=force) if goal else []
-    updated = sales_progress_cache.get(month)
     return build_progress_widget_state(
         month, months, month_title(month).capitalize(), goal, rows,
-        now=datetime.now(ZoneInfo("Europe/Moscow")), page=page,
-        updated=updated[0].astimezone(ZoneInfo("Europe/Moscow")) if updated else None,
+        now=datetime.now(ZoneInfo("Europe/Moscow")),
     )
 
 
@@ -2298,16 +2296,25 @@ async def command_sales_progress(message: Message) -> None:
         message.from_user.id, message.from_user.username
     ):
         return
-    if message.chat.type == "private":
-        try:
-            if await progress_widgets.send(message):
-                return
-        except Exception as error:
-            logging.warning("Progress widget failed (%s); using text", type(error).__name__)
     await message.answer(
         "🎯 <b>Прогресс отдела продаж</b>\n\nВыберите месяц:",
         reply_markup=progress_month_keyboard(),
     )
+
+
+@router.message(Command("progress2"))
+async def command_sales_progress_widget(message: Message) -> None:
+    if not message.from_user or not has_internal_access(message.from_user.id, message.from_user.username):
+        return
+    if message.chat.type != "private":
+        await message.answer("Виджет /progress2 доступен в личке с ботом. Здесь используйте /progress.")
+        return
+    try:
+        if await progress_widgets.send(message):
+            return
+    except Exception as error:
+        logging.warning("Progress widget failed (%s)", type(error).__name__)
+    await message.answer("Не удалось открыть виджет. Обычный отчёт доступен по /progress.")
 
 
 @router.callback_query(F.data == "progress:text")

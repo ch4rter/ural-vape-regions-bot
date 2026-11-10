@@ -1,33 +1,31 @@
 <style>
-body{font-family:system-ui;font-size:14px}
-.muted{color:var(--tg-theme-hint-color);font-size:12px}
-.nav,.row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:6px 0}
-.nav strong{text-align:center;flex:1}.nav button{padding:6px 12px}
-#pct{font-size:32px;font-weight:700;margin-top:8px}
-.track{height:8px;border-radius:4px;background:var(--tg-theme-secondary-bg-color);margin:6px 0 12px}
-#bar{height:8px;border-radius:4px;background:var(--tg-theme-button-color)}
-.row strong{text-align:right}#refresh{width:100%;margin-top:8px}
-#status{min-height:16px;margin-top:4px}
+body{margin:0;padding:16px 16px 28px;font:13px system-ui;color:#f5f7ff;background:linear-gradient(135deg,#102a43 0%,#25345d 50%,#49336b 100%)}
+button{font:inherit;color:#f5f7ff;border:1px solid #627297;border-radius:10px;padding:6px 10px;background:#35476b}
+button[disabled]{color:#95a4bd}button:active{background:#50668b}
+.muted{color:#c0cee6;font-size:11px}.nav,.row{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.nav{margin:8px 0}.nav strong{flex:1;text-align:center;font-size:15px}
+#pct{font-size:34px;font-weight:700;line-height:1.1}.track{height:8px;border-radius:6px;background:#536080;margin:10px 0}
+#bar{height:8px;border-radius:6px;background:linear-gradient(90deg,#68e5cb,#b5c5ff)}
+.row{margin:7px 0}.row strong{white-space:nowrap}.line{height:3px;background:#536080;border-radius:3px;margin-top:3px}.fill{height:3px;background:#81dfcf;border-radius:3px}
+.member{margin:7px 0}.member .row{margin:0}
+#refresh{width:100%;background:#d6e8ff;color:#152e4b;border:0;font-weight:600;margin-top:8px}
+#status{color:#d0dcf1;font-size:11px}#status:empty{display:none}
 </style>
-<div class="muted">ЦЕЛЬ ОТДЕЛА</div>
+<div class="muted">URAL VAPE · ПЛАН ОТДЕЛА</div>
 <div class="nav"><button id="prev">←</button><strong id="title"></strong><button id="next">→</button></div>
-<div id="body"></div>
-<button id="refresh">Обновить</button>
-<div id="status" class="muted"></div>
+<div id="body"></div><button id="refresh">Обновить</button><div id="status"></div>
 <script>
 const W=window.TelegramWidget,$=id=>document.getElementById(id);
-let s={},busy=false,revision=0;
+let s={},busy=false,revision=0,shares=false;
 function el(tag,text,cls){const x=document.createElement(tag);x.textContent=text;if(cls)x.className=cls;return x}
 function row(parent,name,value){const r=el('div','','row');r.appendChild(el('span',name));r.appendChild(el('strong',value));parent.appendChild(r)}
-function ask(month,page,action){
+function ask(month,action){
  if(busy||!month)return;busy=true;const before=revision;$('status').textContent='Загружаю…';
- W.request('pw:'+month+':'+page+':'+action).then(a=>{
-  busy=false;if(before===revision)$('status').textContent=a.result||'';
- },e=>{busy=false;$('status').textContent='Не удалось обновить. Попробуйте ещё раз.'});
+ W.request('pw:'+month+':0:'+action).then(a=>{busy=false;if(before===revision)$('status').textContent=a.result||''},
+ ()=>{busy=false;$('status').textContent='Не удалось обновить. Попробуйте ещё раз.'});
 }
 function draw(){
- revision++;
- s=JSON.parse(W.chatData||'{}');$('title').textContent=s.title||'План отдела';
+ revision++;s=JSON.parse(W.chatData||'{}');$('title').textContent=s.title||'План отдела';
  $('prev').disabled=!s.prev;$('next').disabled=!s.next;$('refresh').disabled=!s.m;
  const b=$('body');b.textContent='';$('status').textContent='';
  if(s.error){b.appendChild(el('p',s.error));return}
@@ -35,17 +33,16 @@ function draw(){
  const track=el('div','','track'),bar=el('div','');bar.id='bar';
  bar.style.width=Math.max(0,Math.min(100,Number(s.pct)))+'%';track.appendChild(bar);b.appendChild(track);
  row(b,'Выполнено',s.total);row(b,'Цель',s.goal);row(b,'Осталось',s.left);
- b.appendChild(el('div','Вклад команды','muted'));
- s.rows.forEach(r=>row(b,r[0],r[1]));
- if(s.pages>1){const n=el('div','','nav'),p=el('button','←'),v=el('span',(s.page+1)+' / '+s.pages),f=el('button','→');
- p.disabled=s.page===0;f.disabled=s.page+1===s.pages;
- p.onclick=()=>ask(s.m,s.page-1,'show');f.onclick=()=>ask(s.m,s.page+1,'show');
- n.appendChild(p);n.appendChild(v);n.appendChild(f);b.appendChild(n)}
- b.appendChild(el('div',Number(s.pct)>=100?'Цель выполнена!':s.timing,'muted'));
- if(s.daily)b.appendChild(el('div','Для выполнения: '+s.daily+' в день','muted'));
- b.appendChild(el('div','Данные: '+s.updated,'muted'));
+ if(s.phase==='current'){
+ b.appendChild(el('div',s.delta+' к темпу месяца','muted'));
+ b.appendChild(el('div','Ориентир: равномерный план на начало дня','muted'));
+ }else b.appendChild(el('div',s.phase==='future'?'Месяц ещё не начался':Number(s.pct)>=100?'План выполнен':'Итог месяца','muted'));
+ const head=el('div','','row');head.appendChild(el('strong','Вклад команды'));
+ const toggle=el('button',shares?'Доли, %':'Суммы, ₽');toggle.onclick=()=>{shares=!shares;draw()};head.appendChild(toggle);b.appendChild(head);
+ s.rows.forEach(r=>{const member=el('div','','member'),line=el('div','','line'),fill=el('div','','fill');
+ row(member,r[0],shares?r[2].replace('.',',')+'%':r[1]);
+ fill.style.width=Math.max(0,Math.min(100,Number(r[2])))+'%';line.appendChild(fill);member.appendChild(line);b.appendChild(member)});
 }
-$('prev').onclick=()=>ask(s.prev,0,'show');$('next').onclick=()=>ask(s.next,0,'show');
-$('refresh').onclick=()=>ask(s.m,s.page||0,'refresh');
+$('prev').onclick=()=>ask(s.prev,'show');$('next').onclick=()=>ask(s.next,'show');$('refresh').onclick=()=>ask(s.m,'refresh');
 W.onEvent('chatDataChanged',draw);draw();
 </script>

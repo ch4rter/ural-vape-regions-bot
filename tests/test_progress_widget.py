@@ -40,19 +40,20 @@ def query(**changes):
     return WidgetQuery.model_validate(raw)
 
 
-def test_widget_sizes_financial_totals_and_paging():
+def test_widget_sizes_financial_totals_and_all_managers():
     html = Path("progress_widget.html").read_bytes()
     assert len(html) <= 32768
     assert len(zlib.compress(html, 9)) <= 4096
     rows = [ManagerProgress("Менеджер " + str(i), str(i), Decimal(i * 100)) for i in range(8)]
     state = build_state("2026-11", ["2026-10", "2026-11"], "Ноябрь 2026",
-                        Decimal(2000), rows, now=datetime(2026, 11, 10),
-                        updated=datetime(2026, 11, 10, 12), page=1)
+                        Decimal(2000), rows, now=datetime(2026, 11, 10))
     assert state["total"] == "2 800 ₽"
     assert state["pct"] == "140.0"
     assert state["left"] == "0 ₽"
-    assert state["rows"][0] == ["Менеджер 4", "400 ₽"]
-    assert state["pages"] == 3
+    assert state["rows"][0] == ["Менеджер 7", "700 ₽", "25.0"]
+    assert len(state["rows"]) == 8
+    assert "pages" not in state and "updated" not in state and "timing" not in state
+    assert state["delta"] == "+2 200 ₽"
     assert state["prev"] == "2026-10" and state["next"] == ""
     assert len(encode_state(state).encode()) <= 1024
     state = build_state("2026-11", ["2026-11"], "Ноябрь", None, [], now=datetime(2026, 11, 10))
@@ -173,7 +174,7 @@ def test_missing_goal_does_not_query_moysklad(monkeypatch):
 
 
 @pytest.mark.parametrize("chat_type,access,widget_sent,expected_text", [
-    ("private", True, True, False),
+    ("private", True, True, True),
     ("private", True, False, True),
     ("supergroup", True, True, True),
     ("private", False, True, False),
@@ -186,4 +187,43 @@ def test_progress_command_routing(monkeypatch, chat_type, access, widget_sent, e
                               from_user=SimpleNamespace(id=123, username=None), answer=AsyncMock())
     asyncio.run(app.command_sales_progress(message))
     assert message.answer.called == expected_text
+    send.assert_not_called()
+
+
+@pytest.mark.parametrize("chat_type,access,sent,text", [
+    ("private", True, True, False), ("private", True, False, True),
+    ("supergroup", True, True, True), ("private", False, True, False),
+])
+def test_progress2_separate_command(monkeypatch, chat_type, access, sent, text):
+    monkeypatch.setattr(app, "has_internal_access", lambda *args: access)
+    send = AsyncMock(return_value=sent)
+    monkeypatch.setattr(app.progress_widgets, "send", send)
+    message = SimpleNamespace(chat=SimpleNamespace(type=chat_type),
+                              from_user=SimpleNamespace(id=123, username=None), answer=AsyncMock())
+    asyncio.run(app.command_sales_progress_widget(message))
+    assert message.answer.called == text
     assert send.called == (chat_type == "private" and access)
+
+
+def test_widget_has_no_caption_or_external_buttons():
+    service = make_service()
+    telegram = AsyncMock(return_value=SimpleNamespace(chat=SimpleNamespace(id=123), message_id=5))
+    message = SimpleNamespace(chat=SimpleNamespace(id=123, type="private"),
+                              from_user=SimpleNamespace(id=123, username=None),
+                              message_thread_id=None, bot=telegram)
+    assert asyncio.run(service.send(message)) is True
+    payload = telegram.call_args.args[0].model_dump(exclude_none=True)
+    assert "caption" not in payload and "reply_markup" not in payload
+
+
+@pytest.mark.parametrize("month,now,phase,delta", [
+    ("2026-11", datetime(2026, 11, 1), "current", "+0 ₽"),
+    ("2026-11", datetime(2026, 11, 16), "current", "−1 500 ₽"),
+    ("2026-10", datetime(2026, 11, 16), "past", "−3 000 ₽"),
+    ("2026-12", datetime(2026, 11, 16), "future", "+0 ₽"),
+])
+def test_calendar_benchmark_and_zero_sales(month, now, phase, delta):
+    state = build_state(month, [month], month, Decimal(3000),
+                        [ManagerProgress("Тест", "x", Decimal(0))], now=now)
+    assert state["phase"] == phase and state["delta"] == delta
+    assert state["rows"][0][2] == "0"

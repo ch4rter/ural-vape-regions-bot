@@ -1,4 +1,4 @@
-"""Private /progress widget and a narrow Bot API 10.4 adapter for aiogram 3.29.
+"""Private /progress2 widget and a narrow Bot API 10.4 adapter for aiogram 3.29.
 
 Protocol: pw:<YYYY-MM>:<page>:<show|refresh>. Financial data is chat_data only.
 Docs: https://core.telegram.org/bots/widgets
@@ -6,6 +6,7 @@ Docs: https://core.telegram.org/bots/widgets
 from __future__ import annotations
 
 import json
+import calendar
 import logging
 import time
 from datetime import datetime
@@ -17,10 +18,10 @@ from zoneinfo import ZoneInfo
 from aiogram import BaseMiddleware
 from aiogram.exceptions import TelegramBadRequest, TelegramNotFound
 from aiogram.methods import TelegramMethod
-from aiogram.types import Chat, InlineKeyboardButton, InlineKeyboardMarkup, Message, User
+from aiogram.types import Chat, Message, User
 from pydantic import BaseModel, Field
 
-from sales_progress import format_money, month_timing
+from sales_progress import format_money
 
 
 class SendWidget(TelegramMethod[Message]):
@@ -29,10 +30,8 @@ class SendWidget(TelegramMethod[Message]):
     chat_id: int
     html: str
     chat_data: str
-    caption: str
     allow_queries: bool = True
     protect_content: bool = True
-    reply_markup: InlineKeyboardMarkup
     message_thread_id: int | None = None
 
 
@@ -67,26 +66,32 @@ def encode_state(state: dict) -> str:
     return result
 
 
-def build_state(month, months, title, goal, rows, *, now, updated=None, page=0):
+def build_state(month, months, title, goal, rows, *, now):
     rows = sorted(rows, key=lambda row: (-row.revenue, row.name.casefold()))
-    pages = max(1, (len(rows) + 2) // 3)
-    page = min(max(page, 0), pages - 1)
     index = months.index(month)
     state = dict(m=month, title=title, prev=months[index - 1] if index else "",
                  next=months[index + 1] if index + 1 < len(months) else "",
-                 page=page, pages=pages, rows=[])
+                 rows=[])
     if goal is None:
         state["error"] = "Цель на этот месяц ещё не установлена."
         return state
     total = sum((row.revenue for row in rows), Decimal(0))
     remaining = max(goal - total, Decimal(0))
-    timing, days = month_timing(month, now.date())
+    year, number = map(int, month.split("-"))
+    days = calendar.monthrange(year, number)[1]
+    # Linear calendar benchmark at the start of today, not a sales forecast.
+    elapsed = 0 if month > now.strftime("%Y-%m") else (
+        days if month < now.strftime("%Y-%m") else now.day - 1)
+    pace = goal * Decimal(elapsed) / Decimal(days)
+    delta = total - pace
     state.update(pct=str((total / goal * 100).quantize(Decimal("0.1"))),
                  total=format_money(total), goal=format_money(goal),
-                 left=format_money(remaining), timing=timing.replace("<b>", "").replace("</b>", ""),
-                 daily=format_money(remaining / days) if days and remaining else "",
-                 updated=updated.strftime("%d.%m %H:%M МСК") if updated else "",
-                 rows=[[row.name[:32], format_money(row.revenue)] for row in rows[page * 3:page * 3 + 3]])
+                 left=format_money(remaining),
+                 delta=("+" if delta >= 0 else "−") + format_money(abs(delta)),
+                 phase="future" if month > now.strftime("%Y-%m") else ("past" if elapsed == days else "current"),
+                 rows=[[row.name[:32], format_money(row.revenue),
+                        str((row.revenue / total * 100).quantize(Decimal("0.1"))) if total else "0"]
+                       for row in rows])
     return state
 
 
@@ -99,7 +104,7 @@ class ProgressWidgets(BaseMiddleware):
 
     @staticmethod
     def key(chat_id, message_id):
-        return f"progress_widget:v1:{chat_id}:{message_id}"
+        return f"progress_widget:v2:{chat_id}:{message_id}"
 
     async def send(self, message):
         user = message.from_user
@@ -112,10 +117,7 @@ class ProgressWidgets(BaseMiddleware):
         try:
             sent = await message.bot(SendWidget(
                 chat_id=message.chat.id, html=self.html, chat_data=encode_state(state),
-                caption="План отдела продаж · /progress\nЕсли виджет не отображается, нажмите «Обычный вид».",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(text="Обычный вид", callback_data="progress:text")
-                ]]), message_thread_id=message.message_thread_id,
+                message_thread_id=message.message_thread_id,
             ))
         except (TelegramBadRequest, TelegramNotFound) as error:
             logging.warning("Progress widget unavailable (%s); using text", type(error).__name__)
@@ -140,13 +142,13 @@ class ProgressWidgets(BaseMiddleware):
             await answer("Доступно только сотрудникам в личке с ботом.")
             return
         if self.get_setting(self.key(chat.id, query.message_id)) != "1":
-            await answer("Откройте новую карточку командой /progress.")
+            await answer("Откройте новую карточку командой /progress2.")
             return
         parts = query.data.split(":")
         if (query.type.get("type") != "data" or len(parts) != 4 or parts[0] != "pw"
                 or parts[1] not in self.months() or not parts[2].isdigit()
                 or len(parts[2]) > 3 or parts[3] not in {"show", "refresh"}):
-            await answer("Некорректный запрос. Откройте /progress заново.")
+            await answer("Некорректный запрос. Откройте /progress2 заново.")
             return
         if user.id in self.busy:
             await answer("Данные уже загружаются…")
