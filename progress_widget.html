@@ -1,0 +1,51 @@
+<style>
+body{font-family:system-ui;font-size:14px}
+.muted{color:var(--tg-theme-hint-color);font-size:12px}
+.nav,.row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:6px 0}
+.nav strong{text-align:center;flex:1}.nav button{padding:6px 12px}
+#pct{font-size:32px;font-weight:700;margin-top:8px}
+.track{height:8px;border-radius:4px;background:var(--tg-theme-secondary-bg-color);margin:6px 0 12px}
+#bar{height:8px;border-radius:4px;background:var(--tg-theme-button-color)}
+.row strong{text-align:right}#refresh{width:100%;margin-top:8px}
+#status{min-height:16px;margin-top:4px}
+</style>
+<div class="muted">ЦЕЛЬ ОТДЕЛА</div>
+<div class="nav"><button id="prev">←</button><strong id="title"></strong><button id="next">→</button></div>
+<div id="body"></div>
+<button id="refresh">Обновить</button>
+<div id="status" class="muted"></div>
+<script>
+const W=window.TelegramWidget,$=id=>document.getElementById(id);
+let s={},busy=false,revision=0;
+function el(tag,text,cls){const x=document.createElement(tag);x.textContent=text;if(cls)x.className=cls;return x}
+function row(parent,name,value){const r=el('div','','row');r.appendChild(el('span',name));r.appendChild(el('strong',value));parent.appendChild(r)}
+function ask(month,page,action){
+ if(busy||!month)return;busy=true;const before=revision;$('status').textContent='Загружаю…';
+ W.request('pw:'+month+':'+page+':'+action).then(a=>{
+  busy=false;if(before===revision)$('status').textContent=a.result||'';
+ },e=>{busy=false;$('status').textContent='Не удалось обновить. Попробуйте ещё раз.'});
+}
+function draw(){
+ revision++;
+ s=JSON.parse(W.chatData||'{}');$('title').textContent=s.title||'План отдела';
+ $('prev').disabled=!s.prev;$('next').disabled=!s.next;$('refresh').disabled=!s.m;
+ const b=$('body');b.textContent='';$('status').textContent='';
+ if(s.error){b.appendChild(el('p',s.error));return}
+ const pct=el('div',s.pct.replace('.',',')+'%');pct.id='pct';b.appendChild(pct);
+ const track=el('div','','track'),bar=el('div','');bar.id='bar';
+ bar.style.width=Math.max(0,Math.min(100,Number(s.pct)))+'%';track.appendChild(bar);b.appendChild(track);
+ row(b,'Выполнено',s.total);row(b,'Цель',s.goal);row(b,'Осталось',s.left);
+ b.appendChild(el('div','Вклад команды','muted'));
+ s.rows.forEach(r=>row(b,r[0],r[1]));
+ if(s.pages>1){const n=el('div','','nav'),p=el('button','←'),v=el('span',(s.page+1)+' / '+s.pages),f=el('button','→');
+ p.disabled=s.page===0;f.disabled=s.page+1===s.pages;
+ p.onclick=()=>ask(s.m,s.page-1,'show');f.onclick=()=>ask(s.m,s.page+1,'show');
+ n.appendChild(p);n.appendChild(v);n.appendChild(f);b.appendChild(n)}
+ b.appendChild(el('div',Number(s.pct)>=100?'Цель выполнена!':s.timing,'muted'));
+ if(s.daily)b.appendChild(el('div','Для выполнения: '+s.daily+' в день','muted'));
+ b.appendChild(el('div','Данные: '+s.updated,'muted'));
+}
+$('prev').onclick=()=>ask(s.prev,0,'show');$('next').onclick=()=>ask(s.next,0,'show');
+$('refresh').onclick=()=>ask(s.m,s.page||0,'refresh');
+W.onEvent('chatDataChanged',draw);draw();
+</script>

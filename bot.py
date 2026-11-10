@@ -74,6 +74,7 @@ from moysklad_bonus import (
     save_classification,
 )
 from sales_progress import fetch_team_revenue, parse_goal, render_progress
+from progress_widget import ProgressWidgets, build_state as build_progress_widget_state
 from order_splitter import ORDER_STORES, split_customer_order
 from order_notifications import (
     OrderNotice,
@@ -164,6 +165,7 @@ material_album_tasks: dict[tuple[int, int, str], asyncio.Task] = {}
 bonus_reports_in_progress: set[int] = set()
 order_splits_in_progress: set[int] = set()
 sales_progress_cache: dict[str, tuple[datetime, list]] = {}
+sales_progress_locks: dict[str, asyncio.Lock] = {}
 sales_progress_refreshes: dict[tuple[int, int], datetime] = {}
 inline_moysklad_client: MoySkladClient | None = None
 inline_order_cache: dict[str, tuple[datetime, InlineOrderCard | None]] = {}
@@ -2194,7 +2196,7 @@ def shift_month(month: str, offset: int) -> str:
 
 
 def progress_months(*, admin: bool = False) -> list[str]:
-    current = datetime.now().strftime("%Y-%m")
+    current = datetime.now(ZoneInfo("Europe/Moscow")).strftime("%Y-%m")
     offsets = range(-2, 7) if admin else range(-5, 3)
     return [shift_month(current, offset) for offset in offsets]
 
@@ -2234,6 +2236,14 @@ def sales_goal_key(month: str) -> str:
 
 
 async def load_progress_rows(month: str, *, force: bool = False) -> list:
+    async with sales_progress_locks.setdefault(month, asyncio.Lock()):
+        cached = sales_progress_cache.get(month)
+        # A refresh from another message/user reuses a just-loaded snapshot.
+        force = force and (not cached or datetime.now() - cached[0] >= timedelta(seconds=20))
+        return await _load_progress_rows(month, force=force)
+
+
+async def _load_progress_rows(month: str, *, force: bool = False) -> list:
     cached = sales_progress_cache.get(month)
     if cached and not force and datetime.now() - cached[0] < timedelta(seconds=60):
         return cached[1]
@@ -2254,6 +2264,28 @@ async def load_progress_rows(month: str, *, force: bool = False) -> list:
     return rows
 
 
+async def progress_widget_snapshot(month: str, page: int, force: bool) -> dict:
+    months = progress_months()
+    if month not in months:
+        raise ValueError("Invalid progress month")
+    goal = parse_goal(materials_db.get_setting(sales_goal_key(month)))
+    rows = await load_progress_rows(month, force=force) if goal else []
+    updated = sales_progress_cache.get(month)
+    return build_progress_widget_state(
+        month, months, month_title(month).capitalize(), goal, rows,
+        now=datetime.now(ZoneInfo("Europe/Moscow")), page=page,
+        updated=updated[0].astimezone(ZoneInfo("Europe/Moscow")) if updated else None,
+    )
+
+
+progress_widgets = ProgressWidgets(
+    access=lambda user_id, username: has_internal_access(user_id, username),
+    months=progress_months, snapshot=progress_widget_snapshot,
+    get_setting=lambda key: materials_db.get_setting(key),
+    set_setting=lambda key, value: materials_db.set_setting(key, value),
+)
+
+
 def progress_refresh_keyboard(month: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🔄 Обновить", callback_data=f"progress:refresh:{month}")
@@ -2266,13 +2298,35 @@ async def command_sales_progress(message: Message) -> None:
         message.from_user.id, message.from_user.username
     ):
         return
+    if message.chat.type == "private":
+        try:
+            if await progress_widgets.send(message):
+                return
+        except Exception as error:
+            logging.warning("Progress widget failed (%s); using text", type(error).__name__)
     await message.answer(
         "🎯 <b>Прогресс отдела продаж</b>\n\nВыберите месяц:",
         reply_markup=progress_month_keyboard(),
     )
 
 
+@router.callback_query(F.data == "progress:text")
+async def progress_text_fallback(callback: CallbackQuery) -> None:
+    if not has_internal_access(callback.from_user.id, callback.from_user.username):
+        await callback.answer("Доступно только сотрудникам.", show_alert=True)
+        return
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer(
+            "🎯 <b>Прогресс отдела продаж</b>\n\nВыберите месяц:",
+            reply_markup=progress_month_keyboard(),
+        )
+
+
 async def show_sales_progress(callback: CallbackQuery, month: str, *, force: bool) -> None:
+    if not has_internal_access(callback.from_user.id, callback.from_user.username):
+        await callback.answer("Доступно только сотрудникам.", show_alert=True)
+        return
     if not re.fullmatch(r"\d{4}-\d{2}", month):
         await callback.answer("Некорректный месяц.", show_alert=True)
         return
@@ -8295,6 +8349,7 @@ async def main() -> None:
     configure_crm(crm_service, crm_database, crm_beta_ids)
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dispatcher = Dispatcher()
+    dispatcher.update.outer_middleware(progress_widgets)
     router.message.outer_middleware(AccessMiddleware())
     router.callback_query.outer_middleware(AccessMiddleware())
     dispatcher.include_router(crm_router)
@@ -8316,7 +8371,9 @@ async def main() -> None:
     monitor_task = asyncio.create_task(order_status_monitor(bot))
     activity_task = asyncio.create_task(customer_activity_monitor(bot))
     try:
-        await dispatcher.start_polling(bot)
+        await dispatcher.start_polling(
+            bot, allowed_updates=sorted(set(dispatcher.resolve_used_update_types()) | {"widget_query"})
+        )
     finally:
         monitor_task.cancel()
         activity_task.cancel()
